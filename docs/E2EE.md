@@ -336,3 +336,59 @@ The wasm URL is in the `/messages/` HTML as bx asset `72238`
 (`"72238":{"uri":"…wasm…"}`). Next to research: what the web does with the
 secret (`useMWChatEncryptedBackupsAddDevice`, virtual devices, `EBMinos*`
 queries) to fetch and decrypt the archived messages.
+
+### After the PIN (2026-10-29)
+
+- `mwEBGetPINSecretFromVesta` runs the Vesta login above and decodes the
+  user secret as UTF-8 text: it is the account's **recovery code**. A wrong
+  PIN surfaces as `BackupErrorType.INVALID_PASSWORD`.
+- `mwEBAddDevice` → `EBSMAPI.addDeviceWithRecoveryCode({recoveryCode,
+  userId})`, which runs in the MAW worker (`EBDeps.getEBSMAPI()`,
+  `EBSMWorkerThreadAPI`, `EBAddDeviceWithRecoveryCode`, `EBAddDeviceGraphQL`):
+  it adds this client as a backup device, then
+  `MWEncryptedBackupsInitializeRestoreDeferred` starts the restore.
+- The restore is the Minos pipeline, also mostly in the worker: `EBMinosDb`
+  (IndexedDB), `useMinosMailboxKeyFetch`, `EBMinosProcessMessages`
+  (`EBMinosMessageEncryptionVersion`, `...MetadataVersion`), LS procedures
+  `LSMinosVerifySingleEpoch`, `LSWriteMinosPublicKey`, and GraphQL
+  `EBMinosMekFetchOnMissQuery`, `EBMinosFetchContactKeysQuery`,
+  `useMWEncryptedBackupsFetchBackupIdsV2Query`. The worker bundle isn't in
+  the page's resource list; it has to be located (MAW worker init script) to
+  read the key derivation from the recovery code and the message decryption.
+- Plan: (1) Vesta login in the app via the wasm (in-memory WASI on `wasmi`),
+  ending with the recovery code; (2) read the worker's EB/Minos code for the
+  recovery-code key derivation, device add and archive decryption; (3)
+  implement those; (4) PIN screen. Also: since the recovery code alone
+  unlocks the backup, the app could accept it directly as an alternative.
+
+### In the app (2026-10-29)
+
+- `src/vesta.rs` runs the Vesta wasm in `wasmi` with an in-memory WASI
+  (files `input`/`output` only; stdout/stderr dropped). Test:
+  `VESTA_WASM=/path/vesta.wasm cargo test vesta`.
+- The Vesta `fbid` field is not the user's fbid: it's the
+  `client_generated_id` of the backup's virtual device with
+  `device_type == "HSM"` (`MWChatEncryptedBackupsSettingsDialogQuery`,
+  `31918369997811363`, `data.xfb_backup.virtual_devices`). With the real
+  fbid the init query fails with `field_exception`.
+- `messenger-rs debug-vesta-status` (read-only, no PIN): finds the module
+  link, loads the module, reads `is_registered` / `attempts_remaining`, and
+  verifies the HSM keys with the module. Verified working.
+- `vesta::secret_from_pin` implements the full login; not run yet (it sends
+  the PIN). The restore after it (recovery code → device add → Minos) is
+  still to be researched.
+
+### Restore internals (2026-10-29, later)
+
+- The web worker is `static_resources/webworker/init_script/` and loads the
+  same module registry, so its modules can be read from the page.
+- `EBAddDeviceWithRecoveryCode`: waits for the "EBLS" database (the
+  encrypted-backup Lightspeed DB inside the worker), reads the backup id from
+  its `encrypted_backups` table, calls `EBAddDeviceGraphQL.addDeviceGraphQL
+  ({backupId, recoveryCode, userId})`, then waits for a row in
+  `secure_encrypted_backups_recovery_code_status` and checks it with
+  `MWEncryptedBackupsRecoveryCodeStatus`. The restore itself then runs as
+  Lightspeed stored procedures in that DB (`LSMinosVerifySingleEpoch`,
+  `LSWriteMinosPublicKey`, ...) plus the EB/Minos JS and a second wasm
+  (`COs9e0Kj0ic.wasm`, VOPRF over Ristretto). Re-implementing it means
+  re-implementing that whole EBLS state machine: far bigger than Vesta.

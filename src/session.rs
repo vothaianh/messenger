@@ -63,6 +63,9 @@ pub struct Bootstrap {
     /// sent to DGW as `x-dgw-regionhint`; without it the gateway answers syncs
     /// but never pushes live changes.
     pub region: Option<String>,
+    /// Where the page loads the Vesta (backup PIN) client module from: bx
+    /// asset 72238, `"72238":{"uri":"…wasm…"}`.
+    pub vesta_wasm_url: Option<String>,
 }
 
 pub struct Session {
@@ -145,11 +148,12 @@ impl Session {
         }
 
         let region = capture(&html, r#""MessengerWebRegion",\[\],\{"regionNullable":"([A-Z0-9]+)"#);
+        let vesta_wasm_url = capture(&html, r#""72238":\{"uri":"([^"]+\.wasm[^"]*)""#).map(|u| u.replace("\\/", "/"));
 
         Ok(Session {
             http,
             cookies,
-            boot: Bootstrap { fbid, dtsg, lsd, ls_app_id, mqtt_app_id, mqtt_endpoint, ls_doc_id, ls_version, page_params, e2ee_cat, e2ee_app_id, region },
+            boot: Bootstrap { fbid, dtsg, lsd, ls_app_id, mqtt_app_id, mqtt_endpoint, ls_doc_id, ls_version, page_params, e2ee_cat, e2ee_app_id, region, vesta_wasm_url },
             req_counter: Default::default(),
             device_id: uuid::Uuid::new_v4().to_string(),
         })

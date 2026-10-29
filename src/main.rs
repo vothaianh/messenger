@@ -13,6 +13,7 @@ mod mqtt;
 mod session;
 mod store;
 mod ui;
+mod vesta;
 
 use session::Cookies;
 
@@ -36,6 +37,19 @@ fn main() -> anyhow::Result<()> {
         cookies.save()?;
         println!("Saved. Run the app again.");
         return Ok(());
+    }
+
+    // Read-only: is there a PIN backup, can we load the Vesta module, do the
+    // HSM keys verify. Sends no PIN.
+    if std::env::args().nth(1).as_deref() == Some("debug-vesta-status") {
+        let cookies = Cookies::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        return tokio::runtime::Runtime::new()?.block_on(async {
+            let s = session::Session::connect(cookies).await?;
+            println!("module link found: {}", s.boot.vesta_wasm_url.is_some());
+            let (status, keys_ok) = vesta::check_backup(&s).await?;
+            println!("registered: {}  attempts remaining: {:?}  HSM keys verify: {keys_ok}", status.registered, status.attempts_remaining);
+            Ok(())
+        });
     }
 
     // Diagnostics: bootstrap + one Lightspeed sync, printing a summary.
