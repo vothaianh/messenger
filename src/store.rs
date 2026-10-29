@@ -503,6 +503,47 @@ impl Store {
         });
     }
 
+}
+
+/// The web client keeps some restored messages' text as an encrypted
+/// reference (`<n>##<n><base64><n>##<n>`) that it opens only when showing
+/// the message; that's not the text.
+pub fn is_secure_text_token(text: &str) -> bool {
+    let t = text.trim();
+    t.len() > 40 && t.matches("##").count() >= 2 && !t.contains(char::is_whitespace) && t.starts_with(|c: char| c.is_ascii_digit())
+}
+
+impl Store {
+    /// Drop restored messages whose text is still an encrypted reference
+    /// (from before they were filtered out). Returns how many went.
+    pub fn drop_secure_tokens(&mut self) -> usize {
+        let mut n = 0;
+        for list in self.messages.values_mut() {
+            let before = list.len();
+            list.retain(|m| !is_secure_text_token(&m.text));
+            n += before - list.len();
+        }
+        n
+    }
+
+    /// Messages of an encrypted chat restored from the backup (read from the
+    /// web client's database by the hidden web engine). Already-known ids are
+    /// left alone; returns how many were new.
+    pub fn add_restored(&mut self, thread_key: i64, messages: Vec<Message>) -> usize {
+        let known: HashSet<String> = self.messages.get(&thread_key).map(|v| v.iter().map(|m| m.id.clone()).collect()).unwrap_or_default();
+        let mut added = 0;
+        for mut m in messages {
+            if m.id.is_empty() || known.contains(&m.id) {
+                continue;
+            }
+            m.thread_key = thread_key;
+            self.seen_ids.insert(m.id.clone());
+            self.insert_message(m);
+            added += 1;
+        }
+        added
+    }
+
     fn touch_thread(&mut self, thread_key: i64, ts: i64, snippet: String) {
         if let Some(t) = self.threads.get_mut(&thread_key) {
             if ts >= t.last_activity_ms {

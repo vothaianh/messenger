@@ -170,6 +170,17 @@ pub struct MessengerApp {
     sticker_store: bool,
     /// The "restore encrypted history with your PIN" dialog, when open.
     pin_restore: Option<PinRestore>,
+    /// The PIN restore succeeded once (kept): encrypted chats then fetch
+    /// their restored history from the hidden web engine.
+    history_restored: bool,
+    /// Encrypted chats whose restored history was fetched this run, and the
+    /// one being fetched.
+    history_fetched: HashSet<i64>,
+    history_job: Option<HistoryJob>,
+    /// Whether the hidden page already holds a restored backup (checked
+    /// once, when an encrypted chat is first opened and the flag isn't set):
+    /// None = not checked, Some(None) = waiting, Some(Some(id)) = running.
+    restore_check: Option<Option<u64>>,
     store_preview: Option<(String, String)>,
     last_layout_log: String,
     /// Message list as of the previous frame, to keep the view in place when
@@ -194,6 +205,9 @@ struct ListView {
 impl MessengerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, shared: Arc<Shared>, tx: UnboundedSender<Command>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Clean up restored messages saved before encrypted text references
+        // were filtered out.
+        shared.store.lock().unwrap().drop_secure_tokens();
         crate::macos::init_notifications();
         install_fonts(&cc.egui_ctx);
         apply_style(&cc.egui_ctx, false);
@@ -235,11 +249,92 @@ impl MessengerApp {
             sticker_pack: None,
             sticker_store: false,
             pin_restore: None,
+            history_restored: stored("history_restored").is_some_and(|v| v == "true"),
+            history_fetched: HashSet::new(),
+            history_job: None,
+            restore_check: None,
             store_preview: None,
             last_layout_log: String::new(),
             prev_view: None,
             scroll_fix: None,
             focused: true,
+        }
+    }
+
+    /// Fetch one encrypted chat's restored history: the hidden page opens the
+    /// chat (the web client restores a chat's history when it's opened), then
+    /// its messages are read from the web's database every few seconds for
+    /// two minutes and merged into ours.
+    fn history_tick(&mut self, ctx: &egui::Context) {
+        // One read-only check: does the hidden page hold a restored backup?
+        match self.restore_check {
+            Some(None) => {
+                crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
+                if crate::macos::web_loaded() {
+                    if let Some(id) = crate::macos::web_call(BACKUP_PRESENT_JS) {
+                        self.restore_check = Some(Some(id));
+                    }
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+            Some(Some(id)) => {
+                if let Some(r) = crate::macos::web_result(id) {
+                    if r.as_deref() == Ok("yes") {
+                        self.history_restored = true;
+                        self.history_fetched.clear();
+                    }
+                    // Checked; don't ask again this run.
+                    self.restore_check = Some(Some(u64::MAX));
+                } else if id != u64::MAX {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                }
+            }
+            None => {}
+        }
+        let Some(mut job) = self.history_job.take() else { return };
+        let key = job.thread.to_string();
+        let mut done = false;
+        match job.stage {
+            HistoryStage::Start => {
+                crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
+                if crate::macos::web_loaded() {
+                    let _ = crate::macos::web_call_with(OPEN_THREAD_JS, &[("threadKey", &key)]);
+                    job.stage = HistoryStage::Opening(Instant::now());
+                }
+            }
+            HistoryStage::Opening(since) => {
+                if crate::macos::web_loaded() && since.elapsed() > std::time::Duration::from_secs(8) {
+                    job.stage = HistoryStage::Idle(Instant::now() - std::time::Duration::from_secs(10));
+                }
+            }
+            HistoryStage::Idle(last) => {
+                if last.elapsed() > std::time::Duration::from_secs(5) {
+                    match crate::macos::web_call_with(READ_THREAD_JS, &[("threadKey", &key)]) {
+                        Some(id) => job.stage = HistoryStage::Reading(id),
+                        None => done = true,
+                    }
+                }
+            }
+            HistoryStage::Reading(id) => {
+                if let Some(result) = crate::macos::web_result(id) {
+                    if let Ok(text) = result {
+                        let restored = parse_restored(&text);
+                        let added = self.shared.store.lock().unwrap().add_restored(job.thread, restored);
+                        job.found += added;
+                        if std::env::var_os("MESSENGER_DEBUG").is_some() && added > 0 {
+                            eprintln!("[history] {} new restored messages", added);
+                        }
+                    }
+                    job.stage = HistoryStage::Idle(Instant::now());
+                }
+            }
+        }
+        if job.started.elapsed() > std::time::Duration::from_secs(120) {
+            done = true;
+        }
+        if !done {
+            self.history_job = Some(job);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
 
@@ -274,7 +369,11 @@ impl MessengerApp {
             PinStage::Running(id) => {
                 if let Some(result) = crate::macos::web_result(id) {
                     st.stage = match result.as_deref().map(serde_json::from_str::<serde_json::Value>) {
-                        Ok(Ok(v)) if v["ok"].as_bool() == Some(true) => PinStage::Done,
+                        Ok(Ok(v)) if v["ok"].as_bool() == Some(true) => {
+                            self.history_restored = true;
+                            self.history_fetched.clear();
+                            PinStage::Done
+                        }
                         Ok(Ok(v)) if v["wrongPin"].as_bool() == Some(true) => PinStage::WrongPin,
                         Ok(Ok(v)) => PinStage::Failed(v["error"].as_str().unwrap_or("The restore failed").to_string()),
                         Ok(Err(_)) => PinStage::Failed("Unexpected answer from Messenger".into()),
@@ -449,6 +548,7 @@ impl eframe::App for MessengerApp {
         storage.set_string("show_info", self.show_info.to_string());
         storage.set_string("text_scale", text_scale().to_string());
         storage.set_string("theme", self.theme.key().into());
+        storage.set_string("history_restored", self.history_restored.to_string());
         // Also keep the inbox for the next launch (eframe calls this every
         // ~30 s and on exit); the file is written off the UI thread.
         if let Some(bytes) = self.shared.store.lock().unwrap().cache_bytes() {
@@ -464,6 +564,7 @@ impl eframe::App for MessengerApp {
         self.apply_theme(&ctx);
         crate::macos::reap_video();
         self.pin_restore_ui(&ctx);
+        self.history_tick(&ctx);
         web_probe(&ctx);
         image_viewer(&ctx);
         let status = self.shared.status.lock().unwrap().clone();
@@ -822,6 +923,27 @@ fn is_big_emoji(text: &str) -> bool {
     count > 0 && count <= 3
 }
 
+/// `MESSENGER_WEB_PROBE=restore`: where the web client keeps restored
+/// history. Lists the local database's tables whose names mention messages,
+/// backups or restore, with row counts. Names and counts only, no content.
+const RESTORE_PROBE_JS: &str = r#"
+    const out = {};
+    try {
+        const db = await require('LSDatabaseSingleton').getLSDatabaseSingletonPromiseOrValue();
+        const ReQL = require('ReQL');
+        const names = Object.keys(db.tables || {});
+        out.tableCount = names.length;
+        out.tables = {};
+        for (const name of names.filter((n) => /message|backup|restore|minos|epoch|e2ee|secure|thread/i.test(n))) {
+            try {
+                const rows = await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables[name]));
+                out.tables[name] = rows.length;
+            } catch (e) { out.tables[name] = 'err ' + String(e).slice(0, 40); }
+        }
+    } catch (e) { out.error = String(e).slice(0, 160); }
+    return JSON.stringify(out);
+"#;
+
 /// `MESSENGER_WEB_PROBE=1`: open the hidden web engine and log (to stderr)
 /// whether the web client's restore modules are reachable. Read-only.
 fn web_probe(ctx: &egui::Context) {
@@ -838,7 +960,7 @@ fn web_probe(ctx: &egui::Context) {
             PROBE.set((1, 0, Some(Instant::now())));
         }
         1 if crate::macos::web_loaded() && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(8)) => {
-            let body = r#"
+            let body = if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("restore") { RESTORE_PROBE_JS } else { r#"
                 const out = {path: location.pathname, hasRequire: typeof require};
                 try { out.vesta = Object.keys(require('VestaClient')); } catch (e) { out.vestaErr = String(e).slice(0, 80); }
                 try {
@@ -848,7 +970,7 @@ fn web_probe(ctx: &egui::Context) {
                     out.vestaInfo = JSON.parse(t.split('\n')[0]).data.viewer.messenger_default_encrypted_backup.vesta_user_info;
                 } catch (e) { out.infoErr = String(e).slice(0, 120); }
                 return JSON.stringify(out);
-            "#;
+            "# };
             if let Some(id) = crate::macos::web_call(body) {
                 PROBE.set((2, id, since));
             }
@@ -864,6 +986,117 @@ fn web_probe(ctx: &egui::Context) {
     if stage < 3 {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
+}
+
+struct HistoryJob {
+    thread: i64,
+    stage: HistoryStage,
+    started: Instant,
+    found: usize,
+}
+
+enum HistoryStage {
+    Start,
+    /// The hidden page is navigating to the chat.
+    Opening(Instant),
+    /// Waiting before the next read (time of the last one).
+    Idle(Instant),
+    Reading(u64),
+}
+
+/// "yes" if the web client's database holds a restored backup (the PIN
+/// restore ran on this Mac). Row counts only.
+const BACKUP_PRESENT_JS: &str = r#"
+    const ReQL = require('ReQL');
+    const db = await require('LSDatabaseSingleton').getLSDatabaseSingletonPromiseOrValue();
+    const t = db.tables.secure_encrypted_backups_recovery_code_status;
+    if (!t) return 'no';
+    const rows = await ReQL.toArrayAsync(ReQL.fromTableAscending(t));
+    return rows.length > 0 ? 'yes' : 'no';
+"#;
+
+/// Navigate the hidden page to an encrypted chat (`threadKey`), which makes
+/// the web client restore that chat's history from the backup.
+const OPEN_THREAD_JS: &str = r#"
+    location.assign('/messages/e2ee/t/' + encodeURIComponent(threadKey));
+    return 'ok';
+"#;
+
+/// Read one chat's messages (`threadKey`) and their attachments from the web
+/// client's database, as JSON. 64-bit columns are I64 pairs in that database.
+const READ_THREAD_JS: &str = r#"
+    const I64 = require('I64');
+    const ReQL = require('ReQL');
+    const db = await require('LSDatabaseSingleton').getLSDatabaseSingletonPromiseOrValue();
+    const str = (v) => v == null ? null : (Array.isArray(v) ? I64.to_string(v) : String(v));
+    const all = (t) => t ? ReQL.toArrayAsync(ReQL.fromTableAscending(t)) : Promise.resolve([]);
+    // Encrypted chats' text is "vaulted" at rest (MAWVault); open it like
+    // the web does when it shows a message. Unopenable text comes back empty.
+    let vault = null;
+    try { vault = require('MAWVault'); } catch (e) {}
+    const open = async (v) => {
+        if (typeof v !== 'string' || !v) return v || '';
+        if (!vault || !vault.isVaulted(v)) return v;
+        try { const t = await vault.unvault(v); return typeof t === 'string' ? t : ''; } catch (e) { return ''; }
+    };
+    const rows = (await all(db.tables.messages)).filter((r) => str(r.threadKey) === threadKey);
+    const ids = new Set(rows.map((r) => r.messageId));
+    const atts = (await all(db.tables.attachments)).filter((a) => ids.has(a.messageId));
+    const messages = [];
+    for (const r of rows) {
+        messages.push({ id: r.messageId, ts: str(r.timestampMs), sender: str(r.senderId), text: await open(r.text), unsent: !!r.isUnsent, admin: !!r.isAdminMessage });
+    }
+    const attachments = [];
+    for (const a of atts) {
+        attachments.push({ id: a.messageId, mime: a.previewUrlMimeType || '', preview: await open(a.previewUrl), w: str(a.previewWidth), h: str(a.previewHeight), title: await open(a.titleText) });
+    }
+    return JSON.stringify({ messages, attachments });
+"#;
+
+/// Messages from `READ_THREAD_JS`'s JSON. Attachments with a web link come
+/// along; ones only the page can open (blob: URLs) show as a label.
+fn parse_restored(json: &str) -> Vec<Message> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let num = |x: &serde_json::Value| x.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+    let mut out: Vec<Message> = v["messages"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter(|m| !m["admin"].as_bool().unwrap_or(false))
+                .filter(|m| !crate::store::is_secure_text_token(m["text"].as_str().unwrap_or_default()))
+                .map(|m| Message {
+                    id: m["id"].as_str().unwrap_or_default().to_string(),
+                    sender_id: num(&m["sender"]),
+                    timestamp_ms: num(&m["ts"]),
+                    text: m["text"].as_str().unwrap_or_default().to_string(),
+                    unsent: m["unsent"].as_bool().unwrap_or(false),
+                    ..Default::default()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for a in v["attachments"].as_array().into_iter().flatten() {
+        let Some(m) = out.iter_mut().find(|m| m.id == a["id"].as_str().unwrap_or_default()) else { continue };
+        let mime = a["mime"].as_str().unwrap_or_default();
+        let preview = a["preview"].as_str().unwrap_or_default();
+        if preview.starts_with("http") {
+            m.attachments.push(Attachment {
+                kind: if mime.starts_with("video") { AttachmentKind::Video } else { AttachmentKind::Image },
+                url: preview.to_string(),
+                preview_url: preview.to_string(),
+                title: a["title"].as_str().unwrap_or_default().to_string(),
+                subtitle: String::new(),
+                width: num(&a["w"]) as f32,
+                height: num(&a["h"]) as f32,
+            });
+        } else if m.text.is_empty() {
+            m.text = if mime.starts_with("video") { "🎬 Video".into() } else { "📷 Photo".into() };
+        }
+    }
+    // Nothing to show yet (text the page couldn't open): skip it, a later
+    // read may have it.
+    out.retain(|m| !m.text.is_empty() || !m.attachments.is_empty() || m.unsent);
+    out
 }
 
 #[derive(Default)]
@@ -1295,6 +1528,12 @@ impl MessengerApp {
                 self.composer(ui, store, thread, cmds);
             });
 
+        if thread.e2ee && !self.history_restored && self.restore_check.is_none() {
+            self.restore_check = Some(None);
+        }
+        if thread.e2ee && self.history_restored && self.history_job.is_none() && self.history_fetched.insert(key) {
+            self.history_job = Some(HistoryJob { thread: key, stage: HistoryStage::Start, started: Instant::now(), found: 0 });
+        }
         if thread.e2ee && messages.is_empty() {
             if e2ee_notice(ui, key) {
                 self.open_pin_restore(cmds);
