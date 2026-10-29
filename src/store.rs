@@ -505,6 +505,19 @@ impl Store {
 
 }
 
+/// The same message under two ids (received live over E2EE, and restored
+/// from the backup): same sender, same content, within 3 seconds.
+fn same_message(a: &Message, b: &Message) -> bool {
+    if a.id == b.id {
+        return true;
+    }
+    if a.sender_id != b.sender_id || (a.timestamp_ms - b.timestamp_ms).abs() > 3000 {
+        return false;
+    }
+    let media = |m: &Message| !m.attachments.is_empty() || m.text.starts_with("📷") || m.text.starts_with("🎬") || m.text == "Sticker";
+    a.text == b.text || (media(a) && media(b))
+}
+
 /// The web client keeps some restored messages' text as an encrypted
 /// reference (`<n>##<n><base64><n>##<n>`) that it opens only when showing
 /// the message; that's not the text.
@@ -515,12 +528,20 @@ pub fn is_secure_text_token(text: &str) -> bool {
 
 impl Store {
     /// Drop restored messages whose text is still an encrypted reference
-    /// (from before they were filtered out). Returns how many went.
+    /// (from before they were filtered out), and restored copies of messages
+    /// we already had under another id. Returns how many went.
     pub fn drop_secure_tokens(&mut self) -> usize {
         let mut n = 0;
         for list in self.messages.values_mut() {
             let before = list.len();
             list.retain(|m| !is_secure_text_token(&m.text));
+            let mut kept: Vec<Message> = Vec::with_capacity(list.len());
+            for m in list.drain(..) {
+                if !kept.iter().any(|k| same_message(k, &m)) {
+                    kept.push(m);
+                }
+            }
+            *list = kept;
             n += before - list.len();
         }
         n
@@ -534,6 +555,10 @@ impl Store {
         let mut added = 0;
         for mut m in messages {
             if m.id.is_empty() || known.contains(&m.id) {
+                continue;
+            }
+            // The same message received live over E2EE has another id here.
+            if self.messages.get(&thread_key).is_some_and(|v| v.iter().any(|x| same_message(x, &m))) {
                 continue;
             }
             m.thread_key = thread_key;
@@ -918,6 +943,18 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn restored_copies_are_deduplicated() {
+        let mut st = Store::default();
+        let live = Message { id: "3EB0LIVE".into(), thread_key: 7, sender_id: 1, text: "Chua".into(), timestamp_ms: 1_000_000, ..Default::default() };
+        st.insert_message(live);
+        let copy = Message { id: "mid.restored".into(), sender_id: 1, text: "Chua".into(), timestamp_ms: 1_001_200, ..Default::default() };
+        let later = Message { id: "mid.other".into(), sender_id: 1, text: "Chua".into(), timestamp_ms: 1_060_000, ..Default::default() };
+        assert_eq!(st.add_restored(7, vec![copy, later]), 1, "the copy is skipped, a later repeat isn't");
+        assert_eq!(st.messages[&7].len(), 2);
+    }
+
     #[test]
     fn cache_keeps_the_newest_messages_and_skips_pending() {
         let mut st = Store { me: 1, ..Default::default() };
