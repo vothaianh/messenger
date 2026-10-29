@@ -243,3 +243,96 @@ offline messages. Connect soon after registration.
   sees the message.
 - Sending: pictures only so far (`Listener::send_image`): encrypt, upload,
   then the normal per-device send. A plain copy goes into the cache.
+
+## Old history with the PIN: research (2026-10-29)
+
+Read-only look at the web client's encrypted-backup ("EB") code. Nothing was
+entered, registered or restored.
+
+- **PIN check = Vesta, an OPAQUE login against Meta's HSMs.** GraphQL:
+  `VestaServerGraphQLLoginProviderInitQuery` (`28587565877599806`),
+  `...BeginLoginMutation` (`28781838094734033`),
+  `...FinishLoginMutation` (`28557176640587196`); registration has the same
+  three (`...RegisterProvider...`). User info:
+  `useMWChatEncryptedBackupsVestaUserInfoRefetchQuery` (`23870520485955982`).
+- **The client crypto is a Rust crate compiled to wasm** (`VestaGetWasm`,
+  protobuf API `VestaWasm.pb`: `ValidateHsmKey`, `BeginRegister`,
+  `FinishRegister`, `BeginLogin{password}` → `{message, client_state}`,
+  `FinishLogin{client_state, l2_message, l2_message_sig, island_ed25519_pub}`
+  → `{session_key, export_key}`, `UnpackLoginPayload{login_payload,
+  export_key}` → user secret). Vendored crates in the wasm: **opaque-ke
+  1.3.0**, curve25519-dalek 3.2 (Ristretto255), sha2 0.9 (SHA-512),
+  ed25519-dalek 2.2 (the HSM "island" signs its messages), rsa 0.9 (HSM RSA
+  key at registration), pbkdf2 0.12, hkdf 0.11, aes-gcm 0.10.
+- **Archive ("Minos")**: `useMWEncryptedBackupsFetchBackupIdsV2Query`
+  (`25220416984279164`), `EBMinosMekFetchOnMissQuery` (`27665928069709083`,
+  message encryption keys), `EBMinosFetchContactKeysQuery`
+  (`26531892553066563`); decryption in `EncryptedBackupsSymmetricEncryptionUtils`.
+  The restore registers a virtual device (`...GetVirtualDevices...`).
+- **Risk**: the HSM counts failed logins (`login_attempts`) and, like other
+  HSM PIN schemes, can lock or wipe the backup after too many. A client that
+  gets any OPAQUE detail wrong (ciphersuite, slow hash, identities, context)
+  burns an attempt with a correct PIN. Validate the implementation offline
+  (e.g. against opaque-ke 1.3 test vectors and our own server) before the
+  first real login, and stop after one failure.
+
+### Offline cross-test of the Vesta client (2026-10-29)
+
+- The Vesta client wasm (`VestaGetWasm`, ~760 KB, `static.xx.fbcdn.net`) is a
+  WASI command module (`xplat/rust/vesta_client`) with one export,
+  `execute_command`. The web's `WAWasmReactor` writes a `CliCommand` protobuf
+  to the file `input` on a virtual drive and reads a `CliResponse` from
+  `output`. Field numbers: `CliCommand{validateHsmKey=1, beginRegister=2,
+  finishRegister=3, beginLogin=4, finishLogin=5, unpackLoginPayload=6}`,
+  `CliResponse{errorCode=1, ... same order from 2}`; requests and replies as
+  listed above. Error codes: 1 InsufficientResultBuffer, 2 InvalidUserPassword,
+  3 MalformedServerResponse, 4 MalformedClientInput, 5 Encryption,
+  6 Decryption, 7 Serialization, 8 Deserialization, 9 RsaInvalidKey,
+  10 RsaVerification, 11 Ed25519InvalidKey, 12 Ed25519Verification.
+- It runs fine under Node's WASI with a temp dir preopened (no network).
+  `BeginLogin` gives a 98-byte `l1` = opaque-ke 1.3 `CredentialRequest`
+  (Ristretto255 alpha, nonce, empty info with u16 length, ephemeral key).
+- Not plain opaque-ke defaults: the slow hash is PBKDF2
+  (`opaque_slow_hash_pbkdf.rs`, salt label `OPAQUE_PBKDF2_SALT`), the
+  server messages are protobuf-wrapped (`proto/messages.rs`:
+  `registration_response_bytes`, `login_first_message_bytes`,
+  `login_second_message_bytes`, ...), and HSM signatures look like a
+  structured "OTA" signature (errors `OtaSignature1Unverified`,
+  `OtaInvalidRole`, `Expired`). A bare Ed25519 signature over the opaque
+  `CredentialResponse` fails with error 12, whatever the hashing.
+- So re-implementing the client means disassembling the wasm for the PBKDF2
+  parameters and the signature format. The safer option is to run this same
+  wasm in the app (e.g. `wasmi` with a tiny in-memory WASI), fetched at
+  runtime like the web does: byte-for-byte the web's client, so a correct PIN
+  can't fail because of us.
+
+### PIN login flow (from `E2EEBackupSecretRestoreModule`, 2026-10-29)
+
+1. `VestaServerGraphQLLoginProviderInitQuery` with
+   `{request: {fbid, product_use_case: "MSGR_ENC_BACKUP",
+   vesta_client_api_version: 6}}` →
+   `fbid_based_auth_layer_vesta_login_init {base64url_encoded_island_rsa_pub(_signature),
+   base64url_encoded_opaque_pub(_signature),
+   base64url_encoded_island_ed25519_pub(_signature), is_registered,
+   attempts_remaining}`. Stop if not registered.
+2. wasm `validateHsmKey(island_rsa_pub, sig)` and
+   `validateHsmKey(island_ed25519_pub, sig)`; stop if either is false.
+3. wasm `beginLogin(pin)` → `l1`, client state.
+4. `...BeginLoginMutation` `{input: {fbid, product_use_case,
+   base64url_encoded_opaque_l1, vesta_client_api_version: 6,
+   vesta_client_protocol_version: 1}}` →
+   `fbid_based_auth_layer_vesta_begin_login {base64url_encoded_opaque_l2,
+   base64url_encoded_opaque_l2_sig}`.
+5. wasm `finishLogin(l2, l2_sig, island_ed25519_pub, state)` → `l3`,
+   session key, export key.
+6. `...FinishLoginMutation` (same input with `base64url_encoded_opaque_l3`) →
+   `fbid_based_auth_layer_vesta_finish_login_v2 {login_success,
+   base64url_encoded_login_payload, attempts_remaining,
+   trigger_post_login_register}` or `XFBVestaError {vesta_error_code}`.
+7. wasm `unpackLoginPayload(payload, session_key, export_key,
+   use_protobuf_mode = true)` → the user secret (backup key data).
+
+The wasm URL is in the `/messages/` HTML as bx asset `72238`
+(`"72238":{"uri":"…wasm…"}`). Next to research: what the web does with the
+secret (`useMWChatEncryptedBackupsAddDevice`, virtual devices, `EBMinos*`
+queries) to fetch and decrypt the archived messages.

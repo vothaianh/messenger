@@ -165,6 +165,10 @@ pub struct MessengerApp {
     pending_files: Vec<std::path::PathBuf>,
     /// Selected pack in the sticker picker.
     sticker_pack: Option<String>,
+    /// The sticker store is open in the sticker panel, and the store pack
+    /// being previewed (id, name).
+    sticker_store: bool,
+    store_preview: Option<(String, String)>,
     last_layout_log: String,
     /// Message list as of the previous frame, to keep the view in place when
     /// older messages are inserted above it.
@@ -227,6 +231,8 @@ impl MessengerApp {
             theme,
             applied_theme: None,
             sticker_pack: None,
+            sticker_store: false,
+            store_preview: None,
             last_layout_log: String::new(),
             prev_view: None,
             scroll_fix: None,
@@ -372,6 +378,17 @@ impl eframe::App for MessengerApp {
     }
 }
 
+/// Whether our newest message for `t` is its latest activity (not, say, a
+/// reaction or a rename after it), so the snippet can be built from it with
+/// the sender's name.
+fn newest_is_latest(store: &Store, t: &Thread) -> bool {
+    store
+        .messages
+        .get(&t.key)
+        .and_then(|v| v.iter().rev().find(|m| !m.unsent && !m.pending))
+        .is_some_and(|m| m.timestamp_ms + 1000 >= t.last_activity_ms)
+}
+
 /// "You: …" / "Name: …" (groups) / "…" for the newest message we have: used
 /// for encrypted chats (decrypted on this Mac), and for any chat whose server
 /// snippet is empty (a live photo, video or sticker carries no text).
@@ -392,6 +409,7 @@ fn e2ee_snippet(store: &Store, t: &Thread) -> String {
     if m.sender_id == store.me {
         format!("You: {text}")
     } else if t.is_group() {
+        // First name only, like Messenger ("Truc: …").
         let name = store.member_name(t.key, m.sender_id);
         format!("{}: {text}", name.split_whitespace().next().unwrap_or(&name))
     } else {
@@ -509,6 +527,131 @@ fn media_image<'a>(ctx: &egui::Context, url: &str) -> egui::Image<'a> {
     egui::Image::new(url.to_string())
 }
 
+/// A pack's stickers in a grid; a click sends one to `thread`.
+fn sticker_grid(ui: &mut egui::Ui, stickers: &Option<Vec<crate::session::Sticker>>, thread: i64, cmds: &mut Vec<Command>, close: &mut bool) {
+    const CELL: f32 = 84.0;
+    match stickers {
+        None => {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| ui.spinner());
+        }
+        Some(list) if list.is_empty() => {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| ui.label(sf("No stickers", 13.0, 500).color(pal().muted)));
+        }
+        Some(list) => {
+            ui.spacing_mut().item_spacing = Vec2::splat(2.0);
+            ui.horizontal_wrapped(|ui| {
+                for s in list {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(CELL), Sense::click());
+                    if resp.hovered() {
+                        ui.painter().rect_filled(rect, CornerRadius::same(10), pal().selected);
+                    }
+                    if ui.is_rect_visible(rect) {
+                        media_image(ui.ctx(), &s.image).paint_at(ui, rect.shrink(6.0));
+                    }
+                    let resp = if s.label.is_empty() { resp } else { resp.on_hover_text(&s.label) };
+                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        cmds.push(Command::SendSticker { thread, sticker_id: s.id, image: s.image.clone(), label: s.label.clone() });
+                        *close = true;
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// The "+" at the end of the sticker tabs (opens the store): a drawn plus
+/// in a 38 pt tab, like the pack tabs.
+fn plus_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(8), pal().selected);
+    }
+    let c = rect.center();
+    let color = if resp.hovered() { pal().blue } else { pal().muted };
+    let st = Stroke::new(1.8, color);
+    ui.painter().line_segment([c - Vec2::new(7.0, 0.0), c + Vec2::new(7.0, 0.0)], st);
+    ui.painter().line_segment([c - Vec2::new(0.0, 7.0), c + Vec2::new(0.0, 7.0)], st);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A drawn "back" chevron button.
+fn chevron_button(ui: &mut egui::Ui) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    if resp.hovered() {
+        ui.painter().circle_filled(rect.center(), 14.0, pal().quote);
+    }
+    let c = rect.center();
+    let st = Stroke::new(2.0, if resp.hovered() { pal().blue } else { pal().text });
+    ui.painter().line_segment([c + Vec2::new(3.0, -6.0), c + Vec2::new(-3.0, 0.0)], st);
+    ui.painter().line_segment([c + Vec2::new(-3.0, 0.0), c + Vec2::new(3.0, 6.0)], st);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A 32 pt round action with an SF Symbol: filled blue (`!quiet`) or a quiet
+/// translucent one; a spinner while `busy`.
+fn circle_action(ui: &mut egui::Ui, symbol: &str, quiet: bool, busy: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let fill = match (quiet, resp.hovered()) {
+        (false, _) => pal().blue,
+        (true, true) => pal().selected,
+        (true, false) => pal().input,
+    };
+    ui.painter().circle_filled(rect.center(), 16.0, fill);
+    if busy {
+        egui::Spinner::new().size(14.0).paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(14.0)));
+    } else {
+        let ink = if quiet { pal().text } else { Color32::WHITE };
+        if let Some(png) = crate::macos::sf_symbol_png(symbol, 13.0, [ink.r(), ink.g(), ink.b()]) {
+            let dim = |i: usize| png.get(i..i + 4).map_or(1.0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32);
+            let (w, h) = (dim(16), dim(20));
+            let scale = 15.0 / w.max(h);
+            let r = Rect::from_center_size(rect.center(), Vec2::new(w * scale, h * scale));
+            egui::Image::from_bytes(format!("bytes://sym/{symbol}-{:?}.png", ink), png).paint_at(ui, r);
+        }
+    }
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Up to three emoji and nothing else, shown large like Messenger does.
+/// Emoticons such as "=))" or ":)" are punctuation, not emoji: they stay text.
+fn is_big_emoji(text: &str) -> bool {
+    let joiner = |c: char| matches!(c, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}') || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c) || ('\u{E0020}'..='\u{E007F}').contains(&c);
+    let pictograph = |c: char| {
+        ('\u{1F000}'..='\u{1FAFF}').contains(&c)
+            || ('\u{2600}'..='\u{27BF}').contains(&c)
+            || ('\u{2B00}'..='\u{2BFF}').contains(&c)
+            || ('\u{2190}'..='\u{21FF}').contains(&c)
+            || ('\u{2300}'..='\u{23FF}').contains(&c)
+            || matches!(c, '\u{00A9}' | '\u{00AE}' | '\u{203C}' | '\u{2049}' | '\u{2122}' | '\u{2139}' | '\u{3030}' | '\u{303D}' | '\u{3297}' | '\u{3299}')
+    };
+    let text = text.trim();
+    let mut count = 0;
+    let mut regional_seen = 0;
+    let mut prev_zwj = false;
+    for c in text.chars() {
+        if joiner(c) {
+            prev_zwj = c == '\u{200D}';
+            continue;
+        }
+        if !pictograph(c) {
+            return false;
+        }
+        // Parts of a ZWJ sequence (family, profession emoji) count once, and
+        // so does a flag (a pair of regional indicators).
+        let regional = ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+        if regional {
+            regional_seen += 1;
+        }
+        if !prev_zwj && (!regional || regional_seen % 2 == 1) {
+            count += 1;
+        }
+        prev_zwj = false;
+    }
+    count > 0 && count <= 3
+}
+
 /// Memory key of the image open in the in-app viewer.
 const IMAGE_VIEWER: &str = "image_viewer";
 
@@ -561,6 +704,25 @@ fn image_viewer(ctx: &egui::Context) {
         });
     if close {
         ctx.data_mut(|d| d.remove::<Option<String>>(id));
+    }
+}
+
+#[cfg(test)]
+mod emoji_tests {
+    use super::is_big_emoji;
+
+    #[test]
+    fn big_emoji_only_for_real_emoji() {
+        assert!(is_big_emoji("👍"));
+        assert!(is_big_emoji("😆😆😆"));
+        assert!(is_big_emoji("❤️"));
+        assert!(is_big_emoji("👨‍👩‍👧"));
+        assert!(is_big_emoji("🇻🇳"));
+        assert!(!is_big_emoji("=))"));
+        assert!(!is_big_emoji(":)"));
+        assert!(!is_big_emoji("..."));
+        assert!(!is_big_emoji("😆😆😆😆"));
+        assert!(!is_big_emoji("ok 👍"));
     }
 }
 
@@ -745,7 +907,7 @@ impl MessengerApp {
                         ui.add(egui::Label::new(name).truncate());
                         let snippet = if typing {
                             "typing…".to_string()
-                        } else if t.e2ee || t.snippet.trim().is_empty() {
+                        } else if t.e2ee || t.snippet.trim().is_empty() || newest_is_latest(store, t) {
                             // The server can't know encrypted content, and a live
                             // photo or video arrives without a snippet: describe the
                             // newest message we have.
@@ -1192,11 +1354,40 @@ impl MessengerApp {
             cmds.push(Command::LoadStickerPack { pack: id.clone() });
         }
         let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
-        let area = egui::Area::new(egui::Id::NULL.with("sticker_panel")).order(egui::Order::Foreground).pivot(egui::Align2::LEFT_BOTTOM).fixed_pos(bottom_left).show(ctx, |ui| {
-            Frame::default().fill(pal().popup).stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(16)).inner_margin(Margin::same(10)).show(ui, |ui| {
+        // The panel is its own borderless, transparent window with native
+        // Liquid Glass behind it (`macos::glass_window`): an egui popup can't
+        // be glass, since the glass sits behind egui and the messages under
+        // the popup would cover it. It sits where the popup was, above the
+        // composer's left edge.
+        let size = Vec2::new(W + 20.0, 440.0);
+        let local = Rect::from_min_size(Pos2::new(bottom_left.x, bottom_left.y - size.y), size);
+        let origin = ctx.input(|i| i.viewport().inner_rect.map(|r| r.min)).unwrap_or_default();
+        let builder = egui::ViewportBuilder::default()
+            .with_title(crate::macos::STICKER_WINDOW)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_position(origin + local.min.to_vec2())
+            .with_inner_size(size);
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("sticker_panel"), builder, |pctx, _| {
+            if pctx.input(|i| i.key_pressed(Key::Escape)) {
+                close = true;
+            }
+            crate::macos::glass_window(crate::macos::STICKER_WINDOW, 16.0);
+            let frame = Frame::NONE.stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(16)).inner_margin(Margin::same(10));
+            egui::CentralPanel::default().frame(frame).show(pctx, |ui| {
                 ui.set_width(W);
-                // Pack tabs: each pack's thumbnail, the selected one underlined.
+                if self.sticker_store {
+                    self.sticker_store_view(ui, thread, cmds, &mut close);
+                    return;
+                }
+                // Pack tabs: each pack's thumbnail, the selected one underlined
+                // (scrolling sideways), then the store button.
                 ui.horizontal(|ui| {
+                    let store_w = 40.0;
+                    let tabs_w = ui.available_width() - store_w;
+                    ScrollArea::horizontal().id_salt("sticker_tabs").max_width(tabs_w).scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for p in &packs {
                         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
@@ -1214,49 +1405,148 @@ impl MessengerApp {
                             self.sticker_pack = Some(p.id.clone());
                         }
                     }
+                    });
+                    if plus_button(ui).on_hover_text("Sticker Store").clicked() {
+                        self.sticker_store = true;
+                        self.store_preview = None;
+                    }
                 });
                 ui.separator();
                 ScrollArea::vertical().id_salt("sticker_grid").max_height(340.0).auto_shrink([false, false]).show(ui, |ui| {
-                    match &stickers {
-                        None => {
-                            ui.add_space(40.0);
-                            ui.vertical_centered(|ui| ui.spinner());
-                        }
-                        Some(list) if list.is_empty() => {
-                            ui.add_space(40.0);
-                            ui.vertical_centered(|ui| ui.label(sf("No stickers", 13.0, 500).color(pal().muted)));
-                        }
-                        Some(list) => {
-                            ui.spacing_mut().item_spacing = Vec2::splat(2.0);
-                            ui.horizontal_wrapped(|ui| {
-                                for s in list {
-                                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(CELL), Sense::click());
-                                    if resp.hovered() {
-                                        ui.painter().rect_filled(rect, CornerRadius::same(10), pal().selected);
-                                    }
-                                    if ui.is_rect_visible(rect) {
-                                        media_image(ui.ctx(), &s.image).paint_at(ui, rect.shrink(6.0));
-                                    }
-                                    let resp = if s.label.is_empty() { resp } else { resp.on_hover_text(&s.label) };
-                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                        cmds.push(Command::SendSticker { thread, sticker_id: s.id });
-                                        close = true;
-                                    }
-                                }
-                            });
-                        }
-                    }
+                    sticker_grid(ui, &stickers, thread, cmds, &mut close);
                 });
             });
         });
-        // Clicking outside (except on the sticker button itself) closes it.
+        // Clicking in the main window (except on the composer row, where the
+        // sticker button is) closes it.
         let pointer = ctx.input(|i| i.pointer.interact_pos());
-        if ctx.input(|i| i.pointer.any_pressed()) && pointer.is_some_and(|p| !area.response.rect.contains(p) && p.y < bottom_left.y) {
+        if ctx.input(|i| i.pointer.any_pressed()) && pointer.is_some_and(|p| !local.contains(p) && p.y < bottom_left.y) {
             close = true;
         }
         if close {
             self.show_stickers = false;
+            self.sticker_store = false;
+            self.store_preview = None;
         }
+    }
+
+    /// The sticker store inside the sticker panel: every pack as a card
+    /// (banner, name, artist, preview and add/remove), loading more as you
+    /// scroll; a preview shows the pack's stickers, which can be sent.
+    fn sticker_store_view(&mut self, ui: &mut egui::Ui, thread: i64, cmds: &mut Vec<Command>, close: &mut bool) {
+        let (store, loading, has_more, changing, tray) = {
+            let st = self.shared.stickers.lock().unwrap();
+            (st.store.clone(), st.loading.contains("store"), st.store_next.is_some(), st.tray_changing.clone(), st.packs.clone().unwrap_or_default())
+        };
+        if store.is_none() && !loading {
+            cmds.push(Command::LoadStickerStore { more: false });
+        }
+        let in_tray = |id: &str, listed: bool| tray.iter().any(|p| p.id == id) || listed;
+
+        // Header: back (from a preview), title, done.
+        ui.horizontal(|ui| {
+            ui.set_height(32.0);
+            if self.store_preview.is_some() {
+                if chevron_button(ui).on_hover_text("Back").clicked() {
+                    self.store_preview = None;
+                }
+            }
+            let title = self.store_preview.as_ref().map_or("Sticker Store".to_string(), |(_, name)| name.clone());
+            ui.add(egui::Label::new(sf(&title, 16.0, 700)).truncate());
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(egui::Button::new(sf("Done", 13.0, 600).color(pal().blue)).frame(false)).clicked() {
+                    self.sticker_store = false;
+                    self.store_preview = None;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        if let Some((id, _)) = self.store_preview.clone() {
+            let listed = store.as_ref().and_then(|l| l.iter().find(|p| p.id == id)).is_some_and(|p| p.in_tray);
+            let added = in_tray(&id, listed);
+            let busy = changing.contains(&id);
+            let label = if busy { "…" } else if added { "Remove from tray" } else { "Add to tray" };
+            let fill = if added { pal().input } else { pal().blue };
+            let ink = if added { pal().text } else { Color32::WHITE };
+            let b = egui::Button::new(sf(label, 13.0, 600).color(ink)).fill(fill).corner_radius(CornerRadius::same(16)).min_size(Vec2::new(ui.available_width(), 32.0));
+            if ui.add_enabled(!busy, b).clicked() {
+                cmds.push(Command::StickerPackTray { pack: id.clone(), add: !added });
+            }
+            ui.add_space(6.0);
+            let (stickers, loading_pack) = {
+                let st = self.shared.stickers.lock().unwrap();
+                (st.pack_stickers.get(&id).cloned(), st.loading.contains(&id))
+            };
+            if stickers.is_none() && !loading_pack {
+                cmds.push(Command::LoadStickerPack { pack: id.clone() });
+            }
+            ScrollArea::vertical().id_salt(("store_pack", &id)).max_height(320.0).auto_shrink([false, false]).show(ui, |ui| {
+                sticker_grid(ui, &stickers, thread, cmds, close);
+            });
+            return;
+        }
+
+        ScrollArea::vertical().id_salt("sticker_store").max_height(360.0).auto_shrink([false, false]).show(ui, |ui| {
+            let Some(list) = &store else {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| ui.spinner());
+                return;
+            };
+            if list.is_empty() && !loading {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| ui.label(sf("The sticker store couldn't load", 13.0, 500).color(pal().muted)));
+                return;
+            }
+            let w = ui.available_width();
+            for p in list {
+                Frame::default().fill(pal().quote).corner_radius(CornerRadius::same(14)).inner_margin(Margin::same(8)).show(ui, |ui| {
+                    ui.set_width(w - 16.0);
+                    if p.preview.starts_with("http") {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(w - 16.0, 96.0), Sense::click());
+                        if ui.is_rect_visible(rect) {
+                            media_image(ui.ctx(), &p.preview).fit_to_exact_size(rect.size()).maintain_aspect_ratio(true).paint_at(ui, rect);
+                        }
+                        if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.store_preview = Some((p.id.clone(), p.name.clone()));
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(w - 16.0 - 84.0);
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.add(egui::Label::new(sf(&p.name, 13.0, 600)).truncate());
+                            ui.add(egui::Label::new(sf(&p.artist, 11.0, 400).color(pal().muted)).truncate());
+                        });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let added = in_tray(&p.id, p.in_tray);
+                            let busy = changing.contains(&p.id);
+                            if circle_action(ui, if added { "checkmark" } else { "plus" }, added, busy)
+                                .on_hover_text(if added { "Remove from tray" } else { "Add to tray" })
+                                .clicked()
+                                && !busy
+                            {
+                                cmds.push(Command::StickerPackTray { pack: p.id.clone(), add: !added });
+                            }
+                            if circle_action(ui, "eye", true, false).on_hover_text("Preview").clicked() {
+                                self.store_preview = Some((p.id.clone(), p.name.clone()));
+                            }
+                        });
+                    });
+                });
+                ui.add_space(6.0);
+            }
+            if loading {
+                ui.vertical_centered(|ui| ui.spinner());
+            } else if has_more {
+                // Load the next page when the end of the list scrolls into view.
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(w, 1.0), Sense::hover());
+                if ui.is_rect_visible(rect) {
+                    cmds.push(Command::LoadStickerStore { more: true });
+                }
+            }
+        });
     }
 
     fn message_menu(&mut self, ctx: &egui::Context, store: &Store, thread: &Thread, m: &Message, mine: bool, cmds: &mut Vec<Command>) {
@@ -1370,7 +1660,7 @@ impl MessengerApp {
         };
         let has_card = m.attachments.iter().any(|a| matches!(a.kind, AttachmentKind::Link) || !a.title.is_empty());
         if !m.text.is_empty() && !(bare_link && has_card) {
-            let big_emoji = m.text.chars().count() <= 3 && m.text.chars().all(|c| !c.is_alphanumeric() && !c.is_whitespace());
+            let big_emoji = is_big_emoji(&m.text);
             let r = if big_emoji {
                 ui.label(RichText::new(&m.text).size(40.0))
             } else {
@@ -1503,7 +1793,7 @@ impl MessengerApp {
 
         let clip = Some(button(row.left() + 16.0));
         // Stickers (not in encrypted chats: sending them there isn't supported).
-        let sticker = (!thread.e2ee).then(|| button(row.left() + 16.0 + 36.0));
+        let sticker = Some(button(row.left() + 16.0 + 36.0));
         let send = button(row.right() - 16.0);
         let pill = Rect::from_min_max(
             Pos2::new(sticker.or(clip).map_or(row.left(), |c| c.right() + 8.0), row.top()),
@@ -1528,7 +1818,7 @@ impl MessengerApp {
                 self.show_stickers = !self.show_stickers;
             }
         }
-        if self.show_stickers && !thread.e2ee {
+        if self.show_stickers {
             self.sticker_panel(ui.ctx(), Pos2::new(pill.left() - 40.0, pill.top() - 8.0), key, cmds);
         }
         let smiley = Rect::from_center_size(Pos2::new(pill.right() - 20.0, mid_y), Vec2::splat(32.0));

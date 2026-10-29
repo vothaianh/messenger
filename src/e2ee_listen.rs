@@ -93,6 +93,9 @@ pub enum OutgoingPayload {
     Text(String),
     /// A picture file to encrypt, upload and send.
     Image(std::path::PathBuf),
+    /// A sticker picture (link) to download, encrypt, upload and send as a
+    /// sticker, with its accessibility label.
+    Sticker { url: String, label: String },
 }
 
 /// Messenger message ids: milliseconds since the epoch shifted left 22 bits,
@@ -339,6 +342,47 @@ impl Listener {
             e2ee_media::write_private(&cached, &img.bytes)?;
         }
         let out = crate::armadillo::encode_image(&file, uploaded.object_id.as_deref(), crate::store::now_ms() / 1000, "");
+        self.send_application(peer, out, backlog).await
+    }
+
+    /// Send a sticker: its picture (WebP, often animated) encrypted and
+    /// uploaded like an image, in an Armadillo sticker message.
+    pub async fn send_sticker(
+        &mut self,
+        peer: i64,
+        url: &str,
+        label: &str,
+        http: &reqwest::Client,
+        media_conn: &mut Option<MediaConn>,
+        backlog: &mut Vec<Vec<u8>>,
+    ) -> Result<Received> {
+        use crate::e2ee_media::{self, MediaType};
+        let bytes = http.get(url).send().await?.error_for_status()?.bytes().await?.to_vec();
+        let format = image::guess_format(&bytes).map_err(|_| anyhow!("the sticker isn't a picture"))?;
+        let (width, height) = image::load_from_memory_with_format(&bytes, format).map(|i| (i.width(), i.height())).unwrap_or((512, 512));
+        // Animated WebP has an ANIM chunk.
+        let animated = bytes.windows(4).take(256).any(|w| w == b"ANIM");
+        let enc = e2ee_media::encrypt(&bytes, MediaType::Image)?;
+        if !media_conn.as_ref().is_some_and(MediaConn::fresh) {
+            *media_conn = Some(self.media_conn(backlog).await?);
+        }
+        let conn = media_conn.as_ref().expect("just fetched");
+        let uploaded = e2ee_media::upload(http, &conn.hosts, &conn.auth, MediaType::Image, &enc).await?;
+        let file = crate::armadillo::MediaFile {
+            direct_path: uploaded.direct_path,
+            media_key: enc.media_key.to_vec(),
+            file_sha256: enc.file_sha256.to_vec(),
+            file_enc_sha256: enc.file_enc_sha256.to_vec(),
+            mimetype: format.to_mime_type().to_string(),
+            file_length: bytes.len() as u64,
+            width,
+            height,
+            thumbnail: Vec::new(),
+        };
+        if let Some(cached) = e2ee_media::cached_path(&file) {
+            e2ee_media::write_private(&cached, &bytes)?;
+        }
+        let out = crate::armadillo::encode_sticker(&file, uploaded.object_id.as_deref(), crate::store::now_ms() / 1000, animated, label);
         self.send_application(peer, out, backlog).await
     }
 
@@ -812,6 +856,7 @@ pub async fn run(
                         let sent = match &out.payload {
                             OutgoingPayload::Text(text) => listener.send_text(out.peer, text, &mut backlog).await,
                             OutgoingPayload::Image(path) => listener.send_image(out.peer, path, &session.http, &mut media_conn, &mut backlog).await,
+                            OutgoingPayload::Sticker { url, label } => listener.send_sticker(out.peer, url, label, &session.http, &mut media_conn, &mut backlog).await,
                         };
                         match sent {
                             Ok(rec) => {

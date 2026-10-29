@@ -39,7 +39,13 @@ pub enum Command {
     RefreshRecent { thread: i64 },
     LoadStickerPacks,
     LoadStickerPack { pack: String },
-    SendSticker { thread: i64, sticker_id: i64 },
+    /// The sticker store's first page, or (`more`) the next one.
+    LoadStickerStore { more: bool },
+    /// Add a store pack to the tray (`add`) or remove it.
+    StickerPackTray { pack: String, add: bool },
+    /// A sticker by id; encrypted chats send its picture (`image`) as an
+    /// Armadillo sticker.
+    SendSticker { thread: i64, sticker_id: i64, image: String, label: String },
     LoadMoreThreads,
     Mute { thread: i64, minutes: Option<i64> },
 }
@@ -49,8 +55,16 @@ pub struct StickerState {
     /// None until the tray has been fetched.
     pub packs: Option<Vec<crate::session::StickerPack>>,
     pub pack_stickers: std::collections::HashMap<String, Vec<crate::session::Sticker>>,
-    /// Requests in flight (pack ids, or "" for the tray).
+    /// Requests in flight (pack ids, or "" for the tray, "store" for a
+    /// store page).
     pub loading: std::collections::HashSet<String>,
+    /// The sticker store: packs loaded so far (None until the first page),
+    /// its id and the next page's cursor.
+    pub store: Option<Vec<crate::session::StorePack>>,
+    pub store_id: String,
+    pub store_next: Option<String>,
+    /// Packs being added to or removed from the tray.
+    pub tray_changing: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -598,6 +612,81 @@ impl Conn {
         });
     }
 
+    /// Fetch the store's first page, or the next one.
+    fn load_sticker_store(&self, more: bool) {
+        let page = {
+            let mut st = self.shared.stickers.lock().unwrap();
+            if !st.loading.insert("store".into()) {
+                return;
+            }
+            match (more, &st.store_next) {
+                (false, _) => None,
+                (true, Some(next)) => Some((st.store_id.clone(), next.clone())),
+                (true, None) => {
+                    st.loading.remove("store");
+                    return;
+                }
+            }
+        };
+        let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
+        tokio::spawn(async move {
+            let result = session.sticker_store(page.as_ref().map(|(id, cursor)| (id.as_str(), cursor.as_str()))).await;
+            let mut st = shared.stickers.lock().unwrap();
+            match result {
+                Ok(p) => {
+                    st.store_id = p.store_id;
+                    st.store_next = p.next;
+                    let list = st.store.get_or_insert_with(Vec::new);
+                    if page.is_none() {
+                        list.clear();
+                    }
+                    list.extend(p.packs);
+                }
+                Err(e) => {
+                    eprintln!("[stickers] store: {e:#}");
+                    st.store.get_or_insert_with(Vec::new);
+                    st.store_next = None;
+                }
+            }
+            st.loading.remove("store");
+            drop(st);
+            repaint();
+        });
+    }
+
+    /// Add a store pack to the tray or remove it, then refresh the tray.
+    fn sticker_pack_tray(&self, pack: String, add: bool) {
+        if !self.shared.stickers.lock().unwrap().tray_changing.insert(pack.clone()) {
+            return;
+        }
+        let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
+        tokio::spawn(async move {
+            let result = session.sticker_pack_tray(&pack, add).await;
+            let tray = match &result {
+                Ok(()) => session.sticker_packs().await.ok(),
+                Err(_) => None,
+            };
+            let mut st = shared.stickers.lock().unwrap();
+            st.tray_changing.remove(&pack);
+            match result {
+                Ok(()) => {
+                    if let Some(p) = st.store.as_mut().and_then(|l| l.iter_mut().find(|p| p.id == pack)) {
+                        p.in_tray = add;
+                    }
+                    if let Some(tray) = tray {
+                        st.packs = Some(tray);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[stickers] tray change: {e:#}");
+                    drop(st);
+                    *shared.error.lock().unwrap() = Some(format!("Couldn't {} the sticker pack: {e}", if add { "add" } else { "remove" }));
+                }
+            }
+            repaint();
+        });
+    }
+
     /// Fetch the sticker tray (`None`) or one pack's stickers, once.
     fn load_stickers(&self, pack: Option<String>) {
         let key = pack.clone().unwrap_or_default();
@@ -710,6 +799,11 @@ impl Conn {
                 self.send_e2ee(*thread, OutgoingPayload::Text(text.clone()), text.clone())?;
                 return Ok(None);
             }
+            Command::SendSticker { thread, image, label, .. } if e2ee(thread) => {
+                let payload = crate::e2ee_listen::OutgoingPayload::Sticker { url: image.clone(), label: label.clone() };
+                self.send_e2ee(*thread, payload, "Sticker".into())?;
+                return Ok(None);
+            }
             // Encrypted chats: pictures only for now (videos and files aren't wired up).
             Command::SendFiles { thread, paths, .. } if e2ee(thread) => {
                 let (images, others): (Vec<_>, Vec<_>) =
@@ -802,6 +896,12 @@ impl Conn {
                 self.tasks(vec![("742", p, "edit_message".into())])
             }
             Command::MarkRead { thread } => {
+                // Clear the unread dot right away: the server's read watermark
+                // update isn't always pushed back to us.
+                if let Some(t) = self.shared.store.lock().unwrap().threads.get_mut(&thread) {
+                    t.last_read_ms = t.last_read_ms.max(t.last_activity_ms);
+                }
+                (self.repaint)();
                 let p = json!({"thread_id": thread, "last_read_watermark_ts": now_ms(), "sync_group": 1});
                 self.tasks(vec![("21", p, thread.to_string())])
             }
@@ -828,7 +928,15 @@ impl Conn {
                 self.load_stickers(Some(pack));
                 return Ok(None);
             }
-            Command::SendSticker { thread, sticker_id } => {
+            Command::LoadStickerStore { more } => {
+                self.load_sticker_store(more);
+                return Ok(None);
+            }
+            Command::StickerPackTray { pack, add } => {
+                self.sticker_pack_tray(pack, add);
+                return Ok(None);
+            }
+            Command::SendSticker { thread, sticker_id, .. } => {
                 let otid = new_otid();
                 self.shared.store.lock().unwrap().add_pending(thread, otid, "Sticker".into(), None);
                 (self.repaint)();

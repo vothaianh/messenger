@@ -60,6 +60,8 @@ one small native app (about 20 MB) that opens instantly with your recent chats.
 
 ### Media and links
 - Photos, videos, stickers, files and voice messages
+- Sticker panel in Liquid Glass with a sticker store: browse packs, preview
+  them, add or remove them from your tray, send from any pack
 - Photos open in an in-app viewer; videos play in a native AVKit player window
 - Shared posts and reels as preview cards (picture, title, source)
 

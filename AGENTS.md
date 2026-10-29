@@ -116,6 +116,15 @@ style.
   0.12` in dark; window tint `bg` 38% navy / 42% white over a fully opaque
   background blur; tuned with the user between "not glassy" and "too clear": the dark theme is dark blue). Keep tints light: the user
   wants the glass to look transparent, with the wallpaper showing through so text keeps its contrast on any wallpaper.
+- **Glass panels over content** (the sticker panel) are their own egui
+  viewport: a borderless transparent window positioned over the main one,
+  given a glass pane by `macos::glass_window(title, radius)` and attached as
+  a child window. Use this for any floating panel that must be Liquid Glass.
+- **Sticker store** (in the sticker panel's "+"): `Session::sticker_store`
+  (`CometStickersStoreDialogQuery`, then `...PackListPaginationQuery`) and
+  `sticker_pack_tray` (`CometStickersStorePackMutation{Add,Remove}Mutation`,
+  input `pack_id`). Adding a pack changes the user's account: only on their
+  click.
 - **Media viewing stays in the app:** images open in the egui overlay
   `image_viewer` (scrim, fitted picture, close/open-in-browser buttons),
   videos in `macos::play_video` (an `NSWindow` with AVKit's `AVPlayerView`,

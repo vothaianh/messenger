@@ -299,6 +299,68 @@ impl Session {
             .collect())
     }
 
+    /// The sticker store, like the web's store dialog: the first page
+    /// (`CometStickersStoreDialogQuery`), or the page after `cursor` of the
+    /// store `store_id` (`CometStickersStorePackListPaginationQuery`).
+    pub async fn sticker_store(&self, page: Option<(&str, &str)>) -> Result<StorePage> {
+        let (store, list) = match page {
+            None => {
+                let v = self.graphql("CometStickersStoreDialogQuery", STICKER_STORE_DOC, &json!({"scale": 3})).await?;
+                let store = v.pointer("/data/viewer/sticker_store").cloned().unwrap_or_default();
+                (store["id"].as_str().unwrap_or_default().to_string(), store["available_packs"].clone())
+            }
+            Some((store_id, cursor)) => {
+                let vars = json!({"count": 20, "cursor": cursor, "id": store_id, "scale": 3});
+                let v = self.graphql("CometStickersStorePackListPaginationQuery", STICKER_STORE_PAGE_DOC, &vars).await?;
+                (store_id.to_string(), v.pointer("/data/fetch__StickerStore/available_packs").cloned().unwrap_or_default())
+            }
+        };
+        let uri = |n: &Value, key: &str| n.pointer(&format!("/{key}/uri")).and_then(Value::as_str).unwrap_or_default().to_string();
+        let packs = list["edges"]
+            .as_array()
+            .map(|edges| {
+                edges
+                    .iter()
+                    .filter_map(|e| {
+                        let n = &e["node"];
+                        Some(StorePack {
+                            id: n["id"].as_str()?.to_string(),
+                            name: n["name"].as_str().unwrap_or_default().to_string(),
+                            artist: n["artist"].as_str().unwrap_or_default().to_string(),
+                            preview: uri(n, "preview_image"),
+                            thumbnail: uri(n, "thumbnail_image"),
+                            in_tray: n["in_sticker_tray"].as_bool().unwrap_or(false),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let more = list.pointer("/page_info/has_next_page").and_then(Value::as_bool).unwrap_or(false);
+        let next = list.pointer("/page_info/end_cursor").and_then(Value::as_str).filter(|_| more).map(str::to_string);
+        Ok(StorePage { store_id: store, packs, next })
+    }
+
+    /// Add a store pack to the sticker tray, or remove it
+    /// (`CometStickersStorePackMutation{Add,Remove}Mutation`).
+    pub async fn sticker_pack_tray(&self, pack_id: &str, add: bool) -> Result<()> {
+        let n = self.req_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let vars = json!({
+            "input": {
+                "feedback_target_id": null, "pack_id": pack_id,
+                "actor_id": self.boot.fbid.to_string(), "client_mutation_id": n.to_string(),
+            },
+            "scale": 3,
+            "stickerInterface": "MESSAGES",
+        });
+        let (name, doc) = if add {
+            ("CometStickersStorePackMutationAddMutation", STICKER_PACK_ADD_DOC)
+        } else {
+            ("CometStickersStorePackMutationRemoveMutation", STICKER_PACK_REMOVE_DOC)
+        };
+        self.graphql(name, doc, &vars).await?;
+        Ok(())
+    }
+
     /// The stickers of one pack (first page, like the web picker).
     pub async fn sticker_pack(&self, pack_id: &str) -> Result<Vec<Sticker>> {
         let vars = json!({"packID": pack_id, "stickerWidth": 128, "stickerHeight": 128, "scale": 3});
@@ -384,6 +446,29 @@ pub fn new_otid() -> i64 {
 
 /// Persisted query ids of the web sticker picker (see README "Protocol notes").
 const STICKER_TRAY_DOC: &str = "28475074195489368";
+const STICKER_STORE_DOC: &str = "28719354961066192";
+const STICKER_STORE_PAGE_DOC: &str = "28347266178275168";
+const STICKER_PACK_ADD_DOC: &str = "28628969456733944";
+const STICKER_PACK_REMOVE_DOC: &str = "28423263890675279";
+
+/// A pack in the sticker store.
+#[derive(Clone, Debug)]
+pub struct StorePack {
+    pub id: String,
+    pub name: String,
+    pub artist: String,
+    /// A banner with a few of the pack's stickers.
+    pub preview: String,
+    pub thumbnail: String,
+    pub in_tray: bool,
+}
+
+/// One page of the sticker store, and where the next one starts.
+pub struct StorePage {
+    pub store_id: String,
+    pub packs: Vec<StorePack>,
+    pub next: Option<String>,
+}
 const STICKER_PACK_DOC: &str = "25236323532672635";
 
 #[derive(Clone, Debug)]

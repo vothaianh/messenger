@@ -446,6 +446,76 @@ pub fn encode_text(text: &str) -> Outgoing {
 
 /// An uploaded image (see `e2ee_media.rs`), as the web client encodes it:
 /// `imageMessage { image: SubProtocol(ImageTransport, version 1), caption }`.
+/// The WA media transport (where the encrypted file is and how to open it)
+/// shared by images and stickers.
+fn wa_transport(file: &MediaFile, object_id: Option<&str>, media_key_timestamp: i64) -> WaMediaTransport {
+    WaMediaTransport {
+        integral: Some(MediaIntegral {
+            file_sha256: Some(file.file_sha256.clone()),
+            media_key: Some(file.media_key.clone()),
+            file_enc_sha256: Some(file.file_enc_sha256.clone()),
+            direct_path: Some(file.direct_path.clone()),
+            media_key_timestamp: Some(media_key_timestamp),
+        }),
+        ancillary: Some(MediaAncillary {
+            file_length: Some(file.file_length),
+            mimetype: Some(file.mimetype.clone()),
+            thumbnail: (!file.thumbnail.is_empty()).then(|| MediaThumbnail {
+                jpeg_thumbnail: Some(file.thumbnail.clone()),
+                width: None,
+                height: None,
+            }),
+            object_id: object_id.map(str::to_string),
+        }),
+    }
+}
+
+/// `StickerTransport`: integral {transport 1, isAnimated 2}, ancillary
+/// {height 2, width 3, accessibilityLabel 9}.
+#[derive(Clone, PartialEq, prost::Message)]
+struct StickerTransport {
+    #[prost(message, optional, tag = "1")]
+    integral: Option<StickerIntegral>,
+    #[prost(message, optional, tag = "2")]
+    ancillary: Option<StickerAncillary>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct StickerIntegral {
+    #[prost(message, optional, tag = "1")]
+    transport: Option<WaMediaTransport>,
+    #[prost(bool, optional, tag = "2")]
+    is_animated: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct StickerAncillary {
+    #[prost(uint32, optional, tag = "2")]
+    height: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    width: Option<u32>,
+    #[prost(string, optional, tag = "9")]
+    accessibility_label: Option<String>,
+}
+
+pub fn encode_sticker(file: &MediaFile, object_id: Option<&str>, media_key_timestamp: i64, animated: bool, label: &str) -> Outgoing {
+    let transport = StickerTransport {
+        integral: Some(StickerIntegral { transport: Some(wa_transport(file, object_id, media_key_timestamp)), is_animated: Some(animated) }),
+        ancillary: Some(StickerAncillary {
+            height: Some(file.height),
+            width: Some(file.width),
+            accessibility_label: (!label.is_empty()).then(|| label.to_string()),
+        }),
+    };
+    encode_content(Content {
+        sticker: Some(CaptionedMedia {
+            media: Some(SubProtocol { payload: Some(transport.encode_to_vec()), version: Some(1) }),
+            caption: None,
+        }),
+        ..Default::default()
+    })
+}
+
 pub fn encode_image(file: &MediaFile, object_id: Option<&str>, media_key_timestamp: i64, caption: &str) -> Outgoing {
     let transport = MediaTransportWrapper {
         integral: Some(TransportIntegral {

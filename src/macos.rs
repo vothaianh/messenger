@@ -583,3 +583,50 @@ pub fn reap_video() {
         stop_video();
     }
 }
+
+// ---- Glass windows ----
+//
+// Floating panels that must be real Liquid Glass over egui content (the
+// sticker panel) are their own borderless, transparent egui viewports; this
+// puts a glass pane behind the egui view and attaches the window to the main
+// one, so it moves with it and stays above it.
+
+/// Title of the sticker panel's window.
+pub const STICKER_WINDOW: &str = "Messenger Desktop Stickers";
+
+thread_local! {
+    static GLASS_WINDOWS: RefCell<HashMap<String, (Retained<NSWindow>, Retained<NSGlassEffectView>)>> = RefCell::new(HashMap::new());
+}
+
+/// Give the window titled `title` a glass background with `radius` corners
+/// (once per window; call every frame). Main thread only.
+pub fn glass_window(title: &str, radius: f64) {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(window) = app.windows().iter().find(|w| w.title().to_string() == title) else { return };
+    let light = GLASS.with_borrow(|g| g.light);
+    GLASS_WINDOWS.with_borrow_mut(|map| {
+        if let Some((known, pane)) = map.get(title) {
+            if std::ptr::eq(&**known, &*window) {
+                pane.setTintColor(Some(&glass_tint(light)));
+                return;
+            }
+        }
+        let Some(content) = window.contentView() else { return };
+        let Some(host) = (unsafe { content.superview() }) else { return };
+        window.setOpaque(false);
+        window.setBackgroundColor(Some(&objc2_app_kit::NSColor::clearColor()));
+        window.setHasShadow(true);
+        let pane = NSGlassEffectView::new(mtm);
+        pane.setStyle(NSGlassEffectViewStyle::Regular);
+        pane.setCornerRadius(radius);
+        pane.setTintColor(Some(&glass_tint(light)));
+        pane.setFrame(host.bounds());
+        pane.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+        host.addSubview_positioned_relativeTo(&pane, NSWindowOrderingMode::Below, Some(&content));
+        if let Some(main) = GLASS.with_borrow(|g| g.window.clone()) {
+            unsafe { main.addChildWindow_ordered(&window, NSWindowOrderingMode::Above) };
+        }
+        map.insert(title.to_string(), (window, pane));
+    });
+}
