@@ -411,3 +411,25 @@ queries) to fetch and decrypt the archived messages.
   the JS around `EBMinosLoadMailboxKeys`, `EBMinosMailboxKeysCache`,
   `RecoveryCodeDB`, `EBCryptoUtils` for how the recovery code becomes the
   mailbox keys, and how messages are fetched.
+
+### Adding the backup device (EBAddDeviceGraphQL, 20 KB)
+
+Order of operations:
+1. GraphQL `EBAddDeviceGraphQLEBFetchVirtualDeviceInfoQuery` (virtual device
+   info).
+2. `LSParseRecoveryCode_v2` (1.3 KB): `parseLSRecoveryCode`,
+   `GF32RecoveryCodes` (the code's alphabet/checksum), `deriveLSKey`,
+   `checkLSRecoveryCodeMatch`.
+3. `EBGetLSVirtualDevices`, `getDeviceRegistrationId`.
+4. `LSAddDeviceWithVirtualDeviceAndDecryptionKeyStoredProcedure`.
+5. Labyrinth wasm `deriveAddDeviceEpochs` (`EBLabyrinthWasm*`, a third
+   module, `EBWasm.pb`).
+6. `LSDecryptVirtualDeviceSecretsForDeviceAdditionV2` (**28.7 KB** compiled
+   Lightspeed procedure: base64, auth/encryption/signature key pairs, derived
+   keys, signatures with the Armadillo identity key, debug tokens).
+7. `LSHandleAddDeviceSuccessStoredProcedure`.
+
+Each LS procedure is generated JS calling native crypto ops (`LSCreate*`,
+`.nop` modules). Porting this step alone means translating ~30 KB of
+generated code and its crypto ops exactly, and it changes the account's
+backup (adds a device), so it can only be tested for real once.
