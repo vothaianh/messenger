@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Background: near-black charcoal, slightly lighter at the top -->
+    <linearGradient id="bg" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#2A2C31"/>
+      <stop offset="1" stop-color="#0E0F12"/>
+    </linearGradient>
+    <!-- Faint blue ambient light behind the bolt -->
+    <radialGradient id="ambient" cx="0.5" cy="0.52" r="0.5">
+      <stop offset="0" stop-color="#1A7BFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#1A7BFF" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Bolt: the light icon's blue, bright at the top -->
+    <linearGradient id="bolt" x1="0.2" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#7FD6FF"/>
+      <stop offset="0.5" stop-color="#2E8BFF"/>
+      <stop offset="1" stop-color="#0A52E8"/>
+    </linearGradient>
+    <filter id="tileShadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#000000" flood-opacity="0.5"/>
+    </filter>
+    <filter id="glow" x="-40%" y="-30%" width="180%" height="160%">
+      <feGaussianBlur stdDeviation="26" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="tile">
+      <rect x="100" y="100" width="824" height="824" rx="186"/>
+    </clipPath>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)" filter="url(#tileShadow)"/>
+  <g clip-path="url(#tile)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#ambient)"/>
+  </g>
+  <rect x="100.5" y="100.5" width="823" height="823" rx="185.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="3"/>
+
+  <!-- Lightning bolt (same shape as the light icon), glowing blue -->
+  <path filter="url(#glow)" fill="url(#bolt)" stroke="#9BE0FF" stroke-opacity="0.55" stroke-width="6" stroke-linejoin="round"
+        d="M 584 196 L 318 560 L 488 560 L 430 828 L 708 436 L 534 436 Z"/>
+</svg>

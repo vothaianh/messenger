@@ -1,0 +1,653 @@
+use std::io::Write;
+
+use crate::{
+    BinaryError, Node, NodeRef, Result,
+    decoder::Decoder,
+    encoder::{Encoder, build_marshaled_node_plan, build_marshaled_node_ref_plan},
+    node::{NodeContent, NodeContentRef},
+};
+
+const DEFAULT_MARSHAL_CAPACITY: usize = 1024;
+const AUTO_RESERVE_ATTRS_THRESHOLD: usize = 24;
+const AUTO_RESERVE_CHILDREN_THRESHOLD: usize = 64;
+const AUTO_RESERVE_SCALAR_THRESHOLD: usize = 8 * 1024;
+const AUTO_CHILD_SAMPLE_LIMIT: usize = 32;
+const AUTO_MAX_HINT_CAPACITY: usize = 512 * 1024;
+const AUTO_ATTR_ESTIMATE: usize = 24;
+const AUTO_CHILD_ESTIMATE: usize = 96;
+const AUTO_GRANDCHILD_ESTIMATE: usize = 40;
+
+pub fn unmarshal_ref(data: &[u8]) -> Result<NodeRef<'_>> {
+    let mut decoder = Decoder::new(data);
+    let node = decoder.read_node_ref()?;
+
+    if decoder.is_finished() {
+        Ok(node)
+    } else {
+        Err(BinaryError::LeftoverData(decoder.bytes_left()))
+    }
+}
+
+pub fn marshal_to(node: &Node, writer: &mut impl Write) -> Result<()> {
+    let mut encoder = Encoder::new(writer)?;
+    encoder.write_node(node)?;
+    Ok(())
+}
+
+/// Serialize an owned node directly into a `Vec<u8>` using the fast vec writer path.
+pub fn marshal_to_vec(node: &Node, output: &mut Vec<u8>) -> Result<()> {
+    let mut encoder = Encoder::new_vec(output)?;
+    encoder.write_node(node)?;
+    Ok(())
+}
+
+pub fn marshal(node: &Node) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(DEFAULT_MARSHAL_CAPACITY);
+    marshal_to_vec(node, &mut payload)?;
+    Ok(payload)
+}
+
+/// Serialize a `Node` using a conservative auto strategy.
+///
+/// This keeps the fast one-pass path for typical payloads and only uses
+/// a lightweight preallocation hint for obviously larger payload shapes.
+pub fn marshal_auto(node: &Node) -> Result<Vec<u8>> {
+    if should_auto_reserve_node(node) {
+        marshal_with_capacity(node, estimate_capacity_node(node))
+    } else {
+        marshal(node)
+    }
+}
+
+/// Serialize a `Node` using a two-pass strategy:
+/// 1) compute exact encoded size
+/// 2) write directly into a fixed-size output buffer
+///
+/// This avoids output buffer growth/copies and can be beneficial for large/variable payloads.
+pub fn marshal_exact(node: &Node) -> Result<Vec<u8>> {
+    let plan = build_marshaled_node_plan(node);
+    let mut payload = vec![0; plan.size];
+    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
+    encoder.write_node(node)?;
+    let written = encoder.bytes_written();
+    // Real checks, not debug_asserts: replayed hints are trusted in release,
+    // so a plan/encode traversal divergence must fail the marshal instead of
+    // shipping corrupt bytes. Two integer compares per stanza.
+    if written != payload.len() || !plan.hints.fully_consumed() {
+        return Err(BinaryError::PlanMismatch);
+    }
+    Ok(payload)
+}
+
+/// Zero-copy serialization of a `NodeRef` directly into a writer.
+/// This avoids the allocation overhead of converting to an owned `Node` first.
+pub fn marshal_ref_to(node: &NodeRef<'_>, writer: &mut impl Write) -> Result<()> {
+    let mut encoder = Encoder::new(writer)?;
+    encoder.write_node(node)?;
+    Ok(())
+}
+
+/// Serialize a borrowed node directly into a `Vec<u8>` using the fast vec writer path.
+pub fn marshal_ref_to_vec(node: &NodeRef<'_>, output: &mut Vec<u8>) -> Result<()> {
+    let mut encoder = Encoder::new_vec(output)?;
+    encoder.write_node(node)?;
+    Ok(())
+}
+
+/// Zero-copy serialization of a `NodeRef` to a new `Vec<u8>`.
+/// Prefer `marshal_ref_to` with a reusable buffer for best performance.
+pub fn marshal_ref(node: &NodeRef<'_>) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(DEFAULT_MARSHAL_CAPACITY);
+    marshal_ref_to_vec(node, &mut payload)?;
+    Ok(payload)
+}
+
+/// Serialize a `NodeRef` using the same conservative auto strategy as `marshal_auto`.
+pub fn marshal_ref_auto(node: &NodeRef<'_>) -> Result<Vec<u8>> {
+    if should_auto_reserve_node_ref(node) {
+        marshal_ref_with_capacity(node, estimate_capacity_node_ref(node))
+    } else {
+        marshal_ref(node)
+    }
+}
+
+/// Serialize a `NodeRef` using a two-pass exact-size strategy.
+///
+/// This avoids output buffer growth/copies and preserves zero-copy input semantics.
+pub fn marshal_ref_exact(node: &NodeRef<'_>) -> Result<Vec<u8>> {
+    let plan = build_marshaled_node_ref_plan(node);
+    let mut payload = vec![0; plan.size];
+    let mut encoder = Encoder::new_slice(payload.as_mut_slice(), Some(&plan.hints))?;
+    encoder.write_node(node)?;
+    let written = encoder.bytes_written();
+    // Same invariant enforcement as marshal_exact.
+    if written != payload.len() || !plan.hints.fully_consumed() {
+        return Err(BinaryError::PlanMismatch);
+    }
+    Ok(payload)
+}
+
+#[inline]
+fn marshal_with_capacity(node: &Node, capacity: usize) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(capacity);
+    marshal_to_vec(node, &mut payload)?;
+    Ok(payload)
+}
+
+#[inline]
+fn marshal_ref_with_capacity(node: &NodeRef<'_>, capacity: usize) -> Result<Vec<u8>> {
+    let mut payload = Vec::with_capacity(capacity);
+    marshal_ref_to_vec(node, &mut payload)?;
+    Ok(payload)
+}
+
+#[inline]
+fn should_auto_reserve_node(node: &Node) -> bool {
+    if node.attrs.len() >= AUTO_RESERVE_ATTRS_THRESHOLD {
+        return true;
+    }
+
+    match &node.content {
+        Some(NodeContent::Bytes(bytes)) => bytes.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
+        Some(NodeContent::String(text)) => text.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
+        Some(NodeContent::Nodes(children)) => {
+            if children.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD {
+                return true;
+            }
+            // Check one level deeper for large nested lists (e.g., <iq> -> <list> -> 812 keys)
+            children.iter().any(|child| {
+                matches!(&child.content, Some(NodeContent::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
+            })
+        }
+        None => false,
+    }
+}
+
+#[inline]
+fn should_auto_reserve_node_ref(node: &NodeRef<'_>) -> bool {
+    if node.attrs.len() >= AUTO_RESERVE_ATTRS_THRESHOLD {
+        return true;
+    }
+
+    match node.content.as_ref() {
+        Some(NodeContentRef::Bytes(bytes)) => bytes.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
+        Some(NodeContentRef::String(text)) => text.len() >= AUTO_RESERVE_SCALAR_THRESHOLD,
+        Some(NodeContentRef::Nodes(children)) => {
+            if children.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD {
+                return true;
+            }
+            // Check one level deeper for large nested lists (e.g., <iq> -> <list> -> 812 keys)
+            children.iter().any(|child| {
+                matches!(child.content.as_ref(), Some(NodeContentRef::Nodes(gc)) if gc.len() >= AUTO_RESERVE_CHILDREN_THRESHOLD)
+            })
+        }
+        None => false,
+    }
+}
+
+#[inline]
+fn estimate_capacity_node(node: &Node) -> usize {
+    let mut estimate = DEFAULT_MARSHAL_CAPACITY + 16;
+    estimate += node.tag.len();
+    estimate += node.attrs.len() * AUTO_ATTR_ESTIMATE;
+
+    match &node.content {
+        Some(NodeContent::Bytes(bytes)) => {
+            estimate += bytes.len() + 8;
+        }
+        Some(NodeContent::String(text)) => {
+            estimate += text.len() + 8;
+        }
+        Some(NodeContent::Nodes(children)) => {
+            estimate += children.len() * AUTO_CHILD_ESTIMATE;
+            for child in children.iter().take(AUTO_CHILD_SAMPLE_LIMIT) {
+                estimate += child.tag.len() + child.attrs.len() * AUTO_ATTR_ESTIMATE;
+                match &child.content {
+                    Some(NodeContent::Bytes(bytes)) => estimate += bytes.len() + 8,
+                    Some(NodeContent::String(text)) => estimate += text.len() + 8,
+                    Some(NodeContent::Nodes(grand_children)) => {
+                        estimate += grand_children.len() * AUTO_GRANDCHILD_ESTIMATE;
+                    }
+                    None => {}
+                }
+                if estimate >= AUTO_MAX_HINT_CAPACITY {
+                    return AUTO_MAX_HINT_CAPACITY;
+                }
+            }
+        }
+        None => {}
+    }
+
+    estimate.clamp(DEFAULT_MARSHAL_CAPACITY, AUTO_MAX_HINT_CAPACITY)
+}
+
+#[inline]
+fn estimate_capacity_node_ref(node: &NodeRef<'_>) -> usize {
+    let mut estimate = DEFAULT_MARSHAL_CAPACITY + 16;
+    estimate += node.tag.len();
+    estimate += node.attrs.len() * AUTO_ATTR_ESTIMATE;
+
+    match node.content.as_ref() {
+        Some(NodeContentRef::Bytes(bytes)) => {
+            estimate += bytes.len() + 8;
+        }
+        Some(NodeContentRef::String(text)) => {
+            estimate += text.len() + 8;
+        }
+        Some(NodeContentRef::Nodes(children)) => {
+            estimate += children.len() * AUTO_CHILD_ESTIMATE;
+            for child in children.iter().take(AUTO_CHILD_SAMPLE_LIMIT) {
+                estimate += child.tag.len() + child.attrs.len() * AUTO_ATTR_ESTIMATE;
+                match child.content.as_ref() {
+                    Some(NodeContentRef::Bytes(bytes)) => estimate += bytes.len() + 8,
+                    Some(NodeContentRef::String(text)) => estimate += text.len() + 8,
+                    Some(NodeContentRef::Nodes(grand_children)) => {
+                        estimate += grand_children.len() * AUTO_GRANDCHILD_ESTIMATE;
+                    }
+                    None => {}
+                }
+                if estimate >= AUTO_MAX_HINT_CAPACITY {
+                    return AUTO_MAX_HINT_CAPACITY;
+                }
+            }
+        }
+        None => {}
+    }
+
+    estimate.clamp(DEFAULT_MARSHAL_CAPACITY, AUTO_MAX_HINT_CAPACITY)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jid::Jid;
+    use crate::node::{Attrs, NodeContent, NodeValue};
+
+    type TestResult = Result<()>;
+
+    /// An interop JID's `integrator` has a wire field only in `INTEROP_JID`.
+    /// Encoded as a `JID_PAIR` it is simply absent, so two interop destinations
+    /// that differ only there went out as the same bytes.
+    ///
+    /// Asserted on the emitted bytes rather than by round-tripping: our decoder
+    /// reads a trailing server that the outbound form does not carry (see
+    /// `write_interop_jid`), so a local encode/decode cycle is the wrong oracle
+    /// here — the two directions of this token genuinely differ.
+    ///
+    /// Every encoder path is covered because `marshal_exact` sizes its output
+    /// slice from the size estimator before writing into it: an estimator that
+    /// disagrees with the writer surfaces as `UnexpectedEof`, not as wrong bytes,
+    /// and `marshal_exact` is what production sends through.
+    #[test]
+    fn interop_jid_carries_its_integrator_onto_the_wire() -> TestResult {
+        use crate::jid::Server;
+
+        fn node_for(jid: &Jid) -> Node {
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(jid.clone()));
+            Node::new("iq", attrs, None)
+        }
+
+        fn encode_all(jid: &Jid) -> Vec<(&'static str, Vec<u8>)> {
+            let node = node_for(jid);
+            let r = node.as_node_ref();
+            vec![
+                ("marshal", marshal(&node).expect("marshal")),
+                ("marshal_exact", marshal_exact(&node).expect("exact")),
+                ("marshal_ref", marshal_ref(&r).expect("ref")),
+                (
+                    "marshal_ref_exact",
+                    marshal_ref_exact(&r).expect("ref exact"),
+                ),
+            ]
+        }
+
+        let base = Jid {
+            user: "123456789".into(),
+            server: Server::Interop,
+            agent: 0,
+            device: 7,
+            integrator: 300,
+        };
+
+        // The integrator reaches the bytes: change only it, and the encoding
+        // changes. Under JID_PAIR these were byte-identical.
+        let other = Jid {
+            integrator: 301,
+            ..base.clone()
+        };
+        for ((path, a), (_, b)) in encode_all(&base).into_iter().zip(encode_all(&other)) {
+            assert_ne!(a, b, "{path}: the integrator must reach the wire");
+            assert!(
+                a.contains(&crate::token::INTEROP_JID),
+                "{path}: must use the INTEROP_JID token"
+            );
+            // Big-endian device and integrator, adjacent, as WA Web writes them.
+            assert!(
+                a.windows(4).any(|w| w == [0x00, 0x07, 0x01, 0x2C]),
+                "{path}: device 7 and integrator 300 as u16 BE"
+            );
+        }
+
+        // Every path agrees byte for byte, so the exact-size plan matches the
+        // writer. When it does not, `marshal_exact` fails outright.
+        let encodings = encode_all(&base);
+        let (_, first) = &encodings[0];
+        for (path, bytes) in &encodings[1..] {
+            assert_eq!(bytes, first, "{path}: must agree with marshal");
+        }
+
+        // A zero-integrator interop JID keeps the JID_PAIR form we have always
+        // sent. That form carries user and server only — it drops the device —
+        // which is pre-existing and deliberately untouched here.
+        let plain = Jid {
+            integrator: 0,
+            ..base.clone()
+        };
+        let bytes = marshal(&node_for(&plain))?;
+        assert!(
+            !bytes.contains(&crate::token::INTEROP_JID),
+            "no integrator, no INTEROP_JID token"
+        );
+        let decoded = unmarshal_ref(&bytes[1..])?;
+        let back = decoded
+            .attrs
+            .iter()
+            .find(|(k, _)| &**k == "jid")
+            .and_then(|(_, v)| v.to_jid())
+            .expect("jid attr");
+        assert_eq!(back.server, Server::Interop);
+        assert_eq!(back.device, 0, "JID_PAIR carries no device");
+
+        Ok(())
+    }
+
+    /// The two round-trips real code performs — through the wire, and through the
+    /// store, which holds JIDs as text — have to agree: a JID that survives one
+    /// must equal a JID that survives the other, or `stored_jid == wire_jid`
+    /// silently flips depending on where each side came from.
+    #[test]
+    fn ad_jid_round_trips_equal_through_the_wire_and_through_text() -> TestResult {
+        use crate::jid::Server;
+        use std::str::FromStr;
+
+        for server in [Server::Pn, Server::Lid, Server::Hosted, Server::HostedLid] {
+            let original = Jid {
+                user: "123456789012345".into(),
+                server,
+                agent: 0,
+                device: 7,
+                integrator: 0,
+            };
+
+            let mut attrs = Attrs::with_capacity(1);
+            attrs.push("jid".to_string(), NodeValue::Jid(original.clone()));
+            let node = Node::new("iq", attrs, None);
+
+            // marshal writes a leading format byte that unmarshal_ref does not expect.
+            let bytes = marshal(&node)?;
+            let decoded = unmarshal_ref(&bytes[1..])?;
+            let from_wire = decoded
+                .attrs
+                .iter()
+                .find(|(k, _)| &**k == "jid")
+                .and_then(|(_, v)| v.to_jid())
+                .expect("jid attr survives the round-trip");
+
+            assert_eq!(
+                from_wire, original,
+                "{server:?}: encode -> decode must be idempotent"
+            );
+
+            let from_text = Jid::from_str(&from_wire.to_string()).expect("renders parseably");
+            assert_eq!(
+                from_wire, from_text,
+                "{server:?}: a wire-decoded JID must equal the same JID read back as text"
+            );
+        }
+
+        Ok(())
+    }
+
+    fn fixture_node() -> Node {
+        let mut attrs = Attrs::with_capacity(4);
+        attrs.push("id".to_string(), "ABC123");
+        attrs.push("to".to_string(), "123456789@s.whatsapp.net");
+        attrs.push(
+            "participant".to_string(),
+            NodeValue::Jid("15551234567@s.whatsapp.net".parse::<Jid>().unwrap()),
+        );
+        attrs.push("hex".to_string(), "DEADBEEF");
+
+        let child = Node::new(
+            "item",
+            Attrs::new(),
+            Some(NodeContent::Bytes(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+        );
+
+        Node::new(
+            "message",
+            attrs,
+            Some(NodeContent::Nodes(vec![
+                child,
+                Node::new(
+                    "text",
+                    Attrs::new(),
+                    Some(NodeContent::String("hello".repeat(40).into())),
+                ),
+            ])),
+        )
+    }
+
+    fn large_binary_fixture() -> Node {
+        Node::new(
+            "message",
+            Attrs::new(),
+            Some(NodeContent::Bytes(vec![
+                0xAB;
+                AUTO_RESERVE_SCALAR_THRESHOLD + 2048
+            ])),
+        )
+    }
+
+    #[test]
+    fn test_marshaled_node_size_matches_output() -> TestResult {
+        let node = fixture_node();
+        let plan = build_marshaled_node_plan(&node);
+        let payload = marshal(&node)?;
+        assert_eq!(payload.len(), plan.size);
+        Ok(())
+    }
+
+    // The exact path replays plan-recorded hints by traversal order, so it
+    // must produce byte-identical output to the hint-free vec path for every
+    // string shape (tokens, numerics, hex, JIDs with device/agent/empty user,
+    // long strings, bytes, nesting). A divergence in traversal order shows up
+    // here (and as a debug_assert in write_string) before it can corrupt the
+    // wire.
+    #[test]
+    fn test_exact_matches_plain_for_all_string_shapes() -> TestResult {
+        let mut attrs = Attrs::with_capacity(8);
+        attrs.push("to".to_string(), "15551234567@s.whatsapp.net");
+        attrs.push("from".to_string(), "15550000001:12@s.whatsapp.net");
+        attrs.push("participant".to_string(), "15550000002_1@lid");
+        attrs.push("broadcast".to_string(), "status@broadcast");
+        attrs.push("type".to_string(), "text");
+        attrs.push("count".to_string(), "12345");
+        attrs.push("hexish".to_string(), "0123ABCDEF");
+        attrs.push("plain".to_string(), "not_a_token_value");
+        // Empty-user JID: the one branch that skips a hint entirely.
+        attrs.push("empty_user".to_string(), "@s.whatsapp.net");
+        // Typed JID value: user/server hints with no wrapping string hint.
+        attrs.push(
+            "typed_jid".to_string(),
+            NodeValue::Jid("15550000003:7@s.whatsapp.net".parse::<Jid>().unwrap()),
+        );
+        let node = Node::new(
+            "iq",
+            attrs,
+            Some(NodeContent::Nodes(vec![
+                Node::new(
+                    "text",
+                    Attrs::new(),
+                    Some(NodeContent::String("x".repeat(300).into())),
+                ),
+                Node::new("empty", Attrs::new(), Some(NodeContent::String("".into()))),
+                Node::new(
+                    "bin",
+                    Attrs::new(),
+                    Some(NodeContent::Bytes(vec![0xAB; 64])),
+                ),
+                Node::new("leaf", Attrs::new(), None),
+            ])),
+        );
+
+        assert_eq!(marshal(&node)?, marshal_exact(&node)?);
+        let node_ref = node.as_node_ref();
+        assert_eq!(marshal_ref(&node_ref)?, marshal_ref_exact(&node_ref)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshaled_node_ref_size_matches_output() -> TestResult {
+        let node = fixture_node();
+        let node_ref = node.as_node_ref();
+        let plan = build_marshaled_node_ref_plan(&node_ref);
+        let payload = marshal_ref(&node_ref)?;
+        assert_eq!(payload.len(), plan.size);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_matches_marshal_to_bytes() -> TestResult {
+        let node = fixture_node();
+
+        let payload_alloc = marshal(&node)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_to(&node, &mut payload_writer)?;
+
+        assert_eq!(payload_alloc, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_ref_matches_marshal_ref_to_bytes() -> TestResult {
+        let node = fixture_node();
+        let node_ref = node.as_node_ref();
+
+        let payload_alloc = marshal_ref(&node_ref)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_ref_to(&node_ref, &mut payload_writer)?;
+
+        assert_eq!(payload_alloc, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_to_vec_matches_marshal_to() -> TestResult {
+        let node = fixture_node();
+
+        let mut payload_vec_writer = Vec::new();
+        marshal_to_vec(&node, &mut payload_vec_writer)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_to(&node, &mut payload_writer)?;
+
+        assert_eq!(payload_vec_writer, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_ref_to_vec_matches_marshal_ref_to() -> TestResult {
+        let node = fixture_node();
+        let node_ref = node.as_node_ref();
+
+        let mut payload_vec_writer = Vec::new();
+        marshal_ref_to_vec(&node_ref, &mut payload_vec_writer)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_ref_to(&node_ref, &mut payload_writer)?;
+
+        assert_eq!(payload_vec_writer, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_exact_matches_marshal_to_bytes() -> TestResult {
+        let node = fixture_node();
+
+        let payload_exact = marshal_exact(&node)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_to(&node, &mut payload_writer)?;
+
+        assert_eq!(payload_exact, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_ref_exact_matches_marshal_ref_to_bytes() -> TestResult {
+        let node = fixture_node();
+        let node_ref = node.as_node_ref();
+
+        let payload_exact = marshal_ref_exact(&node_ref)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_ref_to(&node_ref, &mut payload_writer)?;
+
+        assert_eq!(payload_exact, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_auto_matches_marshal_to_bytes() -> TestResult {
+        let node = fixture_node();
+        let payload_auto = marshal_auto(&node)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_to(&node, &mut payload_writer)?;
+
+        assert_eq!(payload_auto, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_ref_auto_matches_marshal_ref_to_bytes() -> TestResult {
+        let node = fixture_node();
+        let node_ref = node.as_node_ref();
+        let payload_auto = marshal_ref_auto(&node_ref)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_ref_to(&node_ref, &mut payload_writer)?;
+
+        assert_eq!(payload_auto, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_auto_large_binary_matches_marshal_to_bytes() -> TestResult {
+        let node = large_binary_fixture();
+        let payload_auto = marshal_auto(&node)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_to(&node, &mut payload_writer)?;
+
+        assert_eq!(payload_auto, payload_writer);
+        Ok(())
+    }
+
+    #[test]
+    fn test_marshal_ref_auto_large_binary_matches_marshal_ref_to_bytes() -> TestResult {
+        let node = large_binary_fixture();
+        let node_ref = node.as_node_ref();
+        let payload_auto = marshal_ref_auto(&node_ref)?;
+
+        let mut payload_writer = Vec::new();
+        marshal_ref_to(&node_ref, &mut payload_writer)?;
+
+        assert_eq!(payload_auto, payload_writer);
+        Ok(())
+    }
+}

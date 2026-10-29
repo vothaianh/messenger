@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Foreground layer for the light icon: white bolt on transparent -->
+  <path fill="#FFFFFF" stroke="#FFFFFF" stroke-width="10" stroke-linejoin="round"
+        d="M 584 196 L 318 560 L 488 560 L 430 828 L 708 436 L 534 436 Z"/>
+</svg>

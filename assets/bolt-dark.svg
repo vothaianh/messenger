@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bolt" x1="0.2" y1="0" x2="0.7" y2="1">
+      <stop offset="0" stop-color="#7FD6FF"/>
+      <stop offset="0.5" stop-color="#2E8BFF"/>
+      <stop offset="1" stop-color="#0A52E8"/>
+    </linearGradient>
+  </defs>
+  <!-- Foreground layer for the dark icon: blue gradient bolt on transparent -->
+  <path fill="url(#bolt)" stroke="#9BE0FF" stroke-opacity="0.6" stroke-width="6" stroke-linejoin="round"
+        d="M 584 196 L 318 560 L 488 560 L 430 828 L 708 436 L 534 436 Z"/>
+</svg>

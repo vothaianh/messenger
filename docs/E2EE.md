@@ -1,0 +1,245 @@
+# End-to-end encrypted chats: phase 1 research (2026-10-28)
+
+Read-only research into how Messenger web handles E2EE ("Armadillo") chats, for
+adding them to Messenger Desktop. Nothing was registered or sent.
+
+## What the web client does
+
+Verified live in Chrome on facebook.com/messages:
+
+| Piece | Finding |
+|---|---|
+| Thread list | LS GraphQL sync of **database 95** (`updateOrInsertThread`, thread type 15). Already implemented in `store.rs`. |
+| Engine | "MAW" code running in a Web Worker, plus a `.wasm` crypto module |
+| Socket | `wss://web-chat-e2ee.facebook.com/ws/chat`, Noise_XX / Noise_IK handshake (the WhatsApp multi-device protocol) |
+| Auth | `MessengerWebInitData.cryptoAuthToken.encrypted_serialized_cat` (CAT, ~2.3 KB, valid 14 days). It is in the same `/messages/` HTML that `session.rs` already fetches. A GraphQL `MAWCatQuery` refreshes it. |
+| Device registration | ICDC (`icdc` and `ICDC` appear 50 times in the JS bundles) |
+| Message format | Armadillo protobufs: `MessageTransport` → `MessageApplication` / `ConsumerApplication` |
+| Key storage | IndexedDB tables `e2ee_prekey`, `e2ee_prekeyGeneration`, `registration_id` |
+| History backup | "Labyrinth" (`useMWEBBackupState`): server-side encrypted archive unlocked with the Messenger PIN |
+
+## Protocol flow
+
+From reading the open-source mautrix-meta (`pkg/messagix`, AGPL-3.0) and
+whatsmeow (MPL-2.0). These were only read for protocol understanding. Don't copy
+their code into this MIT/unlicensed project.
+
+1. **Keys**: generate a Signal identity key pair, registration ID, signed
+   prekey and one-time prekeys, and a random device UUID. Persist them (we lose
+   the device if they're lost).
+2. **ICDC fetch**: POST `https://reg-e2ee.facebook.com/v2/fb_icdc_fetch` (form:
+   `fbid`, `fb_cat`, `app_id`, `device_id`). The response has the account's
+   current device identity keys (base64url, 32 bytes each) and `icdc_seq`.
+3. **ICDC register**: append our identity key and bump the seq. Sign an
+   `ICDCIdentityList{seq, timestamp, devices, signing_device_index}` with our
+   identity key, wrapped in `SignedICDCIdentityList`. POST
+   `.../v2/fb_register_v…` with `e_regid`, `e_keytype`, `e_ident`,
+   `e_skey_id/val/sig`, `icdc_list`, `icdc_ts`, `icdc_seq`, and `ihash` (first
+   10 bytes of SHA-256 over the sorted identities). The response gives
+   `wa_device_id`, so our JID becomes `<fbid>.<device>@msgr`.
+4. **Connect**: Noise handshake to `web-chat-e2ee.facebook.com`. The
+   `ClientPayload` carries `product = MESSENGER`, `fbCat`, `username = fbid`,
+   `device`, and platform `BLUE_WEB`. After that it's the WhatsApp binary-node
+   protocol: upload prekeys, receive `<message>` nodes, Signal-decrypt, then
+   parse the Armadillo protobufs.
+5. **Old history** (`securehistory`) is a separate, heavier flow. It needs the
+   user's **Messenger PIN** (or recovery code), checked against Meta's HSM
+   backup service ("Vesta"). Then it derives and enrolls a virtual device,
+   fetches encrypted archive ranges and decrypts them ("Minos" cipher, epochs).
+
+## Reusable Rust code
+
+- **whatsapp-rust** (github.com/jlucaso1/whatsapp-rust, MIT, active, ~157k
+  downloads) is a WhatsApp Web client.
+  - Has: `wacore` with the Noise handshake, binary node codec, prekeys,
+    sessions, and message send/receive. Its `waproto/whatsapp.proto` already
+    has `ClientPayload.fbCat`, product `MESSENGER`, and some Armadillo messages.
+  - Lacks Messenger mode: no ICDC, no `@msgr` server, no CAT handling, no web
+    endpoint selection.
+  - Its vendored `wacore/libsignal` is marked MIT but carries "Signal Messenger,
+    LLC" copyright headers (upstream libsignal is AGPL-3.0). Check the licensing
+    before shipping.
+
+## Feasibility
+
+- **New incoming and outgoing E2EE messages**: feasible. Every piece exists in
+  open source and the token is already in our bootstrap. Estimate: several
+  sessions. Most of the work is adding a "Messenger mode" on top of
+  `whatsapp-rust`'s core and parsing Armadillo payloads.
+- **Old history**: possible but the hardest part. It needs the user's PIN and
+  the Vesta/Minos/epochs flow. Do it last.
+- **Account impact**: registering adds a new E2EE device to the account, visible
+  in the device list and possibly notified. Needs the user's explicit OK
+  (phase 2).
+
+## Phase 2 status
+
+- Implemented in `src/e2ee.rs`. Keys are generated with `x25519-dalek` and
+  signed with `xeddsa`, the ICDC protobufs are encoded with `prost`, and the
+  device JSON is stored in the Keychain (`messenger-rs` / `e2ee-device`).
+- `messenger-rs e2ee-register --check` (read-only) works: it fetched the
+  account's 10 E2EE devices.
+- The actual registration (`messenger-rs e2ee-register`) changes the user's
+  account. The user runs it themselves; the agent's permission policy blocks it.
+- **Done 2026-10-28**: the user ran it and the device registered as
+  `<fbid>.91@msgr` (the account went from 10 to 11 E2EE devices). Don't
+  register again: re-running prints "Already registered". Losing the Keychain
+  item means registering a new device.
+
+## Phase 3 plan (receive E2EE messages)
+
+`whatsapp-rust` hardcodes its WebSocket URL (`wacore/src/net.rs`,
+`WHATSAPP_WEB_WS_URL`) and builds the `ClientPayload` internally
+(`wacore/src/store/device.rs`, `build_base_client_payload`). The plan is to
+vendor it under `vendor/whatsapp-rust` (MIT: keep its LICENSE and attribution)
+with a small "Messenger mode" patch:
+
+1. Configurable socket URL → `wss://web-chat-e2ee.facebook.com/ws/chat`.
+2. A login `ClientPayload` for Messenger: `product = MESSENGER`, `fbCat`,
+   `username = fbid`, `device = 91`, platform `BLUE_WEB`, no pairing or ADV
+   flow. The ADV identity is a zero-filled placeholder, as in the reference
+   clients.
+3. JID server `msgr` alongside `s.whatsapp.net`.
+4. Seed its device store from our Keychain `e2ee::Device` (identity, regid,
+   signed prekey) and persist Signal sessions and prekeys locally. Use a
+   SQLite store in `~/Library/Application Support/Messenger Desktop/`, with the
+   encryption key in the Keychain.
+5. After connecting: upload one-time prekeys, receive `<message>` nodes, decrypt
+   them, unwrap `MessageTransport` → `MessageApplication` /
+   `ConsumerApplication`, and map text, media, reactions and edits into
+   `store.rs` for E2EE threads (thread key ↔ `<user>@msgr`).
+6. UI: replace the E2EE notice with the normal conversation view, showing
+   messages received since registration, plus a "history needs PIN" banner
+   until phase 5.
+
+Messages sent to our device before we first connect wait on the server as
+offline messages. Connect soon after registration.
+
+## Phase 3 progress
+
+- **Step 1, done (2026-10-28): Noise handshake and login work.**
+  `src/e2ee_socket.rs` uses the MIT crates `wacore-noise`, `wacore-binary`
+  (with `default-features = false`, because its `simd` feature needs nightly),
+  `wacore-libsignal` and `waproto` (buffa types: `MessageField::some`, typed
+  enums). It sends a Messenger `ClientPayload` (`product = Messenger`, CAT,
+  device 91, `BlueWeb`, app version 301.0.2). The server cert verifies against
+  the standard WA root key. `messenger-rs e2ee-connect` printed `<success>`,
+  `<ib><edge_routing/>` and `<ib><offline/>`.
+- The static Noise key lives in the Keychain device JSON (`noise_priv`), created
+  on the first connect.
+- Next steps:
+  1. Prekeys: `<iq xmlns="encrypt" type="get"><count/>`, then upload one-time
+     prekeys (`type="set"`: registration, type, identity, list, skey). Persist
+     them.
+  2. Signal store (identities, sessions, prekeys, sender keys) on disk, plus
+     decryption of `<enc type="pkmsg|msg|skmsg">`.
+  3. Unwrap the Armadillo protos (`MessageTransport` → `MessageApplication` /
+     `ConsumerApplication`). Check which of these `waproto` already has.
+  4. Send `<ack>` and receipts, and retry receipts on decrypt failure.
+  5. Wire it into `client.rs`, `store.rs` and the UI.
+- **Steps 1–2 implemented (2026-10-28).**
+  - `src/e2ee_store.rs` is the Signal store: a clone-able `Arc<Mutex>` handle,
+    because libsignal's `message_decrypt` takes one `&mut dyn` per store role.
+    It's JSON at `~/Library/Application Support/Messenger Desktop/e2ee-store.json`
+    (0600), rewritten on every change.
+  - `src/e2ee_listen.rs`:
+    - Prekeys: `<iq xmlns=encrypt type=get><count/>`; below 50, upload 100
+      (`registration`, `type`, `identity`, `list` of `key{id,value}`, and
+      `skey{id,value,signature}`). Verified: the server count went 0 → 100.
+    - Decrypts `pkmsg`/`msg` with sessions and `skmsg` with sender keys. It
+      removes a consumed one-time prekey only after the session is saved.
+    - Appends plaintext to `e2ee-inbox.jsonl` (0600) **before** sending `<ack>`.
+    - Answers pings, and acks notifications and receipts.
+  - `messenger-rs e2ee-listen [secs]` prints ids, sizes and protobuf field
+    outlines, never content.
+- Not yet verified: decrypting a real message. Test by sending from the
+  user's phone in an E2EE chat; their own devices, including 91, get a copy.
+- **Findings from live tests (2026-10-28 20:00–20:15):**
+  - The connection needs `<iq xmlns=passive type=set><active/>` after login and
+    a `w:p` ping every 20s. Without them the server resets it within ~2 min.
+    Servers also restart with `<stream:error code=503>`, so reconnect.
+  - The user's phone (device 86) sent a message after registration, but it
+    reached device 91 as `<message type=text>` with `<unavailable>` and **no
+    `<enc>` for us**: the phone's cached device list didn't include 91 yet.
+  - Acks to `<fbid>:86@msgr` lost the `:86`, because upstream
+    `wacore-binary` encodes msgr device JIDs as `JID_PAIR`. Fixed by vendoring
+    `wacore-binary` with an `FB_JID` encoder patch
+    (`vendor/wacore-binary/VENDORED.md`); the roundtrip test passes.
+  - Even with the correct `to`, a plain `<ack class=message>` for the
+    `<unavailable>` message doesn't stop redelivery. Next: send a **retry
+    receipt** (`<receipt type="retry">` with `<retry count id t v>`,
+    `<registration>` and `<keys>` holding our identity, a one-time prekey and
+    the signed prekey). It asks the sending device to re-encrypt for 91, and
+    should also settle the queue entry.
+- **Retry receipts implemented (2026-10-28).** On `<unavailable>` without
+  `<enc>`, or on a decrypt failure, the client sends
+  `<receipt type=retry to=<sender device>>` with `retry{count,id,t,v=1}`,
+  `registration` and `keys` (type 0x05, identity, a fresh one-time prekey,
+  skey, and a zero-filled `ADVSignedDeviceIdentity`), capped at 5 per message,
+  followed by the ack. The server accepted it (no error). The phone didn't
+  re-send within 90s; it likely has to be in the foreground to process retries.
+- **First successful E2EE decryption (2026-10-28 20:38).**
+  - Root cause of the earlier failures: upstream `wacore-binary` encodes
+    **every** msgr JID as `JID_PAIR`. That drops the device (`:86`), and even
+    for bare `fbid@msgr` it's rejected. The server reset the connection on a
+    `fbid:devices` query and silently ignored acks whose `recipient` was
+    encoded that way. The vendored patch now writes `FB_JID` for all msgr JIDs
+    (test `bare_msgr_jid_uses_fb_jid_token`).
+  - `messenger-rs e2ee-devices` (read-only) shows the server's device list for
+    the account: 11 devices including 91.
+  - The user's message from the phone (device 86) to an E2EE 1:1 chat arrived as
+    `pkmsg` and decrypted to 128 bytes, outline `#1:bytes[61] #2:bytes[63]`
+    (Armadillo `MessageTransport`: payload + protocol). We sent a `type=sender`
+    receipt. The offline queue then drained: the stale `<unavailable>` message
+    and its receipts stopped redelivering.
+  - Next: the Armadillo protos (`MessageTransport`, `MessageApplication`,
+    `ConsumerApplication`) to get text, media and reactions, then wire into the
+    app.
+
+## Phase 4: sending text to 1:1 chats (implemented 2026-10-29, awaiting first user test)
+
+- `Listener::send_text` (`src/e2ee_listen.rs`):
+  1. `fbid:devices` for the peer and for us; drop our own device (91).
+  2. Devices without a Signal session get a prekey bundle via
+     `<iq xmlns=encrypt type=get><key><user jid=…/>` → `process_prekey_bundle`.
+  3. One `MessageApplication` (ConsumerApplication text, consumer v1;
+     metadata franking key = 32 random bytes, franking version 0) shared by all
+     devices. Per device, a `MessageTransport` (application v2, future-proof
+     PLACEHOLDER, random 1–15 byte padding, backup directive UPSERT with the
+     message id; for our own devices also the DSM destination `peer@msgr`).
+  4. `<message id to=peer@msgr type=text><participants><to jid><enc v=3
+     type=pkmsg|msg>` plus `<franking><franking_tag>` = HMAC-SHA256(franking
+     key, MessageApplication bytes). The id is `(ms << 22) | 22 random bits`.
+  5. Wait for `<ack id>` (an `error` attribute means rejected), then log it to
+     `e2ee-inbox.jsonl` as `enc_type: "sent"`, so it replays after restarts.
+- UI: encrypted chats use the normal composer (text and 👍 only; no files,
+  replies, reactions, edits or typing indicators yet).
+
+## Media in encrypted chats (2026-10-29; sending awaiting first user test)
+
+- Scheme (`src/e2ee_media.rs`), same as WhatsApp: random 32-byte media key;
+  HKDF-SHA256 with info "WhatsApp Image/Video/Audio/Document Keys" gives IV,
+  AES-256 key and HMAC key. Blob = AES-256-CBC(PKCS#7) || first 10 bytes of
+  HMAC-SHA256(iv || ciphertext).
+- Hosts: `<iq xmlns="w:m" type="set"><media_conn/>` on the E2EE socket returns
+  an auth token (TTL 300 s) and hosts: `scontent.*.fbcdn.net` (download) and
+  `rupload.facebook.com` (upload).
+- Upload (web module `WAMediaUrl` / `WAHttpRegularUploadMedia`): POST the
+  blob, `Content-Type: text/plain`, to
+  `https://rupload.facebook.com/wa-msgr/mms/<image|video|audio|document>/<b64url(enc sha256)>?auth=<auth>&token=<b64url(enc sha256)>`
+  (`mediaUploadRoot` is `/wa-msgr/mms`). The JSON answer has `direct_path`
+  and optionally `object_id` and `handle`.
+- Message (web module `WAMediaTransport.pb`, field numbers confirmed):
+  `ConsumerApplication.Content.imageMessage(2) = { image(1): SubProtocol {
+  payload: ImageTransport, version: 1 }, caption(2) }`.
+  `ImageTransport { integral(1) { transport(1): WAMediaTransport }, ancillary(2)
+  { height(1), width(2) } }`. `WAMediaTransport { integral(1) { fileSha256(1),
+  mediaKey(2), fileEncSha256(3), directPath(4), mediaKeyTimestamp(5) },
+  ancillary(2) { fileLength(1), mimetype(2), thumbnail(3) { jpegThumbnail(1),
+  …, width(3), height(4) }, objectId(4) } }`. Video ancillary: height(4), width(5).
+- Receiving: the listener downloads `https://<host><direct path>`, checks and
+  decrypts, and caches the file (0600) in
+  `~/Library/Caches/Messenger Desktop/e2ee-media/<sha256>.<ext>` before the UI
+  sees the message.
+- Sending: pictures only so far (`Listener::send_image`): encrypt, upload,
+  then the normal per-device send. A plain copy goes into the cache.
