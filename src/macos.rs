@@ -593,6 +593,8 @@ pub fn reap_video() {
 
 /// Title of the sticker panel's window.
 pub const STICKER_WINDOW: &str = "Messenger Desktop Stickers";
+/// Title of the PIN dialog's window.
+pub const PIN_WINDOW: &str = "Messenger Desktop PIN";
 
 thread_local! {
     static GLASS_WINDOWS: RefCell<HashMap<String, (Retained<NSWindow>, Retained<NSGlassEffectView>)>> = RefCell::new(HashMap::new());

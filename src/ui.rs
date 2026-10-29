@@ -293,19 +293,42 @@ impl MessengerApp {
         let busy = matches!(st.stage, PinStage::OpeningWeb(_) | PinStage::Running(_));
         let mut close = !busy && ctx.input(|i| i.key_pressed(Key::Escape));
         let screen = ctx.content_rect();
-        egui::Area::new(egui::Id::new("pin_restore")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+        // A dimming scrim over the app; clicking it closes the dialog.
+        egui::Area::new(egui::Id::new("pin_restore_scrim")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
             let scrim = ui.allocate_rect(screen, Sense::click());
-            ui.painter().rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(140));
-            let card = Rect::from_center_size(screen.center(), Vec2::new(380.0, 300.0));
-            if scrim.clicked() && !busy && !ui.rect_contains_pointer(card) {
+            ui.painter().rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(110));
+            if scrim.clicked() && !busy {
                 close = true;
             }
-            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(card).layout(Layout::top_down(Align::Center)));
-            Frame::default().fill(pal().popup).stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(20)).inner_margin(Margin::same(22)).show(&mut child, |ui| {
-                ui.set_width(card.width() - 44.0);
+        });
+        // The card is a Liquid Glass window of its own (like the sticker
+        // panel): glass behind egui can't show through the app's content.
+        let size = Vec2::new(380.0, 310.0);
+        let origin = ctx.input(|i| i.viewport().inner_rect.map(|r| r.min)).unwrap_or_default();
+        let builder = egui::ViewportBuilder::default()
+            .with_title(crate::macos::PIN_WINDOW)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_position(origin + (screen.center() - size / 2.0).to_vec2())
+            .with_inner_size(size);
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("pin_restore"), builder, |pctx, _| {
+            crate::macos::glass_window(crate::macos::PIN_WINDOW, 24.0);
+            if !busy && pctx.input(|i| i.key_pressed(Key::Escape)) {
+                close = true;
+            }
+            let frame = Frame::NONE.stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(24)).inner_margin(Margin::same(22));
+            egui::CentralPanel::default().frame(frame).show(pctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("🔒").size(30.0));
-                    ui.add_space(6.0);
+                    // A drawn icon (SF Symbol), not the 🔒 emoji.
+                    if let Some(png) = crate::macos::sf_symbol_png("lock.fill", 26.0, [pal().blue.r(), pal().blue.g(), pal().blue.b()]) {
+                        let dim = |i: usize| png.get(i..i + 4).map_or(1.0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32);
+                        let (w, h) = (dim(16), dim(20));
+                        let scale = 30.0 / w.max(h);
+                        ui.add(egui::Image::from_bytes("bytes://sym/pin-lock.png", png).fit_to_exact_size(Vec2::new(w * scale, h * scale)));
+                    }
+                    ui.add_space(8.0);
                     ui.label(sf("Restore encrypted history", 17.0, 700));
                     ui.add_space(6.0);
                     let note = match (&info.registered, info.loading) {
@@ -314,16 +337,26 @@ impl MessengerApp {
                     };
                     ui.add(egui::Label::new(sf(&note, 13.0, 400).color(pal().muted)).wrap());
                     ui.add_space(12.0);
+                    // A capsule field (INPUT fill, hairline, blue ring when focused).
+                    let field_rect = ui.allocate_exact_size(Vec2::new(200.0, 44.0), Sense::hover()).0;
+                    let field_id = egui::Id::new("pin_field");
+                    let focused = ui.memory(|m| m.has_focus(field_id));
+                    ui.painter().rect_filled(field_rect, CornerRadius::same(22), pal().input);
+                    let ring = if focused { Stroke::new(2.0, pal().blue) } else { Stroke::new(1.0, pal().border) };
+                    ui.painter().rect_stroke(field_rect, CornerRadius::same(22), ring, egui::StrokeKind::Inside);
                     let field = TextEdit::singleline(&mut st.pin)
+                        .id(field_id)
                         .password(true)
                         .char_limit(6)
+                        .frame(Frame::NONE)
                         .horizontal_align(Align::Center)
-                        .font(egui::FontId::proportional(24.0))
-                        .desired_width(180.0)
+                        .font(egui::FontId::proportional(22.0))
                         .hint_text("••••••");
-                    let resp = ui.add_enabled(!busy, field);
+                    let resp = ui.put(field_rect.shrink2(Vec2::new(16.0, 8.0)), |ui: &mut egui::Ui| ui.add_enabled(!busy, field));
                     st.pin.retain(|c| c.is_ascii_digit());
                     if !st.focused {
+                        // Make the dialog's window key so the PIN can be typed.
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
                         resp.request_focus();
                         st.focused = true;
                     }

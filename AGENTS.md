@@ -120,6 +120,14 @@ style.
   viewport: a borderless transparent window positioned over the main one,
   given a glass pane by `macos::glass_window(title, radius)` and attached as
   a child window. Use this for any floating panel that must be Liquid Glass.
+- **Every dialog and floating panel is Liquid Glass**, never an opaque egui
+  card: the sticker panel, the PIN restore dialog, and anything new (sheets,
+  confirmations, pickers that stay open). Build it as its own viewport with
+  `macos::glass_window(TITLE, radius)` (see `STICKER_WINDOW`, `PIN_WINDOW`),
+  `Frame::NONE` plus a `border` hairline, and a dimming scrim in the main
+  window for modal dialogs. Inside: SF Symbol icons (not emoji), capsule
+  fields and buttons. A dialog that takes typing sends
+  `ViewportCommand::Focus` so its window becomes key.
 - **Sticker store** (in the sticker panel's "+"): `Session::sticker_store`
   (`CometStickersStoreDialogQuery`, then `...PackListPaginationQuery`) and
   `sticker_pack_tray` (`CometStickersStorePackMutation{Add,Remove}Mutation`,
