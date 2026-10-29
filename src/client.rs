@@ -39,6 +39,8 @@ pub enum Command {
     RefreshRecent { thread: i64 },
     LoadStickerPacks,
     LoadStickerPack { pack: String },
+    /// Look up the PIN backup's status and client id (read-only).
+    LoadPinInfo,
     /// The sticker store's first page, or (`more`) the next one.
     LoadStickerStore { more: bool },
     /// Add a store pack to the tray (`add`) or remove it.
@@ -67,6 +69,16 @@ pub struct StickerState {
     pub tray_changing: std::collections::HashSet<String>,
 }
 
+/// The PIN backup's state, for the restore dialog.
+#[derive(Default, Clone)]
+pub struct PinInfo {
+    pub loading: bool,
+    pub registered: Option<bool>,
+    pub attempts_remaining: Option<i64>,
+    pub client_id: Option<String>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Status {
     Connecting,
@@ -88,6 +100,9 @@ pub struct Shared {
     /// DGW streams' cursor (`Store::cursors`): the server rejects one chain's
     /// cursor on the other with `handleSyncFailure`.
     http_cursor: Mutex<Option<String>>,
+    /// Encrypted-history PIN backup: status, and the client id the web's
+    /// restore needs (read-only lookups, see `vesta.rs`).
+    pub pin: Mutex<PinInfo>,
     /// A mailbox poll is in flight.
     polling: std::sync::atomic::AtomicBool,
 }
@@ -101,6 +116,7 @@ pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (A
         stickers: Mutex::new(StickerState::default()),
         e2ee_tx: Mutex::new(None),
         polling: Default::default(),
+        pin: Mutex::new(PinInfo::default()),
         http_cursor: Mutex::new(None),
     });
     let (tx, rx) = mpsc::unbounded_channel();
@@ -926,6 +942,38 @@ impl Conn {
             }
             Command::LoadStickerPack { pack } => {
                 self.load_stickers(Some(pack));
+                return Ok(None);
+            }
+            Command::LoadPinInfo => {
+                {
+                    let mut pin = self.shared.pin.lock().unwrap();
+                    if pin.loading {
+                        return Ok(None);
+                    }
+                    pin.loading = true;
+                }
+                let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
+                tokio::spawn(async move {
+                    let result = async {
+                        let status = crate::vesta::pin_status(&session).await?;
+                        let id = crate::vesta::vesta_client_id(&session).await?;
+                        anyhow::Ok((status, id))
+                    }
+                    .await;
+                    let mut pin = shared.pin.lock().unwrap();
+                    pin.loading = false;
+                    match result {
+                        Ok((status, id)) => {
+                            pin.registered = Some(status.registered);
+                            pin.attempts_remaining = status.attempts_remaining;
+                            pin.client_id = Some(id);
+                            pin.error = None;
+                        }
+                        Err(e) => pin.error = Some(format!("{e:#}")),
+                    }
+                    drop(pin);
+                    repaint();
+                });
                 return Ok(None);
             }
             Command::LoadStickerStore { more } => {

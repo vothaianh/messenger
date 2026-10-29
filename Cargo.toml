@@ -50,6 +50,7 @@ emojis = "0.9.1"
 objc2-av-kit = { version = "0.3", features = ["AVPlayerView", "objc2-app-kit", "objc2-av-foundation"] }
 objc2-av-foundation = { version = "0.3", features = ["AVPlayer", "AVPlayerItem", "AVAsset", "objc2-core-media"] }
 wasmi = { version = "2.0.0", default-features = false, features = ["std", "validate"] }
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKContentWorld", "WKFrameInfo", "WKNavigation", "block2", "objc2-app-kit"] }
 
 [dev-dependencies]
 resvg = "0.45.1"

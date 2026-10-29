@@ -168,6 +168,8 @@ pub struct MessengerApp {
     /// The sticker store is open in the sticker panel, and the store pack
     /// being previewed (id, name).
     sticker_store: bool,
+    /// The "restore encrypted history with your PIN" dialog, when open.
+    pin_restore: Option<PinRestore>,
     store_preview: Option<(String, String)>,
     last_layout_log: String,
     /// Message list as of the previous frame, to keep the view in place when
@@ -232,12 +234,145 @@ impl MessengerApp {
             applied_theme: None,
             sticker_pack: None,
             sticker_store: false,
+            pin_restore: None,
             store_preview: None,
             last_layout_log: String::new(),
             prev_view: None,
             scroll_fix: None,
             focused: true,
         }
+    }
+
+    fn open_pin_restore(&mut self, cmds: &mut Vec<Command>) {
+        if self.pin_restore.is_none() {
+            self.pin_restore = Some(PinRestore::default());
+        }
+        cmds.push(Command::LoadPinInfo);
+    }
+
+    /// The PIN dialog and the restore it drives: the web client's own restore
+    /// code, run in the hidden web engine (see `macos::web_open` and
+    /// `RESTORE_JS`). One PIN attempt per click; nothing is retried.
+    fn pin_restore_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut st) = self.pin_restore.take() else { return };
+        let info = self.shared.pin.lock().unwrap().clone();
+
+        // Drive the restore.
+        match st.stage {
+            PinStage::OpeningWeb(since) => {
+                if crate::macos::web_loaded() && since.elapsed() > std::time::Duration::from_secs(6) {
+                    let pin = std::mem::take(&mut st.pin);
+                    match info.client_id.as_deref().and_then(|id| crate::macos::web_call_with(RESTORE_JS, &[("pin", &pin), ("clientId", id)])) {
+                        Some(id) => st.stage = PinStage::Running(id),
+                        None => st.stage = PinStage::Failed("Couldn't start the restore".into()),
+                    }
+                } else if since.elapsed() > std::time::Duration::from_secs(60) {
+                    st.stage = PinStage::Failed("Messenger didn't load in time. Try again.".into());
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(300));
+            }
+            PinStage::Running(id) => {
+                if let Some(result) = crate::macos::web_result(id) {
+                    st.stage = match result.as_deref().map(serde_json::from_str::<serde_json::Value>) {
+                        Ok(Ok(v)) if v["ok"].as_bool() == Some(true) => PinStage::Done,
+                        Ok(Ok(v)) if v["wrongPin"].as_bool() == Some(true) => PinStage::WrongPin,
+                        Ok(Ok(v)) => PinStage::Failed(v["error"].as_str().unwrap_or("The restore failed").to_string()),
+                        Ok(Err(_)) => PinStage::Failed("Unexpected answer from Messenger".into()),
+                        Err(e) => PinStage::Failed(e.clone()),
+                    };
+                    if matches!(st.stage, PinStage::WrongPin) {
+                        self.send(Command::LoadPinInfo);
+                    }
+                } else {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                }
+            }
+            _ => {}
+        }
+
+        let busy = matches!(st.stage, PinStage::OpeningWeb(_) | PinStage::Running(_));
+        let mut close = !busy && ctx.input(|i| i.key_pressed(Key::Escape));
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("pin_restore")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            let scrim = ui.allocate_rect(screen, Sense::click());
+            ui.painter().rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(140));
+            let card = Rect::from_center_size(screen.center(), Vec2::new(380.0, 300.0));
+            if scrim.clicked() && !busy && !ui.rect_contains_pointer(card) {
+                close = true;
+            }
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(card).layout(Layout::top_down(Align::Center)));
+            Frame::default().fill(pal().popup).stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(20)).inner_margin(Margin::same(22)).show(&mut child, |ui| {
+                ui.set_width(card.width() - 44.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("🔒").size(30.0));
+                    ui.add_space(6.0);
+                    ui.label(sf("Restore encrypted history", 17.0, 700));
+                    ui.add_space(6.0);
+                    let note = match (&info.registered, info.loading) {
+                        (Some(false), _) => "This account has no Messenger PIN backup.".to_string(),
+                        _ => "Enter the 6-digit PIN you use for Messenger's secure storage.".to_string(),
+                    };
+                    ui.add(egui::Label::new(sf(&note, 13.0, 400).color(pal().muted)).wrap());
+                    ui.add_space(12.0);
+                    let field = TextEdit::singleline(&mut st.pin)
+                        .password(true)
+                        .char_limit(6)
+                        .horizontal_align(Align::Center)
+                        .font(egui::FontId::proportional(24.0))
+                        .desired_width(180.0)
+                        .hint_text("••••••");
+                    let resp = ui.add_enabled(!busy, field);
+                    st.pin.retain(|c| c.is_ascii_digit());
+                    if !st.focused {
+                        resp.request_focus();
+                        st.focused = true;
+                    }
+                    ui.add_space(8.0);
+                    let status = match &st.stage {
+                        PinStage::Idle => info.attempts_remaining.map(|n| format!("{n} attempts left")).unwrap_or_default(),
+                        PinStage::OpeningWeb(_) => "Connecting to secure storage…".into(),
+                        PinStage::Running(_) => "Checking your PIN…".into(),
+                        PinStage::WrongPin => match info.attempts_remaining {
+                            Some(n) => format!("Incorrect PIN. {n} attempts left."),
+                            None => "Incorrect PIN.".into(),
+                        },
+                        PinStage::Failed(e) => format!("Couldn't restore: {}", truncate(e, 120)),
+                        PinStage::Done => "PIN accepted. Your history is being restored in the background; messages will appear as they're decrypted.".into(),
+                    };
+                    let color = match st.stage {
+                        PinStage::WrongPin | PinStage::Failed(_) => Color32::from_rgb(240, 90, 90),
+                        _ => pal().muted,
+                    };
+                    ui.add(egui::Label::new(sf(&status, 12.0, 500).color(color)).wrap());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 8.0) / 2.0;
+                        let done = matches!(st.stage, PinStage::Done);
+                        if ui.add_enabled(!busy, egui::Button::new(sf(if done { "Close" } else { "Cancel" }, 14.0, 600)).fill(pal().input).corner_radius(CornerRadius::same(16)).min_size(Vec2::new(w, 34.0))).clicked() {
+                            close = true;
+                        }
+                        let ready = st.pin.len() == 6 && !busy && !done && info.client_id.is_some() && info.registered == Some(true);
+                        let label = if busy { "Restoring…" } else { "Restore" };
+                        let submit = ui.add_enabled(ready, egui::Button::new(sf(label, 14.0, 600).color(Color32::WHITE)).fill(pal().blue).corner_radius(CornerRadius::same(16)).min_size(Vec2::new(w, 34.0)));
+                        if submit.clicked() || (ready && resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter))) {
+                            crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
+                            st.stage = PinStage::OpeningWeb(Instant::now());
+                        }
+                    });
+                    if let Some(e) = &info.error {
+                        ui.add_space(6.0);
+                        ui.add(egui::Label::new(sf(&truncate(e, 120), 11.0, 400).color(pal().muted)).wrap());
+                    }
+                });
+            });
+        });
+        if close {
+            // The hidden page keeps running after a successful PIN: the
+            // restore continues in its worker.
+            st.pin.clear();
+            return;
+        }
+        self.pin_restore = Some(st);
     }
 
     /// Follow the chosen appearance (or the system's): palette, egui style,
@@ -295,6 +430,8 @@ impl eframe::App for MessengerApp {
         handle_text_size_keys(&ctx);
         self.apply_theme(&ctx);
         crate::macos::reap_video();
+        self.pin_restore_ui(&ctx);
+        web_probe(&ctx);
         image_viewer(&ctx);
         let status = self.shared.status.lock().unwrap().clone();
         let shared = self.shared.clone();
@@ -651,6 +788,112 @@ fn is_big_emoji(text: &str) -> bool {
     }
     count > 0 && count <= 3
 }
+
+/// `MESSENGER_WEB_PROBE=1`: open the hidden web engine and log (to stderr)
+/// whether the web client's restore modules are reachable. Read-only.
+fn web_probe(ctx: &egui::Context) {
+    thread_local! {
+        static PROBE: std::cell::Cell<(u8, u64, Option<Instant>)> = const { std::cell::Cell::new((0, 0, None)) };
+    }
+    if std::env::var_os("MESSENGER_WEB_PROBE").is_none() {
+        return;
+    }
+    let (stage, id, since) = PROBE.get();
+    match stage {
+        0 => {
+            crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
+            PROBE.set((1, 0, Some(Instant::now())));
+        }
+        1 if crate::macos::web_loaded() && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(8)) => {
+            let body = r#"
+                const out = {path: location.pathname, hasRequire: typeof require};
+                try { out.vesta = Object.keys(require('VestaClient')); } catch (e) { out.vestaErr = String(e).slice(0, 80); }
+                try {
+                    const dtsg = require('DTSGInitialData').token, lsd = require('LSD').token;
+                    const body = new URLSearchParams({fb_dtsg: dtsg, lsd, fb_api_caller_class: 'RelayModern', fb_api_req_friendly_name: 'useMWChatEncryptedBackupsVestaUserInfoRefetchQuery', doc_id: '23870520485955982', variables: '{}', server_timestamps: 'true'});
+                    const t = await (await fetch('/api/graphql/', {method: 'POST', body, headers: {'X-FB-LSD': lsd}})).text();
+                    out.vestaInfo = JSON.parse(t.split('\n')[0]).data.viewer.messenger_default_encrypted_backup.vesta_user_info;
+                } catch (e) { out.infoErr = String(e).slice(0, 120); }
+                return JSON.stringify(out);
+            "#;
+            if let Some(id) = crate::macos::web_call(body) {
+                PROBE.set((2, id, since));
+            }
+        }
+        2 => {
+            if let Some(r) = crate::macos::web_result(id) {
+                eprintln!("[web probe] {r:?}");
+                PROBE.set((3, 0, None));
+            }
+        }
+        _ => {}
+    }
+    if stage < 3 {
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+}
+
+#[derive(Default)]
+struct PinRestore {
+    pin: String,
+    stage: PinStage,
+    focused: bool,
+}
+
+#[derive(Default)]
+enum PinStage {
+    #[default]
+    Idle,
+    /// Waiting for the hidden Messenger page to load.
+    OpeningWeb(Instant),
+    /// The restore script is running (web call id).
+    Running(u64),
+    WrongPin,
+    Failed(String),
+    Done,
+}
+
+/// Runs in the hidden facebook.com/messages page with `pin` and `clientId`
+/// (the backup's HSM device id) as arguments. It calls the web client's own
+/// restore, as its PIN dialog does (`useMWChatEncryptedBackupsPinCodeRestore`):
+/// `mwEBGetPINSecretFromVesta` (PIN login → recovery code) with an
+/// `addDevice` that runs `mwEBAddDevice` (adds this backup device and starts
+/// the history restore). QPL logging flows are stubbed with no-ops.
+const RESTORE_JS: &str = r#"
+    const load = async (name) => { const m = await require('requireDeferred')(name).load(); return m; };
+    const noop = () => {};
+    const flow = new Proxy({}, { get: (_, key) => key === 'then' ? undefined : noop });
+    const env = require('CometRelayEnvironment');
+    const db = await require('LSDatabaseSingleton').getLSDatabaseSingletonPromiseOrValue();
+    const addDeviceModule = await load('mwEBAddDevice');
+    const getSecretModule = await load('mwEBGetPINSecretFromVesta');
+    const getSecret = getSecretModule.default || getSecretModule;
+    let finish;
+    const added = new Promise((resolve) => { finish = resolve; });
+    const addDevice = (recoveryCode) => {
+        addDeviceModule.EBAddDevice({
+            environment: env, recoveryCode, restoreDeviceAuthQplFlow: flow, storage: db,
+            onSuccess: () => finish({ ok: true }),
+            onFailure: (e) => finish({ ok: false, error: 'add device: ' + String(e) }),
+            onInvalidRecoveryCode: () => finish({ ok: false, error: 'invalid recovery code' }),
+        });
+    };
+    let wrongPin = false;
+    try {
+        await getSecret({
+            addDevice, clientID: clientId, environment: env, getSourceFromContext: () => 'thread_view',
+            onSubmitPin: noop, onSubmitPinFailure: noop, onVestaSecretFetch: noop, pinCode: pin,
+            productUseCase: 'MSGR_ENC_BACKUP', setIsInProgress: noop,
+            setIsPinCodeIncorrect: (v) => { wrongPin = !!v; }, setIsVestaError: noop,
+            startRestoreDeviceAuthQplFlow: () => flow,
+        });
+    } catch (e) {
+        return JSON.stringify({ ok: false, wrongPin, error: String((e && e.message) || e).slice(0, 200) });
+    }
+    if (wrongPin) return JSON.stringify({ ok: false, wrongPin: true });
+    const result = await Promise.race([added, new Promise((r) => setTimeout(() => r({ ok: false, error: 'adding the device timed out' }), 180000))]);
+    return JSON.stringify(result);
+"#;
 
 /// Memory key of the image open in the in-app viewer.
 const IMAGE_VIEWER: &str = "image_viewer";
@@ -1020,7 +1263,9 @@ impl MessengerApp {
             });
 
         if thread.e2ee && messages.is_empty() {
-            e2ee_notice(ui, key);
+            if e2ee_notice(ui, key) {
+                self.open_pin_restore(cmds);
+            }
             return;
         }
 
@@ -1037,7 +1282,9 @@ impl MessengerApp {
                 if thread.e2ee {
                     ui.vertical_centered(|ui| {
                         ui.label(sf("🔒 End-to-end encrypted. Showing messages received on this Mac.", 12.0, 500).color(pal().muted));
-                        ui.label(sf("Older history needs your Messenger PIN (coming soon).", 12.0, 400).color(pal().muted));
+                        if ui.add(egui::Button::new(sf("Restore older history with your PIN", 12.0, 600).color(pal().blue)).frame(false)).clicked() {
+                            self.open_pin_restore(cmds);
+                        }
                     });
                     ui.add_space(8.0);
                 }
@@ -2140,20 +2387,25 @@ impl MessengerApp {
 }
 
 /// Shown instead of the message list for end-to-end encrypted chats.
-fn e2ee_notice(ui: &mut egui::Ui, key: i64) {
+/// Returns true when "Restore with PIN" was clicked.
+fn e2ee_notice(ui: &mut egui::Ui, key: i64) -> bool {
+    let mut clicked = false;
     ui.vertical_centered(|ui| {
         ui.add_space((ui.available_height() / 2.0 - 110.0).max(24.0));
         ui.label(RichText::new("🔒").size(44.0).color(pal().muted));
         ui.add_space(8.0);
         ui.label(sf("End-to-end encrypted chat", 17.0, 600));
         ui.add_space(4.0);
-        ui.add(egui::Label::new(sf("New messages in this chat will appear here as they arrive, and you can send text from here.\nOlder history needs your Messenger PIN (coming soon); until then, open it in your browser.", 14.0, 400).color(pal().muted)).wrap());
+        ui.add(egui::Label::new(sf("New messages in this chat appear here as they arrive.\nRestore older history with your Messenger PIN.", 14.0, 400).color(pal().muted)).wrap());
         ui.add_space(14.0);
-        let open = egui::Button::new(sf("Open in browser", 15.0, 600).color(Color32::WHITE)).fill(pal().blue).corner_radius(CornerRadius::same(18)).min_size(Vec2::new(0.0, 36.0));
-        if ui.add(open).clicked() {
+        let restore = egui::Button::new(sf("Restore with PIN", 15.0, 600).color(Color32::WHITE)).fill(pal().blue).corner_radius(CornerRadius::same(18)).min_size(Vec2::new(0.0, 36.0));
+        clicked = ui.add(restore).clicked();
+        ui.add_space(6.0);
+        if ui.add(egui::Button::new(sf("Open in browser", 13.0, 500).color(pal().blue)).frame(false)).clicked() {
             ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.facebook.com/messages/e2ee/t/{key}")));
         }
     });
+    clicked
 }
 
 /// "↩ A replied to B" plus the quoted message, shown above a reply.

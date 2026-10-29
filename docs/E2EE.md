@@ -433,3 +433,25 @@ Each LS procedure is generated JS calling native crypto ops (`LSCreate*`,
 `.nop` modules). Porting this step alone means translating ~30 KB of
 generated code and its crypto ops exactly, and it changes the account's
 backup (adds a device), so it can only be tested for real once.
+
+## History restore via the hidden web engine (2026-10-29)
+
+Chosen over a native rewrite (the backup engine is ~30 KB of generated LS
+procedures plus two more wasm modules, and its device-add step changes the
+account, so it can't be iterated on safely).
+
+- `macos::web_open` keeps an off-screen WKWebView on facebook.com/messages
+  with the login window's (default, persistent) WebKit data store, so it's
+  logged in. `web_call_with(body, args)` runs an async function in the page
+  world via `callAsyncJavaScript` (arguments passed as data, not code).
+  Probe (`MESSENGER_WEB_PROBE=1`) confirmed: logged in, `require` available,
+  Vesta status readable.
+- `RESTORE_JS` (ui.rs) calls the web's own `mwEBGetPINSecretFromVesta` with
+  the args its PIN dialog hook builds, and an `addDevice` that runs
+  `mwEBAddDevice.EBAddDevice` with `require('CometRelayEnvironment')` and the
+  `LSDatabaseSingleton` DB. QPL flows are no-op proxies.
+- The PIN dialog (E2EE chat: "Restore with PIN") gets status and the HSM
+  client id via `vesta.rs` (read-only), allows one attempt per click and
+  never retries.
+- Not done yet: reading the restored messages out of the web client's
+  database into our store (inspect after a first real restore).

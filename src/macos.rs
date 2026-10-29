@@ -630,3 +630,120 @@ pub fn glass_window(title: &str, radius: f64) {
         map.insert(title.to_string(), (window, pane));
     });
 }
+
+// ---- Hidden web engine ----
+//
+// A WKWebView that's never shown, running facebook.com/messages with the
+// login window's session (the default, persistent WebKit data store), so the
+// app can use the web client's own code where reimplementing it isn't
+// practical (restoring encrypted-chat history with the PIN). Its window sits
+// off-screen but "visible", so WebKit doesn't throttle the page.
+
+use objc2_web_kit::{WKContentWorld, WKWebView, WKWebViewConfiguration};
+
+#[derive(Default)]
+struct HiddenWeb {
+    window: Option<Retained<NSWindow>>,
+    view: Option<Retained<WKWebView>>,
+    next_id: u64,
+    results: HashMap<u64, Result<String, String>>,
+}
+
+thread_local! {
+    static WEB: RefCell<HiddenWeb> = RefCell::new(HiddenWeb::default());
+}
+
+/// Open (once) the hidden page at `url`. Main thread only.
+pub fn web_open(url: &str, user_agent: &str) {
+    use objc2_app_kit::{NSBackingStoreType, NSWindowCollectionBehavior, NSWindowStyleMask};
+    use objc2_foundation::{NSURLRequest, NSURL};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    WEB.with_borrow_mut(|w| {
+        if w.view.is_some() {
+            return;
+        }
+        let rect = NSRect::new(NSPoint::new(-30000.0, -30000.0), NSSize::new(1280.0, 800.0));
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(mtm.alloc(), rect, NSWindowStyleMask::Borderless, NSBackingStoreType::Buffered, false)
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        window.setExcludedFromWindowsMenu(true);
+        window.setIgnoresMouseEvents(true);
+        window.setCollectionBehavior(NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle);
+        let config = unsafe { WKWebViewConfiguration::new(mtm) };
+        let view = unsafe { WKWebView::initWithFrame_configuration(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), rect.size), &config) };
+        unsafe { view.setCustomUserAgent(Some(&NSString::from_str(user_agent))) };
+        window.setContentView(Some(&view));
+        window.orderFrontRegardless();
+        if let Some(u) = NSURL::URLWithString(&NSString::from_str(url)) {
+            let request = NSURLRequest::requestWithURL(&u);
+            unsafe { view.loadRequest(&request) };
+        }
+        w.window = Some(window);
+        w.view = Some(view);
+    });
+}
+
+/// Whether the hidden page finished loading.
+pub fn web_loaded() -> bool {
+    WEB.with_borrow(|w| w.view.as_ref().is_some_and(|v| unsafe { !v.isLoading() }))
+}
+
+/// Run `body` as an async function in the page (it may `await` and must
+/// `return` a string, e.g. `JSON.stringify(...)`). Returns an id for
+/// `web_result`. Main thread only.
+pub fn web_call(body: &str) -> Option<u64> {
+    web_call_with(body, &[])
+}
+
+/// `web_call` with string arguments, visible to `body` as local variables of
+/// those names. Values are passed as data, never pasted into the code (so a
+/// PIN can't break out of a string literal).
+pub fn web_call_with(body: &str, args: &[(&str, &str)]) -> Option<u64> {
+    let mtm = MainThreadMarker::new()?;
+    let keys: Vec<Retained<NSString>> = args.iter().map(|(k, _)| NSString::from_str(k)).collect();
+    let values: Vec<Retained<objc2::runtime::AnyObject>> = args.iter().map(|(_, v)| Retained::into_super(Retained::into_super(NSString::from_str(v)))).collect();
+    let key_refs: Vec<&NSString> = keys.iter().map(|k| &**k).collect();
+    let arguments = (!args.is_empty()).then(|| objc2_foundation::NSDictionary::from_retained_objects(&key_refs, &values));
+    WEB.with_borrow_mut(|w| {
+        let view = w.view.clone()?;
+        w.next_id += 1;
+        let id = w.next_id;
+        let handler = RcBlock::new(move |result: *mut objc2::runtime::AnyObject, error: *mut NSError| {
+            let outcome = if !error.is_null() {
+                let e = unsafe { &*error };
+                Err(e.localizedDescription().to_string())
+            } else if result.is_null() {
+                Ok(String::new())
+            } else {
+                let obj = unsafe { &*result };
+                match obj.downcast_ref::<NSString>() {
+                    Some(s) => Ok(s.to_string()),
+                    None => Ok(format!("{obj:?}")),
+                }
+            };
+            WEB.with_borrow_mut(|w| {
+                w.results.insert(id, outcome);
+            });
+        });
+        let world = unsafe { WKContentWorld::pageWorld(mtm) };
+        unsafe { view.callAsyncJavaScript_arguments_inFrame_inContentWorld_completionHandler(&NSString::from_str(body), arguments.as_deref(), None, &world, Some(&handler)) };
+        Some(id)
+    })
+}
+
+/// The result of `web_call(id)` once it's done (taken).
+pub fn web_result(id: u64) -> Option<Result<String, String>> {
+    WEB.with_borrow_mut(|w| w.results.remove(&id))
+}
+
+/// Tear the hidden page down.
+pub fn web_close() {
+    WEB.with_borrow_mut(|w| {
+        if let Some(window) = w.window.take() {
+            window.close();
+        }
+        w.view = None;
+        w.results.clear();
+    });
+}

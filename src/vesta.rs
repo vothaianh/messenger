@@ -476,7 +476,7 @@ const SETTINGS_DOC: &str = "31918369997811363";
 
 /// The Vesta client id: the `client_generated_id` of the backup's HSM
 /// virtual device (what the web passes as `fbid` to the Vesta calls).
-async fn vesta_client_id(session: &crate::session::Session) -> Result<String> {
+pub async fn vesta_client_id(session: &crate::session::Session) -> Result<String> {
     let v = session.graphql("MWChatEncryptedBackupsSettingsDialogQuery", SETTINGS_DOC, &serde_json::json!({})).await?;
     v.pointer("/data/xfb_backup/virtual_devices")
         .and_then(|d| d.as_array())
