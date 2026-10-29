@@ -441,7 +441,11 @@ impl Store {
                         let uri = format!("file://{}", path.display());
                         self.add_e2ee_message(thread_key, ev, caption.clone());
                         self.attach(thread_key, &ev.id, Attachment {
-                            kind: if *kind == MediaKind::Video { AttachmentKind::Video } else { AttachmentKind::Image },
+                            kind: match kind {
+                                MediaKind::Video => AttachmentKind::Video,
+                                MediaKind::Sticker => AttachmentKind::Sticker,
+                                _ => AttachmentKind::Image,
+                            },
                             preview_url: uri.clone(),
                             url: uri,
                             title: String::new(),

@@ -392,3 +392,22 @@ queries) to fetch and decrypt the archived messages.
   `LSWriteMinosPublicKey`, ...) plus the EB/Minos JS and a second wasm
   (`COs9e0Kj0ic.wasm`, VOPRF over Ristretto). Re-implementing it means
   re-implementing that whole EBLS state machine: far bigger than Vesta.
+
+### Minos crypto is a wasm too (2026-10-29)
+
+- The archive crypto runs in a second Meta wasm, `EBGetMinosWasm`, bx asset
+  **31853** (also in the `/messages/` HTML). Interface `EBMinosWasm.pb`,
+  wrapper `MinosCommandSpec`, 97 specs. JS wrappers `EBMinosWasm*`:
+  `DeriveMessagingMailboxKeypairs`, `DeriveMailbox{Encryption,Signing,Auth}Keypair`,
+  `MandrakeValidateAndDecryptSelfMmk` / `...NewMmkFromMailbox` /
+  `MandrakeDecryptMek` (mailbox master key → message encryption keys),
+  `DecryptMekForDistribution(FromTransportSender)`,
+  `DecryptAndVerifyMessage`, `DeriveAttachment{PrimaryKey,AccessToken}Secret`,
+  `MinosThreadIdFrom{OneToOneThread,ActThreadId}`.
+- Plan for the native restore: reuse the `vesta.rs` wasm host for this
+  module, and write the orchestration in Rust: recovery code → backup device
+  (`EBAddDeviceGraphQL`) → mailbox keys → MEKs (`EBMinosMekFetchOnMissQuery`)
+  → archived messages → `DecryptAndVerifyMessage` → store. Next step: read
+  the JS around `EBMinosLoadMailboxKeys`, `EBMinosMailboxKeysCache`,
+  `RecoveryCodeDB`, `EBCryptoUtils` for how the recovery code becomes the
+  mailbox keys, and how messages are fetched.

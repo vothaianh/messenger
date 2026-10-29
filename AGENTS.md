@@ -132,6 +132,25 @@ style.
 - Can't screenshot the app from the agent (no Screen Recording permission):
   ask the user for a screenshot to check visual changes.
 
+## Feature parity: regular and encrypted chats
+
+Every feature must work in both kinds of chat, kept in sync:
+
+- **Regular chats** go through Lightspeed: GraphQL/HTTP tasks and the DGW
+  sync streams (`client.rs`, `store.rs`).
+- **Encrypted (🔒, E2EE) chats** go through Armadillo on the E2EE socket
+  (`e2ee_listen.rs`, `armadillo.rs`, `e2ee_media.rs`, `store::apply_e2ee`).
+
+When you add or change a feature (sending a kind of message, stickers,
+media, reactions, replies, edits, unsend, read/delivery receipts, typing,
+notifications, snippets, live updates), implement it for both paths in the
+same change, or say clearly in your report which side is missing and why.
+Don't hide a control in one kind of chat without telling the user (the
+sticker button was hidden in E2EE chats and the user had to ask).
+Current gaps in E2EE chats: replies, reactions, edits, unsend and typing
+aren't sent yet; old history needs the PIN restore (in progress, see
+`docs/E2EE.md`).
+
 ## Research notes
 
 - `docs/E2EE.md` covers how Messenger E2EE (Armadillo) works: endpoints, ICDC
