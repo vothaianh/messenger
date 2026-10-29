@@ -13,7 +13,7 @@ egui_extras = { version = "0.37.0", features = ["all_loaders", "http"] }
 futures-util = "0.3.34"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 objc2 = "0.6.5"
-objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", "NSResponder", "NSView", "NSWindow", "NSColor", "NSGraphics", "NSGlassEffectView", "NSVisualEffectView", "NSMenu", "NSMenuItem", "NSEvent", "NSImage", "NSFont", "NSStringDrawing", "NSAttributedString", "NSCell", "objc2-core-foundation", "block2", "NSBitmapImageRep", "NSImageRep", "NSGraphicsContext", "NSFontDescriptor"] }
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSDockTile", "NSResponder", "NSView", "NSWindow", "NSColor", "NSGraphics", "NSGlassEffectView", "NSVisualEffectView", "NSMenu", "NSMenuItem", "NSEvent", "NSImage", "NSFont", "NSStringDrawing", "NSAttributedString", "NSCell", "objc2-core-foundation", "block2", "NSBitmapImageRep", "NSImageRep", "NSGraphicsContext", "NSFontDescriptor", "NSButton", "NSControl", "NSPasteboard", "NSPasteboardItem", "NSAppearance", "NSBox"] }
 objc2-foundation = "0.3.2"
 prost = "0.14.4"
 rand = "0.10"
@@ -47,6 +47,8 @@ yawc = { version = "0.5", default-features = false, features = ["rustls-aws-lc-r
 objc2-user-notifications = { version = "0.3.2", features = ["UNUserNotificationCenter", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSound", "UNNotificationTrigger", "UNNotification", "block2"] }
 block2 = "0.6.2"
 emojis = "0.9.1"
+objc2-av-kit = { version = "0.3", features = ["AVPlayerView", "objc2-app-kit", "objc2-av-foundation"] }
+objc2-av-foundation = { version = "0.3", features = ["AVPlayer", "AVPlayerItem", "AVAsset", "objc2-core-media"] }
 
 [dev-dependencies]
 resvg = "0.45.1"

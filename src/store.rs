@@ -292,7 +292,7 @@ impl Store {
             .unwrap_or_default()
     }
 
-    fn find_message_mut(&mut self, thread: Option<i64>, id: &str) -> Option<&mut Message> {
+    pub fn find_message_mut(&mut self, thread: Option<i64>, id: &str) -> Option<&mut Message> {
         if let Some(t) = thread {
             if let Some(pos) = self.messages.get(&t).and_then(|v| v.iter().position(|m| m.id == id)) {
                 return self.messages.get_mut(&t).map(|v| &mut v[pos]);
@@ -745,6 +745,21 @@ impl Store {
                 self.attach(c.arg(25).int(), &c.arg(30).string(), att);
             }
             "insertStickerAttachment" => {
+                if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                    // Shape only: numbers as is, links as their path's last
+                    // segment's extension and folder, other strings by length.
+                    let shape: Vec<String> = c.args.iter().enumerate().map(|(i, a)| match a.str() {
+                        Some(s) if s.starts_with("http") => {
+                            let path = s.split('?').next().unwrap_or(s);
+                            let folder = path.split('/').nth(3).unwrap_or("");
+                            let ext = path.rsplit('.').next().filter(|e| e.len() <= 4).unwrap_or("?");
+                            format!("{i}:url({folder} .{ext})")
+                        }
+                        Some(s) => format!("{i}:str({})", s.len()),
+                        None => format!("{i}:{a:?}"),
+                    }).collect();
+                    eprintln!("[sticker] {}", shape.join(" "));
+                }
                 let url = c.args.iter().filter_map(|a| a.str()).find(|s| s.starts_with("http")).unwrap_or("").to_string();
                 let mid = c.args.iter().filter_map(|a| a.str()).find(|s| s.starts_with("mid.")).unwrap_or("").to_string();
                 let att = Attachment {

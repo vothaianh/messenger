@@ -90,9 +90,10 @@ style.
   over the blur, so text keeps its contrast. Message bubbles: own messages
   solid blue, others translucent white (`BUBBLE_OTHER`).
 - **Colors on glass are translucent white, premultiplied** (white at alpha a =
-  `from_rgba_premultiplied(a, a, a, a)`): `INPUT` for controls, `QUOTE` for
-  cards and hover, `SELECTED` for the selected row, `BORDER` for hairlines.
-  Accent is `BLUE`. Popups and menus stay opaque (`POPUP`) for legibility.
+  `from_rgba_premultiplied(a, a, a, a)`; in light, translucent black
+  `(0, 0, 0, a)`): `input` for controls, `quote` for cards and hover,
+  `selected` for the selected row, `border` for hairlines. Accent is `blue`.
+  Popups and menus stay opaque (`popup`) for legibility.
 - **Shapes:** capsule buttons and chips, continuous large radii (18–22 pt for
   surfaces, half-height for pills), no hard separator lines between panes
   (`show_separator_line(false)`); spacing does the separating.
@@ -106,8 +107,19 @@ style.
   emoji content, such as the 👍 quick-send and reactions.
 - **Fields** are 36 pt capsules (`INPUT` fill, `BORDER` hairline, a blue ring
   while focused), lined up with the title's leading edge.
-- **Dark appearance only** for now. The glass tint (`colorWithWhite 0.08,
-  alpha 0.55`) keeps contrast on bright wallpapers.
+- **Light and dark appearances.** Colors come from `pal()`, which returns the
+  `DARK` or `LIGHT` palette (`ui.rs`); never hardcode a color that only works
+  on one of them (white is fine only on `blue`). The ⋯ menu picks Match System
+  / Light / Dark (stored as `theme`); `apply_theme` swaps the palette and egui
+  style and calls `macos::set_appearance`, which sets the window appearance
+  and the glass tint (white 0.1 in light, navy `sRGB 0.04 0.08 0.17, alpha
+  0.12` in dark; window tint `bg` 38% navy / 42% white over a fully opaque
+  background blur; tuned with the user between "not glassy" and "too clear": the dark theme is dark blue). Keep tints light: the user
+  wants the glass to look transparent, with the wallpaper showing through so text keeps its contrast on any wallpaper.
+- **Media viewing stays in the app:** images open in the egui overlay
+  `image_viewer` (scrim, fitted picture, close/open-in-browser buttons),
+  videos in `macos::play_video` (an `NSWindow` with AVKit's `AVPlayerView`,
+  streaming the link; closing it stops playback via `reap_video`).
 - Can't screenshot the app from the agent (no Screen Recording permission):
   ask the user for a screenshot to check visual changes.
 
@@ -120,7 +132,10 @@ style.
   MQTT (`edge-chat`) to Meta's DGW gateway
   (`wss://gateway.facebook.com/ws/lightspeed`); MQTT still answers requests but
   never pushes. DGW auth = session cookie + `x-dgw-uuid` set to the user's fbid.
-  Older history goes over HTTP instead (`Conn::load_older`): task 228 via
-  GraphQL, then a delta sync of database 1 from the cursor with request
-  type 2 (type 1 ignores the cursor and returns a snapshot). Sent over DGW,
-  task 228 makes the server drop the connection.
+  DGW is for receiving only: every task (send, react, read, history 228, ...)
+  goes over HTTP as a GraphQL request type 3 (`Conn::send_tasks_http`,
+  `Conn::load_older`). A task sent on the DGW socket is acked, then the server
+  drops the whole connection. Older history: task 228, then a delta sync of
+  database 1 from the cursor with request type 2 (type 1 ignores the cursor and
+  returns a snapshot). The first database 1 sync on DGW sometimes answers
+  `handleSyncFailure`; the client then resyncs that database from a snapshot.

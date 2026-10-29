@@ -35,8 +35,22 @@ pub enum Command {
     MarkRead { thread: i64 },
     Typing { thread: i64, is_group: bool, typing: bool },
     LoadOlder { thread: i64 },
+    /// Re-fetch a chat's newest messages (fills gaps left while offline).
+    RefreshRecent { thread: i64 },
+    LoadStickerPacks,
+    LoadStickerPack { pack: String },
+    SendSticker { thread: i64, sticker_id: i64 },
     LoadMoreThreads,
     Mute { thread: i64, minutes: Option<i64> },
+}
+
+#[derive(Default)]
+pub struct StickerState {
+    /// None until the tray has been fetched.
+    pub packs: Option<Vec<crate::session::StickerPack>>,
+    pub pack_stickers: std::collections::HashMap<String, Vec<crate::session::Sticker>>,
+    /// Requests in flight (pack ids, or "" for the tray).
+    pub loading: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,8 +66,16 @@ pub struct Shared {
     pub store: Mutex<Store>,
     pub status: Mutex<Status>,
     pub error: Mutex<Option<String>>,
+    /// The sticker tray and loaded packs (fetched on demand).
+    pub stickers: Mutex<StickerState>,
     /// Queue into the E2EE connection, once it's running.
     e2ee_tx: Mutex<Option<mpsc::UnboundedSender<crate::e2ee_listen::Outgoing>>>,
+    /// Database 1 cursor of the HTTP (GraphQL) sync chain. Kept apart from the
+    /// DGW streams' cursor (`Store::cursors`): the server rejects one chain's
+    /// cursor on the other with `handleSyncFailure`.
+    http_cursor: Mutex<Option<String>>,
+    /// A mailbox poll is in flight.
+    polling: std::sync::atomic::AtomicBool,
 }
 
 pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (Arc<Shared>, mpsc::UnboundedSender<Command>) {
@@ -62,7 +84,10 @@ pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (A
         store: Mutex::new(Store::load_cache().unwrap_or_default()),
         status: Mutex::new(Status::Connecting),
         error: Mutex::new(None),
+        stickers: Mutex::new(StickerState::default()),
         e2ee_tx: Mutex::new(None),
+        polling: Default::default(),
+        http_cursor: Mutex::new(None),
     });
     let (tx, rx) = mpsc::unbounded_channel();
     let s = shared.clone();
@@ -111,6 +136,7 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
         let cursor = shared.store.lock().unwrap().cursors.get(&1).cloned();
         match session.ls_sync(1, cursor.as_deref()).await.and_then(|p| decode_payload(&p)) {
             Ok(calls) => {
+                shared.note_http_cursor(&calls);
                 shared.store.lock().unwrap().apply(&calls);
                 // Database 95 holds end-to-end encrypted chats: we can list them
                 // (participants, activity) even though we can't decrypt messages.
@@ -144,8 +170,14 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
         repaint();
 
         let mut conn = Conn::new(session.clone(), shared.clone(), repaint.clone());
-        match conn.run(&mut rx, &set_status).await {
-            Ok(()) => return, // UI closed
+        let mut result = conn.run(&mut rx, &set_status).await;
+        // After the snapshot connection, subscribe like the web client: a new
+        // socket whose streams are delta syncs from the DGW cursors.
+        while matches!(result, Ok(true)) {
+            result = conn.run(&mut rx, &set_status).await;
+        }
+        match result {
+            Ok(_) => return, // UI closed
             Err(e) => {
                 set_status(Status::Reconnecting(e.to_string()));
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -199,6 +231,10 @@ struct Conn {
     next_stream: u16,
     /// Open database sync streams: stream -> database.
     sync_streams: HashMap<u16, i64>,
+    /// Sync streams still waiting for their snapshot (type 1) answer.
+    snapshot_streams: std::collections::HashSet<u16>,
+    /// The snapshots are in: connections now open with delta syncs.
+    subscribed: bool,
     request_id: i64,
     epoch: i64,
     /// Lightspeed task ids must be unique: the server answers a reused id with
@@ -208,7 +244,7 @@ struct Conn {
 
 impl Conn {
     fn new(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) -> Self {
-        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
+        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
     }
 
     /// A Lightspeed request body (the JSON the web client sends on a DGW stream).
@@ -222,15 +258,6 @@ impl Conn {
         })
         .to_string()
         .into_bytes()
-    }
-
-    /// Open a fresh stream for one request, like the web client does.
-    fn request_frames(&mut self, body: &[u8]) -> Vec<u8> {
-        let stream = self.next_stream;
-        self.next_stream = if stream == u16::MAX { FIRST_REQUEST_STREAM } else { stream + 1 };
-        let mut out = dgw::establish(stream);
-        out.extend(dgw::data(stream, 0, body));
-        out
     }
 
     /// Wrap Lightspeed tasks (label + payload + queue) in a type-3 request.
@@ -275,14 +302,35 @@ impl Conn {
         self.ls_req(kind, payload.to_string())
     }
 
-    async fn run(&mut self, rx: &mut mpsc::UnboundedReceiver<Command>, set_status: &impl Fn(Status)) -> Result<()> {
-        let url = dgw::lightspeed_url(&self.session.boot.ls_app_id, self.session.boot.fbid, &self.session.device_id);
+    /// One DGW connection. The first one (`!self.subscribed`) starts every
+    /// database from a snapshot and returns `Ok(true)` once all are in; the
+    /// next one resumes them with delta syncs and gets the live pushes.
+    /// `Ok(false)` means the UI closed.
+    async fn run(&mut self, rx: &mut mpsc::UnboundedReceiver<Command>, set_status: &impl Fn(Status)) -> Result<bool> {
+        let url = dgw::lightspeed_url(&self.session.boot.ls_app_id, self.session.boot.fbid, &self.session.device_id, self.session.boot.region.as_deref());
         let mut ws = dgw::Socket::open(&url, &self.session.cookies.0, USER_AGENT).await?;
+        if std::env::var_os("MESSENGER_DEBUG").is_some() {
+            eprintln!("[dgw] region hint {:?}", self.session.boot.region);
+        }
 
         // One long-lived stream per synced database; pushes (new messages,
         // fetched history, receipts) arrive on these.
         let mut hello = Vec::new();
         self.sync_streams = SYNC_STREAMS.into_iter().collect();
+        // Live pushes only follow a stream that opened with a delta sync
+        // (type 2) from a cursor DGW itself issued. GraphQL cursors make it fail
+        // the sync, and a snapshot stream (type 1) answers once and stays silent
+        // (a delta sent after it on the same stream too). So the first
+        // connection takes snapshots, then we reconnect with their cursors.
+        if !self.subscribed {
+            let mut st = self.shared.store.lock().unwrap();
+            for (_, database) in SYNC_STREAMS {
+                st.cursors.remove(&database);
+            }
+            self.snapshot_streams = SYNC_STREAMS.into_iter().map(|(stream, _)| stream).collect();
+        } else {
+            self.snapshot_streams.clear();
+        }
         for (stream, database) in SYNC_STREAMS {
             let body = self.sync_request(database);
             hello.extend(dgw::establish(stream));
@@ -297,6 +345,12 @@ impl Conn {
         let mut last_frame = tokio::time::Instant::now();
         let mut ping = tokio::time::interval(Duration::from_secs(15));
         ping.tick().await;
+        // DGW doesn't push live changes to us yet (the web client gets them on
+        // its database 1 stream; something it does to subscribe is still
+        // missing), so poll a delta sync of the mailbox over HTTP meanwhile.
+        let mut poll = tokio::time::interval(Duration::from_secs(5));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        poll.tick().await;
 
         loop {
             tokio::select! {
@@ -329,7 +383,14 @@ impl Conn {
                                 }
                                 let sync_failed = self.handle_ls_resp(&body);
                                 if let Some(database) = self.sync_streams.get(&stream).copied() {
-                                    if sync_failed {
+                                    let has_cursor = self.shared.store.lock().unwrap().cursors.contains_key(&database);
+                                    if !sync_failed && has_cursor && self.snapshot_streams.remove(&stream) && self.snapshot_streams.is_empty() {
+                                        // Every snapshot is in: acknowledge, then subscribe on a
+                                        // new connection.
+                                        ws.send(reply).await?;
+                                        self.subscribed = true;
+                                        return Ok(true);
+                                    } else if sync_failed {
                                         // The server rejected our cursor (it happens with the
                                         // one from the GraphQL sync) and stops sending deltas
                                         // on this stream: start that database over from a
@@ -341,6 +402,7 @@ impl Conn {
                                         let fresh = self.next_stream;
                                         self.next_stream += 1;
                                         self.sync_streams.insert(fresh, database);
+                                        self.snapshot_streams.insert(fresh);
                                         reply.extend(dgw::establish(fresh));
                                         reply.extend(dgw::data(fresh, 0, &body));
                                     }
@@ -365,17 +427,19 @@ impl Conn {
                     }
                 }
                 cmd = rx.recv() => {
-                    let Some(cmd) = cmd else { return Ok(()) };
-                    // Encrypted chats go over the E2EE connection, so they don't
-                    // wait for this one (they used to be dropped while it reconnected).
-                    if !connected && !self.is_e2ee_send(&cmd) {
-                        continue;
-                    }
+                    let Some(cmd) = cmd else { return Ok(false) };
+                    // Commands go over HTTP or the E2EE connection, so they don't
+                    // wait for the DGW socket (they used to be dropped while it
+                    // reconnected).
                     match self.command(cmd).await {
-                        Ok(Some(body)) => {
-                            let frames = self.request_frames(&body);
-                            ws.send(frames).await?;
-                        }
+                        // Every request (tasks, typing) goes over HTTP: sent on the DGW
+                        // socket, the server answers and then drops the whole
+                        // connection, losing live updates until we reconnect. DGW
+                        // carries only the database sync streams.
+                        Ok(Some(body)) => match lightspeed_request(&body) {
+                            Some((kind, payload)) => self.send_request_http(kind, payload),
+                            None => eprintln!("[command] malformed request body"),
+                        },
                         Ok(None) => {}
                         Err(e) => {
                             eprintln!("[command] failed: {e:#}");
@@ -384,6 +448,7 @@ impl Conn {
                         }
                     }
                 }
+                _ = poll.tick(), if self.subscribed => self.poll_mailbox(),
                 _ = ping.tick() => {
                     if last_frame.elapsed() > Duration::from_secs(45) {
                         anyhow::bail!("no data from the server for 45s");
@@ -410,6 +475,15 @@ impl Conn {
                 names.sort();
                 names.dedup();
                 eprintln!("[ls_resp] request_id={} calls={} procs={names:?}", v.get("request_id").unwrap_or(&Value::Null), calls.len());
+                if calls.len() <= 2 && ls.len() > 500 && std::env::var_os("MESSENGER_SHAPE_ONCE").is_some() {
+                    // Structure only: every string literal that isn't a plain
+                    // identifier (procedure names) is masked.
+                    let masked = regex_lite_mask(ls);
+                    eprintln!("  payload shape: {masked}");
+                }
+                for c in calls.iter().filter(|c| c.name == "executeFirstBlockForSyncTransactionV4") {
+                    eprintln!("  sync transaction: database {:?} epoch {:?} prev cursor {} new cursor {}", c.arg(0), c.arg(1), c.arg(2).str().map_or(0, str::len), c.arg(3).str().map_or(0, str::len));
+                }
                 for c in calls.iter().filter(|c| c.name == "taskExists" || c.name == "removeTask" || c.name == "updateSyncGroupForThreadType") {
                     eprintln!("  {} {:?}", c.name, c.args);
                 }
@@ -418,11 +492,142 @@ impl Conn {
                 }
             }
             let failed = calls.iter().any(|c| c.name == "handleSyncFailure");
+            // A sync can bring a chat's newest messages while we hold older ones
+            // from the cache; whatever arrived in between is missing. Fill the
+            // gap by fetching the messages just before the new range.
+            let gaps: Vec<(i64, i64, String)> = {
+                let st = self.shared.store.lock().unwrap();
+                calls
+                    .iter()
+                    .filter(|c| c.name == "insertNewMessageRange")
+                    .filter_map(|c| {
+                        // (threadKey, minTimestampMs, maxTimestampMs, minMessageId, ...)
+                        let (thread, min_ts, min_id) = (c.arg(0).int(), c.arg(1).int(), c.arg(3).string());
+                        let newest_known = st.messages.get(&thread)?.iter().filter(|m| !m.pending).map(|m| m.timestamp_ms).max()?;
+                        (newest_known < min_ts && !min_id.is_empty()).then_some((thread, min_ts, min_id))
+                    })
+                    .take(10)
+                    .collect()
+            };
             self.shared.store.lock().unwrap().apply(&calls);
+            for (thread, ts, mid) in gaps {
+                if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                    eprintln!("[gap] {thread}: fetching messages before the new range");
+                }
+                self.load_before(thread, ts, mid);
+            }
             (self.repaint)();
             return failed;
         }
         false
+    }
+
+    /// Run a Lightspeed request over HTTP (GraphQL; type 3 = tasks, 4 =
+    /// typing) and apply its answer. The changes a task makes (the sent
+    /// message, its attachments) aren't in that answer and DGW doesn't always
+    /// push them, so tasks are followed by a delta sync of database 1 from our
+    /// cursor, as `load_older` does.
+    fn send_request_http(&self, kind: i64, payload: String) {
+        let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
+        tokio::spawn(async move {
+            // Typing (type 4) and some tasks answer with an empty payload.
+            let result = session.ls_request(kind, payload).await.and_then(|ls| if ls.trim().is_empty() { Ok(Vec::new()) } else { decode_payload(&ls) });
+            if std::env::var_os("MESSENGER_DEBUG").is_some() && kind == 3 {
+                match &result {
+                    Ok(calls) => {
+                        let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                        eprintln!("[task] answer {names:?}");
+                        // Shape of edit answers: strings as their length only.
+                        for c in calls.iter().filter(|c| c.name == "editMessage" || c.name == "taskExists" || c.name == "removeTask") {
+                            let shape: Vec<String> = c.args.iter().map(|a| match a {
+                                crate::lightspeed::Arg::Str(s) => format!("str({})", s.chars().count()),
+                                other => format!("{other:?}"),
+                            }).collect();
+                            eprintln!("  {} {shape:?}", c.name);
+                        }
+                    }
+                    Err(e) => eprintln!("[task] {e:#}"),
+                }
+            }
+            match result {
+                Ok(calls) => {
+                    shared.store.lock().unwrap().apply(&calls);
+                    repaint();
+                    if kind == 3 {
+                        match http_delta(&session, &shared).await {
+                            Ok(calls) => {
+                                shared.store.lock().unwrap().apply(&calls);
+                                repaint();
+                            }
+                            Err(e) => eprintln!("[command] sync after task failed: {e:#}"),
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[command] task failed: {e:#}");
+                    *shared.error.lock().unwrap() = Some(format!("Couldn't complete that: {e}"));
+                    repaint();
+                }
+            }
+        });
+    }
+
+    /// Delta sync of database 1 from our cursor over HTTP; one at a time.
+    fn poll_mailbox(&self) {
+        if self.shared.polling.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
+        tokio::spawn(async move {
+            match http_delta(&session, &shared).await {
+                Ok(calls) => {
+                    let changed = calls.iter().any(|c| !c.name.starts_with("execute") && c.name != "setRegionHint" && !c.name.starts_with("updateLastSync"));
+                    shared.store.lock().unwrap().apply(&calls);
+                    if changed {
+                        if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                            let mut names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                            names.dedup();
+                            eprintln!("[poll] {names:?}");
+                        }
+                        repaint();
+                    }
+                }
+                Err(e) => eprintln!("[poll] {e:#}"),
+            }
+            shared.polling.store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    /// Fetch the sticker tray (`None`) or one pack's stickers, once.
+    fn load_stickers(&self, pack: Option<String>) {
+        let key = pack.clone().unwrap_or_default();
+        if !self.shared.stickers.lock().unwrap().loading.insert(key.clone()) {
+            return;
+        }
+        let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
+        tokio::spawn(async move {
+            match &pack {
+                None => match session.sticker_packs().await {
+                    Ok(packs) => shared.stickers.lock().unwrap().packs = Some(packs),
+                    Err(e) => {
+                        // Empty rather than None, so the UI doesn't ask again every frame.
+                        eprintln!("[stickers] tray: {e:#}");
+                        shared.stickers.lock().unwrap().packs = Some(Vec::new());
+                    }
+                },
+                Some(id) => match session.sticker_pack(id).await {
+                    Ok(list) => {
+                        shared.stickers.lock().unwrap().pack_stickers.insert(id.clone(), list);
+                    }
+                    Err(e) => {
+                        eprintln!("[stickers] pack {id}: {e:#}");
+                        shared.stickers.lock().unwrap().pack_stickers.insert(id.clone(), Vec::new());
+                    }
+                },
+            }
+            shared.stickers.lock().unwrap().loading.remove(&key);
+            repaint();
+        });
     }
 
     /// Fetch the 20 messages before the oldest one we have. Runs over HTTP, as
@@ -430,12 +635,17 @@ impl Conn {
     /// our cursor: the delta carries the fetched range. (Over DGW the server
     /// drops the connection instead of pushing the result.)
     fn load_older(&self, thread: i64) {
-        let (oldest, cursor) = {
+        let oldest = {
             let st = self.shared.store.lock().unwrap();
-            let oldest = st.messages.get(&thread).and_then(|v| v.iter().find(|m| !m.pending)).map(|m| (m.timestamp_ms, m.id.clone()));
-            (oldest, st.cursors.get(&1).cloned())
+            st.messages.get(&thread).and_then(|v| v.iter().find(|m| !m.pending)).map(|m| (m.timestamp_ms, m.id.clone()))
         };
         let (ts, mid) = oldest.unwrap_or((now_ms(), String::new()));
+        self.load_before(thread, ts, mid);
+    }
+
+    /// Fetch the 20 messages before (`ts`, `mid`) in `thread` (see `load_older`).
+    fn load_before(&self, thread: i64, ts: i64, mid: String) {
+        let cursor = self.shared.http_cursor.lock().unwrap().clone();
         let task = json!({
             "thread_key": thread, "direction": 0, "reference_timestamp_ms": ts,
             "reference_message_id": mid, "sync_group": 1, "cursor": cursor,
@@ -444,8 +654,7 @@ impl Conn {
         tokio::spawn(async move {
             let result = async {
                 session.ls_tasks(&[("228", task, format!("mrq.{thread}"))]).await?;
-                let cursor = shared.store.lock().unwrap().cursors.get(&1).cloned();
-                decode_payload(&session.ls_sync(1, cursor.as_deref()).await?)
+                http_delta(&session, &shared).await
             }
             .await;
             match result {
@@ -464,14 +673,6 @@ impl Conn {
     }
 
     /// Encrypted 1:1 chats go through the E2EE connection, not Lightspeed.
-    fn is_e2ee_send(&self, cmd: &Command) -> bool {
-        let thread = match cmd {
-            Command::SendText { thread, .. } | Command::SendFiles { thread, .. } => thread,
-            _ => return false,
-        };
-        self.shared.store.lock().unwrap().threads.get(thread).is_some_and(|t| t.e2ee)
-    }
-
     /// `shown` is what the pending bubble says until the send completes.
     fn send_e2ee(&self, thread: i64, payload: crate::e2ee_listen::OutgoingPayload, shown: String) -> Result<()> {
         let peer = {
@@ -550,11 +751,21 @@ impl Conn {
                 self.tasks(vec![("46", p, thread.to_string()), ("21", read, thread.to_string())])
             }
             Command::SendFiles { thread, paths, reply_to } => {
+                let otid = new_otid();
+                let shown = if paths.len() == 1 { "Sending a file…".to_string() } else { format!("Sending {} files…", paths.len()) };
+                self.shared.store.lock().unwrap().add_pending(thread, otid, shown, None);
+                (self.repaint)();
                 let mut ids = Vec::new();
                 for path in &paths {
-                    ids.push(self.session.upload(path).await?);
+                    match self.session.upload(path).await {
+                        Ok(id) => ids.push(id),
+                        Err(e) => {
+                            self.shared.store.lock().unwrap().remove_pending(thread, otid);
+                            (self.repaint)();
+                            return Err(e);
+                        }
+                    }
                 }
-                let otid = new_otid();
                 let mut p = json!({
                     "thread_id": thread, "otid": otid.to_string(), "source": 65537, "send_type": 3,
                     "sync_group": 1, "text": null, "attachment_fbids": ids, "initiating_source": 1,
@@ -581,6 +792,12 @@ impl Conn {
                 self.tasks(vec![("33", p, "unsend_message".into())])
             }
             Command::Edit { message_id, text } => {
+                // Show it right away; the server's editMessage agrees.
+                if let Some(m) = self.shared.store.lock().unwrap().find_message_mut(None, &message_id) {
+                    m.text = text.clone();
+                    m.edited = true;
+                }
+                (self.repaint)();
                 let p = json!({"message_id": message_id, "text": text});
                 self.tasks(vec![("742", p, "edit_message".into())])
             }
@@ -601,6 +818,39 @@ impl Conn {
             }
             Command::LoadOlder { thread } => {
                 self.load_older(thread);
+                return Ok(None);
+            }
+            Command::LoadStickerPacks => {
+                self.load_stickers(None);
+                return Ok(None);
+            }
+            Command::LoadStickerPack { pack } => {
+                self.load_stickers(Some(pack));
+                return Ok(None);
+            }
+            Command::SendSticker { thread, sticker_id } => {
+                let otid = new_otid();
+                self.shared.store.lock().unwrap().add_pending(thread, otid, "Sticker".into(), None);
+                (self.repaint)();
+                // A sticker is a send with send_type 2 and the sticker's id.
+                let p = json!({
+                    "thread_id": thread, "otid": otid.to_string(), "source": 65537, "send_type": 2,
+                    "sync_group": 1, "sticker_id": sticker_id, "initiating_source": 1,
+                    "skip_url_preview_gen": 0, "text_has_links": 0, "multitab_env": 0,
+                });
+                let read = json!({"thread_id": thread, "last_read_watermark_ts": now_ms(), "sync_group": 1});
+                self.tasks(vec![("46", p, thread.to_string()), ("21", read, thread.to_string())])
+            }
+            Command::RefreshRecent { thread } => {
+                // The 20 messages before our newest one (the server needs a real
+                // message as the reference).
+                let newest = {
+                    let st = self.shared.store.lock().unwrap();
+                    st.messages.get(&thread).and_then(|v| v.iter().rev().find(|m| !m.pending && m.id.starts_with("mid."))).map(|m| (m.timestamp_ms, m.id.clone()))
+                };
+                if let Some((ts, mid)) = newest {
+                    self.load_before(thread, ts, mid);
+                }
                 return Ok(None);
             }
             Command::LoadMoreThreads => {
@@ -627,4 +877,70 @@ impl Conn {
             }
         }))
     }
+}
+
+impl Shared {
+    /// Remember the database 1 cursor an HTTP sync answered with.
+    fn note_http_cursor(&self, calls: &[crate::lightspeed::Call]) {
+        let cursor = calls
+            .iter()
+            .find(|c| c.name == "executeFirstBlockForSyncTransactionV4" && c.arg(0).int() == 1)
+            .and_then(|c| c.arg(3).str().map(str::to_string));
+        if let Some(cursor) = cursor {
+            *self.http_cursor.lock().unwrap() = Some(cursor);
+        }
+    }
+}
+
+/// Delta sync of database 1 over HTTP from the HTTP cursor. If the server
+/// rejects the cursor, start over from a snapshot (which carries a new one).
+async fn http_delta(session: &Session, shared: &Shared) -> Result<Vec<crate::lightspeed::Call>> {
+    let cursor = shared.http_cursor.lock().unwrap().clone();
+    let mut calls = decode_payload(&session.ls_sync(1, cursor.as_deref()).await?)?;
+    if cursor.is_some() && calls.iter().any(|c| c.name == "handleSyncFailure") {
+        eprintln!("[sync] HTTP cursor rejected; taking a snapshot");
+        calls = decode_payload(&session.ls_sync(1, None).await?)?;
+    }
+    shared.note_http_cursor(&calls);
+    Ok(calls)
+}
+
+/// Request type and payload of a Lightspeed request body (`{"payload", "type"}`).
+fn lightspeed_request(body: &[u8]) -> Option<(i64, String)> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    Some((v["type"].as_i64()?, v["payload"].as_str()?.to_string()))
+}
+
+/// `ls` with each string literal that isn't an identifier replaced by "…".
+fn regex_lite_mask(ls: &str) -> String {
+    let mut out = String::new();
+    let mut chars = ls.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            out.push(c);
+            continue;
+        }
+        let mut lit = String::new();
+        let mut escaped = false;
+        for d in chars.by_ref() {
+            if escaped {
+                lit.push(d);
+                escaped = false;
+            } else if d == '\\' {
+                escaped = true;
+            } else if d == '"' {
+                break;
+            } else {
+                lit.push(d);
+            }
+        }
+        if !lit.is_empty() && lit.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') && lit.chars().next().is_some_and(|ch| ch.is_ascii_alphabetic()) {
+            out.push('"');
+            out.push_str(&lit);
+            out.push('"');
+        } else {
+            out.push_str("\"…\"");
+        }
+    }
+    out
 }

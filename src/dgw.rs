@@ -20,7 +20,12 @@
 //!
 //! Right after a FetchMessages task (228) sent here, the server drops the
 //! connection instead of pushing the history, so `client.rs` fetches history
-//! over HTTP (task, then a type-2 delta sync). Live pushes work.
+//! over HTTP (task, then a type-2 delta sync).
+//!
+//! The web client gets live changes pushed on its database 1 stream (opened
+//! with a type-2 delta sync from its cursor, socket URL with
+//! `x-dgw-regionhint`). We do the same but get no pushes yet, so `client.rs`
+//! also polls a delta sync over HTTP every few seconds.
 
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -109,11 +114,14 @@ pub fn parse(buf: &mut Vec<u8>) -> Vec<Frame> {
 /// The Lightspeed endpoint URL, with the query parameters the web client sends.
 /// Auth is the session cookie (auth type "1:0" = FACEBOOK) plus `x-dgw-uuid`,
 /// which must be the logged-in user's fbid: any other value gets 4003.
-pub fn lightspeed_url(app_id: &str, fbid: i64, device_id: &str) -> String {
+/// The socket URL, with the same parameters (and order) as the web client.
+/// `region` is the mailbox region hint from the page.
+pub fn lightspeed_url(app_id: &str, fbid: i64, device_id: &str, region: Option<&str>) -> String {
     let logging_id = uuid::Uuid::new_v4();
+    let region = region.map(|r| format!("&x-dgw-regionhint={r}")).unwrap_or_default();
     format!(
         "wss://gateway.facebook.com/ws/lightspeed?x-dgw-appid={app_id}&x-dgw-appversion=0&x-dgw-authtype=1:0\
-         &x-dgw-version=5&x-dgw-uuid={fbid}&x-dgw-tier=prod&x-dgw-loggingid={logging_id}\
+         &x-dgw-version=5&x-dgw-uuid={fbid}&x-dgw-tier=prod&x-dgw-loggingid={logging_id}{region}\
          &x-dgw-deviceid={device_id}&x-dgw-ws-compression=true"
     )
 }

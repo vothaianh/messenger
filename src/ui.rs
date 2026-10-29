@@ -16,28 +16,73 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::client::{Command, Shared, Status};
 use crate::store::{now_ms, Attachment, AttachmentKind, Message, Store, Thread};
 
-const BLUE: Color32 = Color32::from_rgb(0, 132, 255);
-// Liquid Glass palette (see AGENTS.md, "Visual style"). Translucent colors are
-// premultiplied: white at alpha a is (a, a, a, a).
-/// Conversation area: a dark tint over the window's background blur.
-const BG: Color32 = Color32::from_rgba_premultiplied(18, 18, 19, 205);
-/// Controls on glass (buttons, search, menu pills).
-const INPUT: Color32 = Color32::from_rgba_premultiplied(28, 28, 28, 28);
-const BUBBLE_OTHER: Color32 = Color32::from_rgba_premultiplied(36, 36, 36, 36);
-/// Quotes, cards and hover fills.
-const QUOTE: Color32 = Color32::from_rgba_premultiplied(18, 18, 18, 18);
-/// Popups and menus stay opaque so they read over anything.
-const POPUP: Color32 = Color32::from_rgb(38, 39, 41);
-const TEXT: Color32 = Color32::from_rgb(228, 230, 235);
-const MUTED: Color32 = Color32::from_rgb(176, 179, 184);
-/// Hairline highlight on glass edges and separators.
-const BORDER: Color32 = Color32::from_rgba_premultiplied(26, 26, 26, 26);
-const SELECTED: Color32 = Color32::from_rgba_premultiplied(31, 31, 31, 31);
-const CHIP_ON_BG: Color32 = Color32::from_rgba_premultiplied(14, 47, 92, 92);
+// Liquid Glass palettes (see AGENTS.md, "Visual style"), one per appearance.
+// Translucent colors are premultiplied: white at alpha a is (a, a, a, a),
+// black at alpha a is (0, 0, 0, a).
+struct Palette {
+    blue: Color32,
+    /// Conversation area: a tint over the window's background blur.
+    bg: Color32,
+    /// Controls on glass (buttons, search, menu pills).
+    input: Color32,
+    bubble_other: Color32,
+    /// Quotes, cards and hover fills.
+    quote: Color32,
+    /// Popups and menus stay opaque so they read over anything.
+    popup: Color32,
+    text: Color32,
+    muted: Color32,
+    /// Hairline on glass edges and separators.
+    border: Color32,
+    selected: Color32,
+    chip_on_bg: Color32,
+    chip_on_text: Color32,
+}
+
+/// Dark blue: a deep navy tint over the blur; fills are translucent
+/// periwinkle (180, 200, 255) instead of white, so they read as blue glass.
+const DARK: Palette = Palette {
+    blue: Color32::from_rgb(59, 139, 255),
+    bg: Color32::from_rgba_premultiplied(4, 8, 14, 97),
+    input: Color32::from_rgba_premultiplied(18, 20, 26, 26),
+    bubble_other: Color32::from_rgba_premultiplied(32, 36, 46, 46),
+    quote: Color32::from_rgba_premultiplied(16, 18, 22, 22),
+    popup: Color32::from_rgb(22, 34, 58),
+    text: Color32::from_rgb(230, 237, 247),
+    muted: Color32::from_rgb(147, 164, 191),
+    border: Color32::from_rgba_premultiplied(23, 26, 33, 33),
+    selected: Color32::from_rgba_premultiplied(20, 38, 72, 77),
+    chip_on_bg: Color32::from_rgba_premultiplied(15, 35, 64, 64),
+    chip_on_text: Color32::from_rgb(110, 170, 255),
+};
+
+/// Light: a near-white tint over the blur, ink-dark text, and fills made of
+/// translucent black so the glass still shows through.
+const LIGHT: Palette = Palette {
+    blue: Color32::from_rgb(0, 122, 255),
+    bg: Color32::from_rgba_premultiplied(105, 105, 106, 107),
+    input: Color32::from_rgba_premultiplied(0, 0, 0, 14),
+    bubble_other: Color32::from_rgba_premultiplied(0, 0, 0, 20),
+    quote: Color32::from_rgba_premultiplied(0, 0, 0, 10),
+    popup: Color32::from_rgb(255, 255, 255),
+    text: Color32::from_rgb(29, 29, 31),
+    muted: Color32::from_rgb(108, 108, 114),
+    border: Color32::from_rgba_premultiplied(0, 0, 0, 24),
+    selected: Color32::from_rgba_premultiplied(0, 0, 0, 20),
+    chip_on_bg: Color32::from_rgba_premultiplied(0, 15, 31, 31),
+    chip_on_text: Color32::from_rgb(0, 102, 214),
+};
+
+static LIGHT_THEME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The palette of the current appearance.
+fn pal() -> &'static Palette {
+    if LIGHT_THEME.load(Ordering::Relaxed) { &LIGHT } else { &DARK }
+}
+
 /// Floating glass surfaces: inset from the window edge, large continuous corners.
 const GLASS_INSET: f32 = 8.0;
 const GLASS_RADIUS: f32 = 22.0;
-const CHIP_ON_TEXT: Color32 = Color32::from_rgb(69, 153, 255);
 /// Height of the transparent macOS titlebar the content extends under.
 const TITLEBAR: f32 = 30.0;
 const AVATAR_SMALL: f32 = 28.0;
@@ -110,6 +155,16 @@ pub struct MessengerApp {
     reaction_picker: Option<ReactionPicker>,
     /// Focus the composer on the next frame (after Reply/Edit).
     focus_composer: bool,
+    /// Chats whose newest messages were re-fetched this session.
+    refreshed: HashSet<i64>,
+    show_stickers: bool,
+    /// Appearance chosen in the ⋯ menu, and the one last applied (light?).
+    theme: ThemePref,
+    applied_theme: Option<(ThemePref, bool)>,
+    /// Pasted files waiting in the composer.
+    pending_files: Vec<std::path::PathBuf>,
+    /// Selected pack in the sticker picker.
+    sticker_pack: Option<String>,
     last_layout_log: String,
     /// Message list as of the previous frame, to keep the view in place when
     /// older messages are inserted above it.
@@ -135,21 +190,15 @@ impl MessengerApp {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         crate::macos::init_notifications();
         install_fonts(&cc.egui_ctx);
-        let mut style = (*cc.egui_ctx.global_style()).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.panel_fill = BG;
-        style.visuals.window_fill = POPUP;
-        style.visuals.panel_fill = Color32::TRANSPARENT;
-        style.visuals.extreme_bg_color = INPUT;
-        style.visuals.selection.bg_fill = BLUE;
-        style.visuals.override_text_color = Some(TEXT);
-        style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-        style.spacing.item_spacing = Vec2::new(8.0, 5.0);
-        style.spacing.button_padding = Vec2::new(10.0, 5.0);
-        cc.egui_ctx.set_global_style(style);
+        apply_style(&cc.egui_ctx, false);
         // We handle Cmd +/-/0 ourselves to scale text only, not the whole UI.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         let stored = |key: &str| cc.storage.and_then(|s| s.get_string(key));
+        let theme = match stored("theme").as_deref() {
+            Some("light") => ThemePref::Light,
+            Some("dark") => ThemePref::Dark,
+            _ => ThemePref::System,
+        };
         let scale = stored("text_scale").and_then(|v| v.parse::<f32>().ok()).filter(|s| (0.5..=2.0).contains(s)).unwrap_or(1.0);
         set_text_scale(&cc.egui_ctx, scale);
         MessengerApp {
@@ -172,11 +221,40 @@ impl MessengerApp {
             mention_sel: 0,
             reaction_picker: None,
             focus_composer: false,
+            refreshed: HashSet::new(),
+            show_stickers: false,
+            pending_files: Vec::new(),
+            theme,
+            applied_theme: None,
+            sticker_pack: None,
             last_layout_log: String::new(),
             prev_view: None,
             scroll_fix: None,
             focused: true,
         }
+    }
+
+    /// Follow the chosen appearance (or the system's): palette, egui style,
+    /// and the native window appearance the glass is drawn with.
+    fn apply_theme(&mut self, ctx: &egui::Context) {
+        let light = match self.theme {
+            ThemePref::Light => true,
+            ThemePref::Dark => false,
+            ThemePref::System => ctx.input(|i| i.raw.system_theme) == Some(egui::Theme::Light),
+        };
+        if self.applied_theme == Some((self.theme, light)) {
+            return;
+        }
+        self.applied_theme = Some((self.theme, light));
+        LIGHT_THEME.store(light, Ordering::Relaxed);
+        apply_style(ctx, light);
+        let forced = match self.theme {
+            ThemePref::System => None,
+            _ => Some(light),
+        };
+        let [r, g, b, a] = pal().bg.to_srgba_unmultiplied();
+        crate::macos::set_appearance(forced, light, [r, g, b, a].map(|c| c as f64 / 255.0));
+        ctx.request_repaint();
     }
 
     fn send(&self, cmd: Command) {
@@ -196,6 +274,7 @@ impl eframe::App for MessengerApp {
         }
         storage.set_string("show_info", self.show_info.to_string());
         storage.set_string("text_scale", text_scale().to_string());
+        storage.set_string("theme", self.theme.key().into());
         // Also keep the inbox for the next launch (eframe calls this every
         // ~30 s and on exit); the file is written off the UI thread.
         if let Some(bytes) = self.shared.store.lock().unwrap().cache_bytes() {
@@ -208,6 +287,9 @@ impl eframe::App for MessengerApp {
         self.glass.clear();
         self.focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         handle_text_size_keys(&ctx);
+        self.apply_theme(&ctx);
+        crate::macos::reap_video();
+        image_viewer(&ctx);
         let status = self.shared.status.lock().unwrap().clone();
         let shared = self.shared.clone();
         let mut store = shared.store.lock().unwrap();
@@ -250,7 +332,9 @@ impl eframe::App for MessengerApp {
         let mut center = ui.new_child(egui::UiBuilder::new().max_rect(center_rect));
         center.set_clip_rect(center_rect);
         egui::CentralPanel::default()
-            .frame(Frame::default().fill(BG))
+            // The content tint is native (`macos::set_appearance`), under the
+            // glass panes too, so no lighter blur shows around them.
+            .frame(Frame::NONE)
             .show(&mut center, |ui| match self.selected.and_then(|k| store.threads.get(&k).cloned()) {
                 Some(thread) => self.conversation(ui, &store, &thread, &mut cmds),
                 None => {
@@ -265,7 +349,7 @@ impl eframe::App for MessengerApp {
                             18.0,
                             500,
                         )
-                        .color(MUTED));
+                        .color(pal().muted));
                     });
                 }
             });
@@ -288,8 +372,9 @@ impl eframe::App for MessengerApp {
     }
 }
 
-/// "You: …" / "Name: …" (groups) / "…" for the newest decrypted message of an
-/// encrypted chat; empty when none was received on this Mac yet.
+/// "You: …" / "Name: …" (groups) / "…" for the newest message we have: used
+/// for encrypted chats (decrypted on this Mac), and for any chat whose server
+/// snippet is empty (a live photo, video or sticker carries no text).
 fn e2ee_snippet(store: &Store, t: &Thread) -> String {
     let Some(m) = store.messages.get(&t.key).and_then(|v| v.iter().rev().find(|m| !m.unsent)) else {
         return t.snippet.replace('\n', " ");
@@ -298,6 +383,10 @@ fn e2ee_snippet(store: &Store, t: &Thread) -> String {
         _ if !m.text.is_empty() => m.text.replace('\n', " "),
         Some(a) if a.kind == AttachmentKind::Image => "📷 Photo".to_string(),
         Some(a) if a.kind == AttachmentKind::Video => "🎬 Video".to_string(),
+        Some(a) if a.kind == AttachmentKind::Audio => "🎤 Voice message".to_string(),
+        Some(a) if a.kind == AttachmentKind::Sticker => "Sticker".to_string(),
+        Some(a) if a.kind == AttachmentKind::Link => if a.title.is_empty() { "🔗 Link".to_string() } else { format!("🔗 {}", a.title.replace('\n', " ")) },
+        Some(a) if a.kind == AttachmentKind::File => format!("📎 {}", if a.title.is_empty() { "File" } else { &a.title }),
         _ => "Sent an attachment".to_string(),
     };
     if m.sender_id == store.me {
@@ -359,6 +448,134 @@ struct ReactionPicker {
     opened: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ThemePref {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePref {
+    fn key(self) -> &'static str {
+        match self {
+            ThemePref::System => "system",
+            ThemePref::Light => "light",
+            ThemePref::Dark => "dark",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ThemePref::System => "Match System",
+            ThemePref::Light => "Light",
+            ThemePref::Dark => "Dark",
+        }
+    }
+}
+
+/// egui's style for the current palette.
+fn apply_style(ctx: &egui::Context, light: bool) {
+    let mut style = (*ctx.global_style()).clone();
+    style.visuals = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
+    style.visuals.window_fill = pal().popup;
+    style.visuals.panel_fill = Color32::TRANSPARENT;
+    style.visuals.extreme_bg_color = pal().input;
+    style.visuals.selection.bg_fill = pal().blue;
+    style.visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
+    style.visuals.override_text_color = Some(pal().text);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal().border);
+    style.visuals.hyperlink_color = pal().blue;
+    style.spacing.item_spacing = Vec2::new(8.0, 5.0);
+    style.spacing.button_padding = Vec2::new(10.0, 5.0);
+    ctx.set_global_style(style);
+}
+
+/// An image from a link that plays if it's animated (stickers are animated
+/// WebP). egui only animates URIs ending in .webp/.gif, and Facebook's signed
+/// links end in a query string, so animated files are handed over as bytes
+/// (egui detects those by their header) once the HTTP loader has them.
+fn media_image<'a>(ctx: &egui::Context, url: &str) -> egui::Image<'a> {
+    let path = url.split('?').next().unwrap_or(url);
+    let animated = path.ends_with(".webp") || path.ends_with(".gif");
+    if animated && url.contains('?') {
+        if let Ok(egui::load::BytesPoll::Ready { bytes, .. }) = ctx.try_load_bytes(url) {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut h);
+            let ext = if path.ends_with(".gif") { "gif" } else { "webp" };
+            return egui::Image::from_bytes(format!("bytes://anim/{:016x}.{ext}", h.finish()), bytes);
+        }
+    }
+    egui::Image::new(url.to_string())
+}
+
+/// Memory key of the image open in the in-app viewer.
+const IMAGE_VIEWER: &str = "image_viewer";
+
+/// The in-app image viewer: the picture fitted over a dark scrim, above
+/// everything. Esc, the close button or a click outside the picture close it;
+/// the arrow button opens the original in the browser.
+fn image_viewer(ctx: &egui::Context) {
+    let id = egui::Id::new(IMAGE_VIEWER);
+    let Some(Some(url)) = ctx.data(|d| d.get_temp::<Option<String>>(id)) else { return };
+    let mut close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::new("image_viewer_area"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let scrim = ui.allocate_rect(screen, Sense::click());
+            ui.painter().rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(225));
+            let area = screen.shrink2(Vec2::new(48.0, 56.0));
+            let image = egui::Image::new(url.as_str()).max_size(area.size()).corner_radius(CornerRadius::same(12));
+            let size = image.load_and_calc_size(ui, area.size()).unwrap_or(Vec2::splat(64.0));
+            let rect = Rect::from_center_size(area.center(), size);
+            image.paint_at(ui, rect);
+            if scrim.clicked() && !ui.rect_contains_pointer(rect) {
+                close = true;
+            }
+            // Close (✕) and open-in-browser buttons, top right.
+            let button = |ui: &mut egui::Ui, center: Pos2, salt: &str| {
+                let r = Rect::from_center_size(center, Vec2::splat(32.0));
+                let resp = ui.interact(r, egui::Id::new(("viewer_btn", salt)), Sense::click());
+                let fill = if resp.hovered() { Color32::from_white_alpha(60) } else { Color32::from_white_alpha(30) };
+                ui.painter().circle_filled(center, 16.0, fill);
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            };
+            let c = Pos2::new(screen.right() - 32.0, screen.top() + 40.0);
+            let x = button(ui, c, "close");
+            let st = Stroke::new(1.8, Color32::WHITE);
+            ui.painter().line_segment([c + Vec2::splat(-5.5), c + Vec2::splat(5.5)], st);
+            ui.painter().line_segment([c + Vec2::new(-5.5, 5.5), c + Vec2::new(5.5, -5.5)], st);
+            if x.on_hover_text("Close").clicked() {
+                close = true;
+            }
+            let c2 = c - Vec2::new(44.0, 0.0);
+            let open = button(ui, c2, "open");
+            ui.painter().line_segment([c2 + Vec2::new(-4.5, 4.5), c2 + Vec2::new(4.5, -4.5)], st);
+            ui.painter().line_segment([c2 + Vec2::new(-0.5, -4.5), c2 + Vec2::new(4.5, -4.5)], st);
+            ui.painter().line_segment([c2 + Vec2::new(4.5, -4.5), c2 + Vec2::new(4.5, 0.5)], st);
+            if open.on_hover_text("Open in browser").clicked() && url.starts_with("http") {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&url));
+            }
+        });
+    if close {
+        ctx.data_mut(|d| d.remove::<Option<String>>(id));
+    }
+}
+
+/// Write a pasted clipboard image to a PNG in the cache, for sending.
+fn save_pasted_image(img: &egui::ColorImage) -> anyhow::Result<std::path::PathBuf> {
+    let [w, h] = img.size;
+    let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+    let buffer = image::RgbaImage::from_raw(w as u32, h as u32, rgba).ok_or_else(|| anyhow::anyhow!("bad image size"))?;
+    let dir = crate::e2ee_media::cache_dir()?.join("pasted");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("Pasted image {}.png", chrono::Local::now().format("%Y-%m-%d at %H.%M.%S")));
+    buffer.save_with_format(&path, image::ImageFormat::Png)?;
+    Ok(path)
+}
+
 /// Category title and SF Symbol for the "+" reaction picker.
 fn emoji_group_label(group: emojis::Group) -> (&'static str, &'static str) {
     use emojis::Group::*;
@@ -382,9 +599,9 @@ fn glass_rect(r: Rect, radius: f32) -> crate::macos::GlassRect {
 impl MessengerApp {
     fn status_line(&mut self, ui: &mut egui::Ui, status: &Status) {
         let (text, color) = match status {
-            Status::Online => (String::new(), MUTED),
+            Status::Online => (String::new(), pal().muted),
             // Cached chats show while connecting, so no "loading" notice.
-            Status::Connecting | Status::Syncing => (String::new(), MUTED),
+            Status::Connecting | Status::Syncing => (String::new(), pal().muted),
             Status::Reconnecting(e) => (format!("Reconnecting — {e}"), Color32::from_rgb(240, 180, 60)),
             Status::LoggedOut(e) => (e.clone(), Color32::from_rgb(240, 90, 90)),
         };
@@ -392,7 +609,7 @@ impl MessengerApp {
         if text.is_empty() && err.is_none() {
             return;
         }
-        Frame::default().fill(QUOTE).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
+        Frame::default().fill(pal().quote).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             if !text.is_empty() {
                 ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
@@ -411,7 +628,7 @@ impl MessengerApp {
                         ui.add(egui::Label::new(RichText::new(truncate(&e, 240)).size(13.0).color(Color32::from_rgb(240, 90, 90))).wrap());
                     });
                     let (rect, close) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                    let color = if close.hovered() { TEXT } else { MUTED };
+                    let color = if close.hovered() { pal().text } else { pal().muted };
                     let c = rect.center();
                     ui.painter().line_segment([c + Vec2::splat(-4.0), c + Vec2::splat(4.0)], Stroke::new(1.5, color));
                     ui.painter().line_segment([c + Vec2::new(-4.0, 4.0), c + Vec2::new(4.0, -4.0)], Stroke::new(1.5, color));
@@ -433,8 +650,16 @@ impl MessengerApp {
             ui.add_space(2.0);
             ui.label(sf("Chats", 24.0, 700));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let menu = egui::Button::new(sf("⋯", 18.0, 700)).fill(INPUT).corner_radius(CornerRadius::same(18)).min_size(Vec2::splat(36.0));
+                let menu = egui::Button::new(sf("⋯", 18.0, 700)).fill(pal().input).corner_radius(CornerRadius::same(18)).min_size(Vec2::splat(36.0));
                 egui::containers::menu::MenuButton::from_button(menu).ui(ui, |ui| {
+                    ui.label(sf("Appearance", 12.0, 600).color(pal().muted));
+                    for pref in [ThemePref::System, ThemePref::Light, ThemePref::Dark] {
+                        if ui.radio(self.theme == pref, pref.label()).clicked() {
+                            self.theme = pref;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
                     if ui.button("Log out").clicked() {
                         crate::session::Cookies::clear();
                         crate::store::clear_cache();
@@ -449,8 +674,8 @@ impl MessengerApp {
         ui.horizontal(|ui| {
             for (f, label) in [(Filter::All, "All"), (Filter::Unread, "Unread"), (Filter::Groups, "Groups")] {
                 let on = self.filter == f;
-                let b = egui::Button::new(sf(label, 15.0, if on { 600 } else { 500 }).color(if on { CHIP_ON_TEXT } else { TEXT }))
-                    .fill(if on { CHIP_ON_BG } else { Color32::TRANSPARENT })
+                let b = egui::Button::new(sf(label, 15.0, if on { 600 } else { 500 }).color(if on { pal().chip_on_text } else { pal().text }))
+                    .fill(if on { pal().chip_on_bg } else { Color32::TRANSPARENT })
                     .corner_radius(CornerRadius::same(18))
                     .min_size(Vec2::new(0.0, 36.0));
                 if ui.add(b).clicked() {
@@ -484,7 +709,7 @@ impl MessengerApp {
             }
             ui.add_space(10.0);
             ui.vertical_centered(|ui| {
-                if ui.add(egui::Button::new(sf("Load more chats", 14.0, 500).color(MUTED)).frame(false)).clicked() {
+                if ui.add(egui::Button::new(sf("Load more chats", 14.0, 500).color(pal().muted)).frame(false)).clicked() {
                     cmds.push(Command::LoadMoreThreads);
                 }
             });
@@ -499,9 +724,9 @@ impl MessengerApp {
         let row_id = ui.scope_id().with(("thread", t.key));
         let hovered = ui.ctx().read_response(row_id).is_some_and(|r| r.hovered());
         let fill = if selected {
-            SELECTED
+            pal().selected
         } else if hovered {
-            QUOTE
+            pal().quote
         } else {
             Color32::TRANSPARENT
         };
@@ -516,28 +741,29 @@ impl MessengerApp {
                     Layout::top_down(Align::Min).with_main_align(Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        let name = sf(&title, 15.0, if unread { 600 } else { 500 }).color(TEXT);
+                        let name = sf(&title, 15.0, if unread { 600 } else { 500 }).color(pal().text);
                         ui.add(egui::Label::new(name).truncate());
                         let snippet = if typing {
                             "typing…".to_string()
-                        } else if t.e2ee {
-                            // The server can't know encrypted content: show the last
-                            // message decrypted on this Mac, like other chats' snippets.
+                        } else if t.e2ee || t.snippet.trim().is_empty() {
+                            // The server can't know encrypted content, and a live
+                            // photo or video arrives without a snippet: describe the
+                            // newest message we have.
                             e2ee_snippet(store, t)
                         } else {
                             t.snippet.replace('\n', " ")
                         };
-                        let s = if unread { sf(&snippet, 13.0, 600).color(TEXT) } else { sf(&snippet, 13.0, 400).color(MUTED) };
+                        let s = if unread { sf(&snippet, 13.0, 600).color(pal().text) } else { sf(&snippet, 13.0, 400).color(pal().muted) };
                         ui.add(egui::Label::new(s).truncate());
                     },
                 );
                 ui.with_layout(Layout::top_down(Align::Max).with_main_align(Align::Center), |ui| {
-                    ui.label(sf(&short_time(t.last_activity_ms), 12.0, if unread { 600 } else { 400 }).color(if unread { CHIP_ON_TEXT } else { MUTED }));
+                    ui.label(sf(&short_time(t.last_activity_ms), 12.0, if unread { 600 } else { 400 }).color(if unread { pal().chip_on_text } else { pal().muted }));
                     if unread {
                         let (r, p) = ui.allocate_painter(Vec2::splat(12.0), Sense::hover());
-                        p.circle_filled(r.rect.center(), 6.0, BLUE);
+                        p.circle_filled(r.rect.center(), 6.0, pal().blue);
                     } else if t.muted {
-                        ui.label(RichText::new("🔕").size(12.0).color(MUTED));
+                        ui.label(RichText::new("🔕").size(12.0).color(pal().muted));
                     }
                 });
             });
@@ -570,6 +796,12 @@ impl MessengerApp {
     }
 
     fn conversation(&mut self, ui: &mut egui::Ui, store: &Store, thread: &Thread, cmds: &mut Vec<Command>) {
+        // First time a chat is shown this session: re-fetch its newest messages,
+        // so anything missed while offline (a gap between the cache and the
+        // last sync) fills in.
+        if !thread.e2ee && self.refreshed.insert(thread.key) {
+            cmds.push(Command::RefreshRecent { thread: thread.key });
+        }
         let key = thread.key;
         let title = store.thread_title(thread);
         let messages: Vec<Message> = store.messages.get(&key).cloned().unwrap_or_default();
@@ -582,7 +814,7 @@ impl MessengerApp {
         // Header (extends under the transparent titlebar and drags the window)
         egui::Panel::top(("conv_header", key))
             .exact_size(64.0)
-            .frame(Frame::default().fill(BG).inner_margin(Margin::symmetric(16, 0)))
+            .frame(Frame::default().inner_margin(Margin::symmetric(16, 0)))
             .show(ui, |ui| {
                 titlebar_drag(ui, ui.max_rect());
                 ui.horizontal_centered(|ui| {
@@ -591,7 +823,7 @@ impl MessengerApp {
                     // Measure the text block so the row can center it next to the
                     // avatar (a plain `vertical` would hug the top of the header).
                     let font = |size: f32, weight: u16| egui::FontId::new(size * text_scale(), egui::FontFamily::Name(format!("sf-{weight}").into()));
-                    let line = |size: f32, weight: u16| ui.painter().layout_no_wrap("Ag".into(), font(size, weight), TEXT).size().y;
+                    let line = |size: f32, weight: u16| ui.painter().layout_no_wrap("Ag".into(), font(size, weight), pal().text).size().y;
                     let subtitle = thread.is_group().then(|| format!("{} members", thread.participants.len()));
                     let height = line(17.0, 600) + if subtitle.is_some() { line(13.0, 400) } else { 0.0 };
                     let width = (ui.available_width() - 140.0).max(80.0);
@@ -599,19 +831,19 @@ impl MessengerApp {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         ui.add(egui::Label::new(sf(&title, 17.0, 600)).truncate());
                         if let Some(subtitle) = subtitle {
-                            ui.label(sf(&subtitle, 13.0, 400).color(MUTED));
+                            ui.label(sf(&subtitle, 13.0, 400).color(pal().muted));
                         }
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         let info = if self.show_info { "info.circle.fill" } else { "info.circle" };
-                        if symbol_button(ui, info, BLUE).on_hover_text("Conversation information").clicked() {
+                        if symbol_button(ui, info, pal().blue).on_hover_text("Conversation information").clicked() {
                             self.show_info = !self.show_info;
                         }
-                        if symbol_button(ui, "video.fill", BLUE).on_hover_text("Video call (opens browser)").clicked() {
+                        if symbol_button(ui, "video.fill", pal().blue).on_hover_text("Video call (opens browser)").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.facebook.com/groupcall/ROOM:{key}/?call_type=video")));
                         }
-                        if symbol_button(ui, "phone.fill", BLUE).on_hover_text("Audio call (opens browser)").clicked() {
+                        if symbol_button(ui, "phone.fill", pal().blue).on_hover_text("Audio call (opens browser)").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.facebook.com/groupcall/ROOM:{key}/?call_type=audio")));
                         }
                     });
@@ -619,7 +851,7 @@ impl MessengerApp {
             });
 
         egui::Panel::bottom(("composer", key))
-            .frame(Frame::default().fill(BG).inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 12 }))
+            .frame(Frame::default().inner_margin(Margin { left: 12, right: 12, top: 6, bottom: 12 }))
             .show_separator_line(false)
             .show(ui, |ui| {
                 self.composer(ui, store, thread, cmds);
@@ -642,8 +874,8 @@ impl MessengerApp {
                 ui.add_space(12.0);
                 if thread.e2ee {
                     ui.vertical_centered(|ui| {
-                        ui.label(sf("🔒 End-to-end encrypted. Showing messages received on this Mac.", 12.0, 500).color(MUTED));
-                        ui.label(sf("Older history needs your Messenger PIN (coming soon).", 12.0, 400).color(MUTED));
+                        ui.label(sf("🔒 End-to-end encrypted. Showing messages received on this Mac.", 12.0, 500).color(pal().muted));
+                        ui.label(sf("Older history needs your Messenger PIN (coming soon).", 12.0, 400).color(pal().muted));
                     });
                     ui.add_space(8.0);
                 }
@@ -658,7 +890,7 @@ impl MessengerApp {
                     if new_block {
                         ui.add_space(14.0);
                         ui.vertical_centered(|ui| {
-                            ui.label(sf(&long_time(m.timestamp_ms), 12.0, 500).color(MUTED));
+                            ui.label(sf(&long_time(m.timestamp_ms), 12.0, 500).color(pal().muted));
                         });
                         ui.add_space(10.0);
                     }
@@ -686,7 +918,7 @@ impl MessengerApp {
                         typing_bubble(ui);
                         let names: Vec<_> = typing.iter().map(|id| store.member_name(key, *id)).collect();
                         if thread.is_group() {
-                            ui.label(sf(&format!("{} is typing", names.join(", ")), 12.0, 400).color(MUTED));
+                            ui.label(sf(&format!("{} is typing", names.join(", ")), 12.0, 400).color(pal().muted));
                         }
                     });
                 }
@@ -735,7 +967,7 @@ impl MessengerApp {
         if m.is_admin {
             ui.add_space(6.0);
             ui.vertical_centered(|ui| {
-                ui.add(egui::Label::new(sf(&m.text, 12.0, 400).color(MUTED)).wrap());
+                ui.add(egui::Label::new(sf(&m.text, 12.0, 400).color(pal().muted)).wrap());
             });
             ui.add_space(6.0);
             return;
@@ -747,7 +979,7 @@ impl MessengerApp {
         if first && !mine && thread.is_group() && m.reply_to_id.is_none() {
             ui.horizontal(|ui| {
                 ui.add_space(gutter + 12.0);
-                ui.label(sf(&store.member_name(thread.key, m.sender_id), 12.0, 400).color(MUTED));
+                ui.label(sf(&store.member_name(thread.key, m.sender_id), 12.0, 400).color(pal().muted));
             });
             ui.add_space(2.0);
         }
@@ -775,7 +1007,7 @@ impl MessengerApp {
             paint_avatar(ui, rect, &pic, &store.contact_name(m.sender_id));
         }
 
-        // Reactions: a pill overlapping the bubble's bottom edge.
+        // Reactions: a pill overlapping the bubble's bottom-right corner.
         if !m.reactions.is_empty() {
             let mut counts: Vec<(String, usize)> = Vec::new();
             for e in m.reactions.values() {
@@ -788,13 +1020,13 @@ impl MessengerApp {
             if m.reactions.len() > 1 {
                 text.push_str(&format!(" {}", m.reactions.len()));
             }
-            let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(16.0 * text_scale()), TEXT);
+            let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(16.0 * text_scale()), pal().text);
             let size = galley.size() + Vec2::new(12.0, 4.0);
-            let x = if mine { bubble_rect.left() + 4.0 } else { bubble_rect.right() - size.x - 4.0 };
+            let x = bubble_rect.right() - size.x - 4.0;
             let pill = Rect::from_min_size(Pos2::new(x, bubble_rect.bottom() - 6.0), size);
-            ui.painter().rect_filled(pill, CornerRadius::same(10), QUOTE);
-            ui.painter().rect_stroke(pill, CornerRadius::same(10), Stroke::new(2.0, BG), egui::StrokeKind::Outside);
-            ui.painter().galley(pill.min + Vec2::new(6.0, 2.0), galley, TEXT);
+            ui.painter().rect_filled(pill, CornerRadius::same(10), pal().quote);
+            ui.painter().rect_stroke(pill, CornerRadius::same(10), Stroke::new(2.0, pal().bg), egui::StrokeKind::Outside);
+            ui.painter().galley(pill.min + Vec2::new(6.0, 2.0), galley, pal().text);
             let who = m.reactions.iter().map(|(id, e)| format!("{e} {}", store.member_name(thread.key, *id))).collect::<Vec<_>>().join("\n");
             ui.interact(pill, ui.scope_id().with(("reactions", &m.id)), Sense::hover()).on_hover_text(who);
             ui.add_space(size.y);
@@ -829,12 +1061,12 @@ impl MessengerApp {
         let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
         let groups: Vec<emojis::Group> = emojis::Group::iter().collect();
         let area = egui::Area::new(egui::Id::NULL.with("reaction_picker")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
-            Frame::default().fill(POPUP).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(16)).inner_margin(Margin::same(10)).show(ui, |ui| {
+            Frame::default().fill(pal().popup).stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(16)).inner_margin(Margin::same(10)).show(ui, |ui| {
                 ui.set_width(W);
                 let search_id = ui.make_persistent_id("reaction_search");
-                Frame::default().fill(INPUT).corner_radius(CornerRadius::same(18)).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+                Frame::default().fill(pal().input).corner_radius(CornerRadius::same(18)).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
                     ui.set_width(W - 24.0);
-                    ui.add(TextEdit::singleline(&mut picker.query).id(search_id).hint_text(sf("Search emoji", 15.0, 400).color(MUTED)).frame(Frame::NONE).desired_width(f32::INFINITY));
+                    ui.add(TextEdit::singleline(&mut picker.query).id(search_id).hint_text(sf("Search emoji", 15.0, 400).color(pal().muted)).frame(Frame::NONE).desired_width(f32::INFINITY));
                 });
                 if picker.opened {
                     ui.memory_mut(|m| m.request_focus(search_id));
@@ -845,7 +1077,7 @@ impl MessengerApp {
                 let mut cell = |ui: &mut egui::Ui, e: &str| {
                     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(CELL), Sense::click());
                     if mine.as_deref() == Some(e) || resp.hovered() {
-                        ui.painter().rect_filled(rect, CornerRadius::same(10), SELECTED);
+                        ui.painter().rect_filled(rect, CornerRadius::same(10), pal().selected);
                     }
                     if ui.is_rect_visible(rect) {
                         match crate::macos::emoji_png(e) {
@@ -853,7 +1085,7 @@ impl MessengerApp {
                                 egui::Image::from_bytes(format!("bytes://emoji/{e}.png"), png).paint_at(ui, rect.shrink(7.0));
                             }
                             None => {
-                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(24.0), TEXT);
+                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(24.0), pal().text);
                             }
                         }
                     }
@@ -863,7 +1095,7 @@ impl MessengerApp {
                 };
                 let header = |ui: &mut egui::Ui, title: &str| {
                     ui.add_space(4.0);
-                    ui.label(sf(title, 13.0, 600).color(MUTED))
+                    ui.label(sf(title, 13.0, 600).color(pal().muted))
                 };
                 let mut active = 0usize;
                 let scroll = ScrollArea::vertical().id_salt("reaction_picker_scroll").max_height(340.0).auto_shrink([false, false]).show(ui, |ui| {
@@ -908,7 +1140,7 @@ impl MessengerApp {
                         ui.spacing_mut().item_spacing.x = 0.0;
                         ui.add_space(((W - 9.0 * 36.0) / 2.0).max(0.0));
                         for (gi, group) in groups.iter().enumerate() {
-                            let color = if gi == active { BLUE } else { MUTED };
+                            let color = if gi == active { pal().blue } else { pal().muted };
                             if symbol_button(ui, emoji_group_label(*group).1, color).on_hover_text(emoji_group_label(*group).0).clicked() {
                                 picker.jump_to = Some(gi);
                             }
@@ -929,6 +1161,101 @@ impl MessengerApp {
         }
         if close {
             self.reaction_picker = None;
+        }
+    }
+
+    /// The sticker picker (web style): the tray's packs as tabs, the selected
+    /// pack's stickers in a grid; a click sends the sticker. Data comes from
+    /// the web client's GraphQL queries (`Session::sticker_packs`).
+    fn sticker_panel(&mut self, ctx: &egui::Context, bottom_left: Pos2, thread: i64, cmds: &mut Vec<Command>) {
+        const W: f32 = 360.0;
+        const CELL: f32 = 84.0;
+        let (packs, loading_tray) = {
+            let st = self.shared.stickers.lock().unwrap();
+            (st.packs.clone(), st.loading.contains(""))
+        };
+        if packs.is_none() && !loading_tray {
+            cmds.push(Command::LoadStickerPacks);
+        }
+        let packs = packs.unwrap_or_default();
+        if self.sticker_pack.as_ref().is_none_or(|p| !packs.iter().any(|x| &x.id == p)) {
+            self.sticker_pack = packs.first().map(|p| p.id.clone());
+        }
+        let (stickers, loading_pack) = match &self.sticker_pack {
+            Some(id) => {
+                let st = self.shared.stickers.lock().unwrap();
+                (st.pack_stickers.get(id).cloned(), st.loading.contains(id))
+            }
+            None => (None, false),
+        };
+        if let (Some(id), None, false) = (&self.sticker_pack, &stickers, loading_pack) {
+            cmds.push(Command::LoadStickerPack { pack: id.clone() });
+        }
+        let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
+        let area = egui::Area::new(egui::Id::NULL.with("sticker_panel")).order(egui::Order::Foreground).pivot(egui::Align2::LEFT_BOTTOM).fixed_pos(bottom_left).show(ctx, |ui| {
+            Frame::default().fill(pal().popup).stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(16)).inner_margin(Margin::same(10)).show(ui, |ui| {
+                ui.set_width(W);
+                // Pack tabs: each pack's thumbnail, the selected one underlined.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for p in &packs {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(38.0), Sense::click());
+                        let selected = self.sticker_pack.as_deref() == Some(p.id.as_str());
+                        if selected || resp.hovered() {
+                            ui.painter().rect_filled(rect, CornerRadius::same(8), pal().selected);
+                        }
+                        if p.thumbnail.starts_with("http") {
+                            egui::Image::new(p.thumbnail.as_str()).paint_at(ui, rect.shrink(4.0));
+                        }
+                        if selected {
+                            ui.painter().line_segment([rect.left_bottom() + Vec2::new(8.0, 1.0), rect.right_bottom() + Vec2::new(-8.0, 1.0)], Stroke::new(2.0, pal().blue));
+                        }
+                        if resp.on_hover_text(&p.name).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                            self.sticker_pack = Some(p.id.clone());
+                        }
+                    }
+                });
+                ui.separator();
+                ScrollArea::vertical().id_salt("sticker_grid").max_height(340.0).auto_shrink([false, false]).show(ui, |ui| {
+                    match &stickers {
+                        None => {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| ui.spinner());
+                        }
+                        Some(list) if list.is_empty() => {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| ui.label(sf("No stickers", 13.0, 500).color(pal().muted)));
+                        }
+                        Some(list) => {
+                            ui.spacing_mut().item_spacing = Vec2::splat(2.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for s in list {
+                                    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(CELL), Sense::click());
+                                    if resp.hovered() {
+                                        ui.painter().rect_filled(rect, CornerRadius::same(10), pal().selected);
+                                    }
+                                    if ui.is_rect_visible(rect) {
+                                        media_image(ui.ctx(), &s.image).paint_at(ui, rect.shrink(6.0));
+                                    }
+                                    let resp = if s.label.is_empty() { resp } else { resp.on_hover_text(&s.label) };
+                                    if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                        cmds.push(Command::SendSticker { thread, sticker_id: s.id });
+                                        close = true;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        });
+        // Clicking outside (except on the sticker button itself) closes it.
+        let pointer = ctx.input(|i| i.pointer.interact_pos());
+        if ctx.input(|i| i.pointer.any_pressed()) && pointer.is_some_and(|p| !area.response.rect.contains(p) && p.y < bottom_left.y) {
+            close = true;
+        }
+        if close {
+            self.show_stickers = false;
         }
     }
 
@@ -1011,17 +1338,17 @@ impl MessengerApp {
     }
 
     fn bubble(&self, ui: &mut egui::Ui, m: &Message, mine: bool, first: bool, last: bool) -> egui::Response {
-        let fill = if mine { BLUE } else { BUBBLE_OTHER };
+        let fill = if mine { pal().blue } else { pal().bubble_other };
         let radius = group_corners(mine, first, last);
         let mut parts: Vec<egui::Response> = Vec::new();
 
         if m.unsent {
             parts.push(
                 Frame::default()
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .stroke(Stroke::new(1.0, pal().border))
                     .corner_radius(radius)
                     .inner_margin(Margin::symmetric(12, 8))
-                    .show(ui, |ui| ui.label(sf(if mine { "You unsent a message" } else { "Message unsent" }, 15.0, 400).italics().color(MUTED)))
+                    .show(ui, |ui| ui.label(sf(if mine { "You unsent a message" } else { "Message unsent" }, 15.0, 400).italics().color(pal().muted)))
                     .response,
             );
             return parts.pop().unwrap();
@@ -1032,10 +1359,17 @@ impl MessengerApp {
         }
 
         if m.attachments.is_empty() && m.sticker_id.is_some() && m.text.is_empty() {
-            parts.push(ui.label(sf("Sticker", 14.0, 400).italics().color(MUTED)));
+            parts.push(ui.label(sf("Sticker", 14.0, 400).italics().color(pal().muted)));
         }
 
-        if !m.text.is_empty() {
+        // A message that is only a link, shown as a preview card already:
+        // the card says it all, so skip the bare URL under it.
+        let bare_link = {
+            let t = m.text.trim();
+            (t.starts_with("http://") || t.starts_with("https://")) && !t.contains(char::is_whitespace)
+        };
+        let has_card = m.attachments.iter().any(|a| matches!(a.kind, AttachmentKind::Link) || !a.title.is_empty());
+        if !m.text.is_empty() && !(bare_link && has_card) {
             let big_emoji = m.text.chars().count() <= 3 && m.text.chars().all(|c| !c.is_alphanumeric() && !c.is_whitespace());
             let r = if big_emoji {
                 ui.label(RichText::new(&m.text).size(40.0))
@@ -1059,15 +1393,15 @@ impl MessengerApp {
         if parts.is_empty() {
             parts.push(
                 Frame::default()
-                    .stroke(Stroke::new(1.0, BORDER))
+                    .stroke(Stroke::new(1.0, pal().border))
                     .corner_radius(radius)
                     .inner_margin(Margin::symmetric(12, 8))
-                    .show(ui, |ui| ui.label(sf("This message isn't supported yet", 14.0, 400).italics().color(MUTED)))
+                    .show(ui, |ui| ui.label(sf("This message isn't supported yet", 14.0, 400).italics().color(pal().muted)))
                     .response,
             );
         }
         if m.pending {
-            parts.push(ui.label(sf("Sending…", 11.0, 400).color(MUTED)));
+            parts.push(ui.label(sf("Sending…", 11.0, 400).color(pal().muted)));
         }
         parts.into_iter().reduce(|a, b| a.union(b)).unwrap()
     }
@@ -1082,11 +1416,11 @@ impl MessengerApp {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.label(sf(&title, 13.0, 600));
                     if !body.is_empty() {
-                        ui.add(egui::Label::new(sf(&truncate(body, 90), 12.0, 400).color(MUTED)).truncate());
+                        ui.add(egui::Label::new(sf(&truncate(body, 90), 12.0, 400).color(pal().muted)).truncate());
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    close = ui.add(egui::Button::new(sf("✕", 14.0, 600).color(MUTED)).frame(false)).clicked();
+                    close = ui.add(egui::Button::new(sf("✕", 14.0, 600).color(pal().muted)).frame(false)).clicked();
                 });
             });
             ui.add_space(6.0);
@@ -1108,7 +1442,7 @@ impl MessengerApp {
             self.draft.clear();
         }
         if self.show_emoji {
-            Frame::default().fill(QUOTE).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(8)).show(ui, |ui| {
+            Frame::default().fill(pal().quote).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(8)).show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for e in EMOJIS {
                         if ui.add(egui::Button::new(RichText::new(e).size(22.0)).frame(false)).clicked() {
@@ -1117,6 +1451,39 @@ impl MessengerApp {
                     }
                 });
             });
+            ui.add_space(6.0);
+        }
+
+        // Pasted or dropped attachments waiting to be sent: thumbnails with a
+        // remove button, above the composer.
+        if !self.pending_files.is_empty() {
+            let mut remove = None;
+            ui.horizontal(|ui| {
+                ui.add_space(52.0);
+                for (i, path) in self.pending_files.iter().enumerate() {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+                    let is_image = path.extension().and_then(|e| e.to_str()).is_some_and(|e| ["png", "jpg", "jpeg", "gif", "webp", "heic"].contains(&e.to_ascii_lowercase().as_str()));
+                    if is_image {
+                        egui::Image::new(format!("file://{}", path.display())).corner_radius(CornerRadius::same(10)).paint_at(ui, rect);
+                    } else {
+                        ui.painter().rect_filled(rect, CornerRadius::same(10), pal().quote);
+                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, truncate(&name, 10), egui::FontId::proportional(11.0), pal().muted);
+                    }
+                    let x = Rect::from_center_size(rect.right_top() + Vec2::new(-8.0, 8.0), Vec2::splat(18.0));
+                    let close = ui.interact(x, ui.scope_id().with(("unattach", i)), Sense::click());
+                    ui.painter().circle_filled(x.center(), 9.0, Color32::from_black_alpha(170));
+                    let c = x.center();
+                    ui.painter().line_segment([c + Vec2::splat(-3.5), c + Vec2::splat(3.5)], Stroke::new(1.4, Color32::WHITE));
+                    ui.painter().line_segment([c + Vec2::new(-3.5, 3.5), c + Vec2::new(3.5, -3.5)], Stroke::new(1.4, Color32::WHITE));
+                    if close.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        remove = Some(i);
+                    }
+                }
+            });
+            if let Some(i) = remove {
+                self.pending_files.remove(i);
+            }
             ui.add_space(6.0);
         }
 
@@ -1135,15 +1502,17 @@ impl MessengerApp {
         let button = |cx: f32| Rect::from_center_size(Pos2::new(cx, mid_y), Vec2::splat(32.0));
 
         let clip = Some(button(row.left() + 16.0));
+        // Stickers (not in encrypted chats: sending them there isn't supported).
+        let sticker = (!thread.e2ee).then(|| button(row.left() + 16.0 + 36.0));
         let send = button(row.right() - 16.0);
         let pill = Rect::from_min_max(
-            Pos2::new(clip.map_or(row.left(), |c| c.right() + 8.0), row.top()),
+            Pos2::new(sticker.or(clip).map_or(row.left(), |c| c.right() + 8.0), row.top()),
             Pos2::new(send.left() - 8.0, row.bottom()),
         );
         // The input is a glass capsule (native pane behind it).
         let pill_radius = CornerRadius::same((PILL_MIN / 2.0) as u8);
-        ui.painter().rect_filled(pill, pill_radius, INPUT);
-        ui.painter().rect_stroke(pill, pill_radius, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+        ui.painter().rect_filled(pill, pill_radius, pal().input);
+        ui.painter().rect_stroke(pill, pill_radius, Stroke::new(1.0, pal().border), egui::StrokeKind::Inside);
         self.glass.push(glass_rect(pill, PILL_MIN / 2.0));
 
         if let Some(clip) = clip {
@@ -1152,6 +1521,15 @@ impl MessengerApp {
                     cmds.push(Command::SendFiles { thread: key, paths, reply_to: self.reply_to.take().map(|r| r.0) });
                 }
             }
+        }
+        if let Some(rect) = sticker {
+            let color = if self.show_stickers { pal().blue } else { pal().blue.gamma_multiply(0.85) };
+            if ui.put(rect, |ui: &mut egui::Ui| symbol_button(ui, "face.smiling.inverse", color)).on_hover_text("Choose a sticker").clicked() {
+                self.show_stickers = !self.show_stickers;
+            }
+        }
+        if self.show_stickers && !thread.e2ee {
+            self.sticker_panel(ui.ctx(), Pos2::new(pill.left() - 40.0, pill.top() - 8.0), key, cmds);
         }
         let smiley = Rect::from_center_size(Pos2::new(pill.right() - 20.0, mid_y), Vec2::splat(32.0));
         if smiley_button(ui, smiley, self.show_emoji).on_hover_text("Choose an emoji").clicked() {
@@ -1202,16 +1580,16 @@ impl MessengerApp {
                 .pivot(egui::Align2::LEFT_BOTTOM)
                 .fixed_pos(Pos2::new(pill.left() + 8.0, pill.top() - 6.0))
                 .show(ui.ctx(), |ui| {
-                    Frame::default().fill(POPUP).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(6)).show(ui, |ui| {
+                    Frame::default().fill(pal().popup).stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(12)).inner_margin(Margin::same(6)).show(ui, |ui| {
                         ui.set_width(260.0);
                         for (i, (id, name)) in candidates.iter().enumerate() {
                             let (row, resp) = ui.allocate_exact_size(Vec2::new(260.0, 34.0), Sense::click());
                             if i == self.mention_sel || resp.hovered() {
-                                ui.painter().rect_filled(row, CornerRadius::same(8), SELECTED);
+                                ui.painter().rect_filled(row, CornerRadius::same(8), pal().selected);
                             }
                             let pic = store.contacts.get(id).map(|c| c.picture.clone()).unwrap_or_default();
                             paint_avatar(ui, Rect::from_center_size(Pos2::new(row.left() + 18.0, row.center().y), Vec2::splat(24.0)), &pic, name);
-                            ui.painter().text(Pos2::new(row.left() + 38.0, row.center().y), egui::Align2::LEFT_CENTER, name, egui::FontId::new(14.0, egui::FontFamily::Name("sf-500".into())), TEXT);
+                            ui.painter().text(Pos2::new(row.left() + 38.0, row.center().y), egui::Align2::LEFT_CENTER, name, egui::FontId::new(14.0, egui::FontFamily::Name("sf-500".into())), pal().text);
                             if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                 picked = Some((*id, name.clone()));
                             }
@@ -1239,6 +1617,37 @@ impl MessengerApp {
             }
         }
 
+        // Cmd+V with a picture or Finder files on the clipboard attaches them
+        // (egui only pastes text; it turns an image-only clipboard into
+        // `PasteImage`). Handled before the text field sees the event.
+        if ui.memory(|m| m.has_focus(text_id)) {
+            let pasted_image = ui.input_mut(|i| {
+                let mut found = None;
+                i.events.retain(|e| match e {
+                    egui::Event::PasteImage(img) => {
+                        found = Some(img.clone());
+                        false
+                    }
+                    _ => true,
+                });
+                found
+            });
+            if let Some(img) = pasted_image {
+                match save_pasted_image(&img) {
+                    Ok(path) => self.pending_files.push(path),
+                    Err(e) => *self.shared.error.lock().unwrap() = Some(format!("Couldn't paste the image: {e}")),
+                }
+            }
+            if ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))) {
+                let files = crate::macos::pasteboard_files();
+                if !files.is_empty() {
+                    // Files copied in Finder: attach them instead of pasting their names.
+                    ui.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                    self.pending_files.extend(files);
+                }
+            }
+        }
+
         let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(text_rect).layout(Layout::top_down(Align::Min)));
         // Tags show in the accent color while composing.
         let tags: Vec<String> = self.mention_picks.iter().map(|(_, t)| t.clone()).collect();
@@ -1246,8 +1655,8 @@ impl MessengerApp {
         let mut layouter = move |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
             let text = buf.as_str();
             let mut job = egui::text::LayoutJob::default();
-            let plain = egui::TextFormat::simple(tag_font.clone(), TEXT);
-            let tagged = egui::TextFormat::simple(tag_font.clone(), BLUE);
+            let plain = egui::TextFormat::simple(tag_font.clone(), pal().text);
+            let tagged = egui::TextFormat::simple(tag_font.clone(), pal().blue);
             let mut pos = 0;
             while pos < text.len() {
                 let next = tags.iter().filter_map(|t| text[pos..].find(t.as_str()).map(|i| (pos + i, t.len()))).min();
@@ -1270,7 +1679,7 @@ impl MessengerApp {
             TextEdit::multiline(&mut self.draft)
                 .id(text_id)
                 .layouter(&mut layouter)
-                .hint_text(sf("Aa", 15.0, 400).color(MUTED))
+                .hint_text(sf("Aa", 15.0, 400).color(pal().muted))
                 .font(font)
                 .frame(Frame::NONE)
                 .desired_rows(1)
@@ -1303,14 +1712,19 @@ impl MessengerApp {
         }
 
         let enter = resp.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
-        let empty = self.draft.trim().is_empty();
+        let empty = self.draft.trim().is_empty() && self.pending_files.is_empty();
         // The chat's own quick emoji (set per group, like the web client), else 👍.
         let quick = if thread.emoji.is_empty() { "👍" } else { thread.emoji.as_str() };
-        let send_button = egui::Button::new(RichText::new(if empty { quick } else { "➤" }).size(20.0).color(BLUE)).frame(false);
+        let send_button = egui::Button::new(RichText::new(if empty { quick } else { "➤" }).size(20.0).color(pal().blue)).frame(false);
         let clicked = ui.put(send, send_button).on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+        if (enter || clicked) && !self.pending_files.is_empty() {
+            // Attachments first, then any text as its own message.
+            let paths = std::mem::take(&mut self.pending_files);
+            cmds.push(Command::SendFiles { thread: key, paths, reply_to: None });
+        }
         if enter || clicked {
             let text = self.draft.trim().to_string();
-            let text = if text.is_empty() && clicked { quick.to_string() } else { text };
+            let text = if text.is_empty() && clicked && empty { quick.to_string() } else { text };
             if !text.is_empty() {
                 if let Some(id) = self.editing.take() {
                     cmds.push(Command::Edit { message_id: id, text });
@@ -1390,7 +1804,7 @@ impl MessengerApp {
                 let media: Vec<_> = all.iter().filter(|a| matches!(a.kind, AttachmentKind::Image | AttachmentKind::Video)).take(30).collect();
                 let other: Vec<_> = all.iter().filter(|a| matches!(a.kind, AttachmentKind::File | AttachmentKind::Link | AttachmentKind::Audio)).take(20).collect();
                 if media.is_empty() && other.is_empty() {
-                    ui.label(sf("Nothing shared yet", 14.0, 400).color(MUTED));
+                    ui.label(sf("Nothing shared yet", 14.0, 400).color(pal().muted));
                 }
                 let cell = ((ui.available_width() - 8.0) / 3.0).floor();
                 ui.horizontal_wrapped(|ui| {
@@ -1439,13 +1853,13 @@ impl MessengerApp {
 fn e2ee_notice(ui: &mut egui::Ui, key: i64) {
     ui.vertical_centered(|ui| {
         ui.add_space((ui.available_height() / 2.0 - 110.0).max(24.0));
-        ui.label(RichText::new("🔒").size(44.0).color(MUTED));
+        ui.label(RichText::new("🔒").size(44.0).color(pal().muted));
         ui.add_space(8.0);
         ui.label(sf("End-to-end encrypted chat", 17.0, 600));
         ui.add_space(4.0);
-        ui.add(egui::Label::new(sf("New messages in this chat will appear here as they arrive, and you can send text from here.\nOlder history needs your Messenger PIN (coming soon); until then, open it in your browser.", 14.0, 400).color(MUTED)).wrap());
+        ui.add(egui::Label::new(sf("New messages in this chat will appear here as they arrive, and you can send text from here.\nOlder history needs your Messenger PIN (coming soon); until then, open it in your browser.", 14.0, 400).color(pal().muted)).wrap());
         ui.add_space(14.0);
-        let open = egui::Button::new(sf("Open in browser", 15.0, 600).color(Color32::WHITE)).fill(BLUE).corner_radius(CornerRadius::same(18)).min_size(Vec2::new(0.0, 36.0));
+        let open = egui::Button::new(sf("Open in browser", 15.0, 600).color(Color32::WHITE)).fill(pal().blue).corner_radius(CornerRadius::same(18)).min_size(Vec2::new(0.0, 36.0));
         if ui.add(open).clicked() {
             ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.facebook.com/messages/e2ee/t/{key}")));
         }
@@ -1474,16 +1888,16 @@ fn reply_header(ui: &mut egui::Ui, store: &Store, thread: &Thread, m: &Message, 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
-        let stroke = Stroke::new(1.3, MUTED);
+        let stroke = Stroke::new(1.3, pal().muted);
         let c = rect.center();
         let pts = vec![c + Vec2::new(4.5, 4.0), c + Vec2::new(4.5, 0.5), c + Vec2::new(3.0, -1.5), c + Vec2::new(-4.0, -1.5)];
         ui.painter().add(egui::Shape::line(pts, stroke));
         ui.painter().line_segment([c + Vec2::new(-4.0, -1.5), c + Vec2::new(-1.0, -4.5)], stroke);
         ui.painter().line_segment([c + Vec2::new(-4.0, -1.5), c + Vec2::new(-1.0, 1.5)], stroke);
-        ui.label(sf(&format!("{sender} replied to {target}"), 12.0, 400).color(MUTED));
+        ui.label(sf(&format!("{sender} replied to {target}"), 12.0, 400).color(pal().muted));
     });
-    Frame::default().fill(QUOTE).corner_radius(CornerRadius::same(18)).inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 14 }).show(ui, |ui| {
-        ui.add(egui::Label::new(sf(&truncate(&quoted, 140), 14.0, 400).color(MUTED)).wrap());
+    Frame::default().fill(pal().quote).corner_radius(CornerRadius::same(18)).inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 14 }).show(ui, |ui| {
+        ui.add(egui::Label::new(sf(&truncate(&quoted, 140), 14.0, 400).color(pal().muted)).wrap());
     });
     ui.add_space(-10.0);
 }
@@ -1495,17 +1909,35 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
             let max = if matches!(a.kind, AttachmentKind::Sticker) { 120.0 } else { 300.0 };
             let scale = (max / w).min(max / h).min(1.0).max(0.0);
             let size = Vec2::new((w * scale).max(80.0), (h * scale).max(80.0));
-            let r = ui.add(egui::Image::new(a.preview_url.as_str()).fit_to_exact_size(size).corner_radius(radius).sense(Sense::click()));
+            let r = ui.add(media_image(ui.ctx(), &a.preview_url).fit_to_exact_size(size).corner_radius(radius).sense(Sense::click()));
             if matches!(a.kind, AttachmentKind::Video) {
                 ui.painter().circle_filled(r.rect.center(), 24.0, Color32::from_black_alpha(150));
                 ui.painter().text(r.rect.center() + Vec2::new(2.0, 0.0), egui::Align2::CENTER_CENTER, "▶", egui::FontId::proportional(22.0), Color32::WHITE);
             }
-            // Opens the full media (or, for shares without a direct link, the preview).
+            // Opens the full media (or, for shares without a direct link, the
+            // preview); videos play in the app's player window. The bubble's own
+            // click sense (for its menu) sits on top, so test the pointer
+            // directly instead of `r.clicked()`.
             let target = if a.url.is_empty() { &a.preview_url } else { &a.url };
-            if r.clicked() && !target.is_empty() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(target));
+            // (Raw pointer input passes through overlays: ignore it while the
+            // image viewer is open.)
+            let viewer_open = ui.ctx().data(|d| d.get_temp::<Option<String>>(egui::Id::new(IMAGE_VIEWER))).flatten().is_some();
+            let hovered = !viewer_open && ui.rect_contains_pointer(r.rect);
+            if hovered && !target.is_empty() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                if ui.input(|i| i.pointer.primary_clicked()) {
+                    if matches!(a.kind, AttachmentKind::Video) {
+                        crate::macos::play_video(target, &a.title, a.width, a.height);
+                    } else if matches!(a.kind, AttachmentKind::Image) {
+                        let full = if a.url.starts_with("http") || a.url.starts_with("file://") { a.url.clone() } else { a.preview_url.clone() };
+                        ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(IMAGE_VIEWER), Some(full)));
+                        ui.ctx().request_repaint();
+                    } else {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(target));
+                    }
+                }
             }
-            r.on_hover_cursor(egui::CursorIcon::PointingHand)
+            r
         }
         // A shared post or reel with a picture: the picture, then title and source.
         AttachmentKind::Link if a.preview_url.starts_with("http") && a.url.is_empty() => {
@@ -1515,7 +1947,7 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
             let scale = (280.0 / w).min(360.0 / h);
             let size = Vec2::new(w * scale, h * scale);
             let r = Frame::default()
-                .fill(BUBBLE_OTHER)
+                .fill(pal().bubble_other)
                 .corner_radius(radius)
                 .show(ui, |ui| {
                     ui.set_width(size.x);
@@ -1525,10 +1957,10 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
                     Frame::default().inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 10 }).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         if !a.title.is_empty() {
-                            ui.add(egui::Label::new(sf(&truncate(&a.title, 110), 14.0, 600).color(Color32::WHITE)).wrap());
+                            ui.add(egui::Label::new(sf(&truncate(&a.title, 110), 14.0, 600).color(pal().text)).wrap());
                         }
                         if !a.subtitle.is_empty() {
-                            ui.add(egui::Label::new(sf(&a.subtitle, 12.0, 400).color(MUTED)).truncate());
+                            ui.add(egui::Label::new(sf(&a.subtitle, 12.0, 400).color(pal().muted)).truncate());
                         }
                     });
                 })
@@ -1546,7 +1978,7 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
                 _ => "📄",
             };
             let r = Frame::default()
-                .fill(if matches!(a.kind, AttachmentKind::Link) { BUBBLE_OTHER } else { fill })
+                .fill(if matches!(a.kind, AttachmentKind::Link) { pal().bubble_other } else { fill })
                 .corner_radius(radius)
                 .inner_margin(Margin::symmetric(12, 10))
                 .show(ui, |ui| {
@@ -1556,12 +1988,13 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
                         ui.add(egui::Image::new(a.preview_url.as_str()).max_size(Vec2::new(280.0, 160.0)).corner_radius(CornerRadius::same(10)));
                     }
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(icon).size(16.0).color(TEXT));
+                        ui.label(RichText::new(icon).size(16.0).color(pal().text));
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 0.0;
-                            ui.add(egui::Label::new(sf(&truncate(&link_title(a), 80), 14.0, 600).color(Color32::WHITE)).wrap());
+                            let ink = if fill == pal().blue && !matches!(a.kind, AttachmentKind::Link) { Color32::WHITE } else { pal().text };
+                            ui.add(egui::Label::new(sf(&truncate(&link_title(a), 80), 14.0, 600).color(ink)).wrap());
                             if let Some(host) = url::Url::parse(&a.url).ok().and_then(|u| u.host_str().map(str::to_string)) {
-                                ui.label(sf(&host, 12.0, 400).color(MUTED));
+                                ui.label(sf(&host, 12.0, 400).color(pal().muted));
                             }
                         });
                     });
@@ -1620,7 +2053,7 @@ fn titlebar_drag(ui: &mut egui::Ui, rect: Rect) {
 fn paperclip_button(ui: &mut egui::Ui, rect: Rect) -> egui::Response {
     let resp = ui.interact(rect, ui.scope_id().with("attach"), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let color = if resp.hovered() { BLUE } else { BLUE.gamma_multiply(0.85) };
+    let color = if resp.hovered() { pal().blue } else { pal().blue.gamma_multiply(0.85) };
     let arc = |cx: f32, cy: f32, r: f32, from: f32, to: f32| -> Vec<Pos2> {
         (0..=10).map(|i| {
             let a = (from + (to - from) * i as f32 / 10.0).to_radians();
@@ -1645,7 +2078,7 @@ fn paperclip_button(ui: &mut egui::Ui, rect: Rect) -> egui::Response {
 fn smiley_button(ui: &mut egui::Ui, rect: Rect, open: bool) -> egui::Response {
     let resp = ui.interact(rect, ui.scope_id().with("emoji_toggle"), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-    let color = if open || resp.hovered() { BLUE } else { MUTED };
+    let color = if open || resp.hovered() { pal().blue } else { pal().muted };
     let stroke = Stroke::new(1.6, color);
     let c = rect.center();
     let p = ui.painter();
@@ -1669,7 +2102,7 @@ fn symbol_button(ui: &mut egui::Ui, symbol: &str, color: Color32) -> egui::Respo
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
     if resp.hovered() {
-        ui.painter().circle_filled(rect.center(), 17.0, QUOTE);
+        ui.painter().circle_filled(rect.center(), 17.0, pal().quote);
     }
     match crate::macos::sf_symbol_png(symbol, 17.0, [color.r(), color.g(), color.b()]) {
         Some(png) => {
@@ -1701,8 +2134,8 @@ fn round_action(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
     let mut clicked = false;
     ui.allocate_ui_with_layout(Vec2::new(64.0, 64.0), Layout::top_down(Align::Center), |ui| {
         let (rect, r) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
-        ui.painter().circle_filled(rect.center(), 18.0, if r.hovered() { BORDER } else { INPUT });
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(16.0), TEXT);
+        ui.painter().circle_filled(rect.center(), 18.0, if r.hovered() { pal().border } else { pal().input });
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(16.0), pal().text);
         ui.label(sf(label, 12.0, 400));
         clicked = r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
     });
@@ -1717,13 +2150,13 @@ fn pill_search(ui: &mut egui::Ui, text: &mut String) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), H), Sense::hover());
     let focused = ui.memory(|m| m.has_focus(id));
     let radius = CornerRadius::same((H / 2.0) as u8);
-    ui.painter().rect_filled(rect, radius, INPUT);
-    let ring = if focused { Stroke::new(1.5, BLUE.gamma_multiply(0.8)) } else { Stroke::new(1.0, BORDER) };
+    ui.painter().rect_filled(rect, radius, pal().input);
+    let ring = if focused { Stroke::new(1.5, pal().blue.gamma_multiply(0.8)) } else { Stroke::new(1.0, pal().border) };
     ui.painter().rect_stroke(rect, radius, ring, egui::StrokeKind::Inside);
 
     // Magnifier: a ring plus a short handle.
     let c = Pos2::new(rect.left() + 17.0, rect.center().y - 1.0);
-    let icon = Stroke::new(1.6, MUTED);
+    let icon = Stroke::new(1.6, pal().muted);
     ui.painter().circle_stroke(c, 5.0, icon);
     ui.painter().line_segment([c + Vec2::splat(3.7), c + Vec2::splat(7.2)], icon);
 
@@ -1733,7 +2166,7 @@ fn pill_search(ui: &mut egui::Ui, text: &mut String) {
     let resp = child.add(
         TextEdit::singleline(text)
             .id(id)
-            .hint_text(sf("Search", 15.0, 400).color(MUTED))
+            .hint_text(sf("Search", 15.0, 400).color(pal().muted))
             .font(egui::FontId::new(15.0 * text_scale(), egui::FontFamily::Name("sf-400".into())))
             .frame(Frame::NONE)
             .margin(Margin::ZERO)
@@ -1747,7 +2180,7 @@ fn pill_search(ui: &mut egui::Ui, text: &mut String) {
         let center = Pos2::new(rect.right() - 18.0, rect.center().y);
         let hit = Rect::from_center_size(center, Vec2::splat(20.0));
         let clear = ui.interact(hit, id.with("clear"), Sense::click());
-        let fill = if clear.hovered() { MUTED } else { MUTED.gamma_multiply(0.7) };
+        let fill = if clear.hovered() { pal().muted } else { pal().muted.gamma_multiply(0.7) };
         ui.painter().circle_filled(center, 7.5, fill);
         let x = Stroke::new(1.5, Color32::from_rgb(30, 30, 32));
         ui.painter().line_segment([center + Vec2::new(-2.8, -2.8), center + Vec2::new(2.8, 2.8)], x);
@@ -1825,13 +2258,13 @@ fn install_fonts(ctx: &egui::Context) {
 fn typing_bubble(ui: &mut egui::Ui) {
     const SIZE: Vec2 = Vec2::new(46.0, 26.0);
     let (rect, _) = ui.allocate_exact_size(SIZE, Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(13), BUBBLE_OTHER);
+    ui.painter().rect_filled(rect, CornerRadius::same(13), pal().bubble_other);
     let t = ui.input(|i| i.time) as f32;
     for i in 0..3 {
         // Each dot peaks a third of a cycle after the previous one.
         let phase = (t * 5.0 - i as f32 * 0.9).sin().max(0.0);
         let center = Pos2::new(rect.center().x + (i as f32 - 1.0) * 9.0, rect.center().y - phase * 3.0);
-        let color = MUTED.gamma_multiply(0.45 + 0.55 * phase);
+        let color = pal().muted.gamma_multiply(0.45 + 0.55 * phase);
         ui.painter().circle_filled(center, 3.0, color);
     }
     ui.ctx().request_repaint(); // keep animating while it's shown
@@ -1855,7 +2288,7 @@ fn status_row(ui: &mut egui::Ui, status: SendStatus) {
         let (rect, resp) = ui.allocate_exact_size(Vec2::splat(R * 2.0 + 1.0), Sense::hover());
         let c = rect.center();
         let p = ui.painter();
-        let stroke = Stroke::new(1.2, MUTED);
+        let stroke = Stroke::new(1.2, pal().muted);
         let check = |p: &egui::Painter, color: Color32| {
             let s = Stroke::new(1.4, color);
             p.line_segment([c + Vec2::new(-3.0, 0.2), c + Vec2::new(-0.9, 2.4)], s);
@@ -1867,11 +2300,11 @@ fn status_row(ui: &mut egui::Ui, status: SendStatus) {
             }
             SendStatus::Sent => {
                 p.circle_stroke(c, R, stroke);
-                check(p, MUTED);
+                check(p, pal().muted);
             }
             SendStatus::Delivered => {
-                p.circle_filled(c, R, MUTED);
-                check(p, BG.to_opaque());
+                p.circle_filled(c, R, pal().muted);
+                check(p, pal().bg.to_opaque());
             }
         }
         resp.on_hover_text(match status {
@@ -1907,14 +2340,14 @@ fn readers_by_message(store: &Store, thread: &Thread, messages: &[Message]) -> H
 /// Small avatars of the people who stopped reading at this message; hover for
 /// names and times.
 fn seen_by_row(ui: &mut egui::Ui, store: &Store, thread: i64, readers: &[(i64, i64)]) {
-    const SIZE: f32 = 14.0;
+    const SIZE: f32 = 18.0;
     const MAX: usize = 8;
     ui.add_space(2.0);
     ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
         ui.add_space(16.0);
-        ui.spacing_mut().item_spacing.x = 2.0;
+        ui.spacing_mut().item_spacing.x = 3.0;
         if readers.len() > MAX {
-            ui.label(sf(&format!("+{}", readers.len() - MAX), 11.0, 500).color(MUTED));
+            ui.label(sf(&format!("+{}", readers.len() - MAX), 11.0, 500).color(pal().muted));
         }
         let start = ui.cursor().min;
         for (id, _) in readers.iter().take(MAX) {
@@ -1955,7 +2388,7 @@ fn paint_avatar(ui: &egui::Ui, rect: Rect, url: &str, name: &str) {
     match image.load_for_size(ui.ctx(), rect.size()) {
         Ok(egui::load::TexturePoll::Ready { .. }) => image.paint_at(ui, rect),
         Ok(egui::load::TexturePoll::Pending { .. }) => {
-            ui.painter().circle_filled(rect.center(), rect.width() / 2.0, QUOTE);
+            ui.painter().circle_filled(rect.center(), rect.width() / 2.0, pal().quote);
         }
         Err(_) => initial(ui),
     }

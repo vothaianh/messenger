@@ -127,13 +127,84 @@ pub type GlassRect = [f32; 5];
 struct Glass {
     window: Option<Retained<NSWindow>>,
     background: Option<Retained<NSVisualEffectView>>,
+    /// The content tint over the whole window, between the blur and the panes.
+    tint: Option<Retained<objc2_app_kit::NSBox>>,
+    tint_rgba: [f64; 4],
     panes: Vec<Retained<NSGlassEffectView>>,
     shown: Vec<GlassRect>,
     host_height: f64,
+    /// Where macOS put the traffic-light buttons, before we nudged them.
+    button_origins: Vec<NSPoint>,
+    /// Light appearance: the glass panes get a light tint instead of a dark one.
+    light: bool,
+}
+
+fn tint_color([r, g, b, a]: [f64; 4]) -> Retained<objc2_app_kit::NSColor> {
+    objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, a)
+}
+
+/// Glass tint per appearance: keeps text contrast on bright or dark wallpapers.
+fn glass_tint(light: bool) -> Retained<objc2_app_kit::NSColor> {
+    if light {
+        objc2_app_kit::NSColor::colorWithWhite_alpha(1.0, 0.1)
+    } else {
+        // Navy, matching the dark blue palette.
+        objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.08, 0.17, 0.12)
+    }
+}
+
+/// Set the app's appearance: `Some(light)` forces Aqua or Dark Aqua, `None`
+/// follows the system. `light` is the effective one, for the glass tint.
+/// Main thread only.
+pub fn set_appearance(forced: Option<bool>, light: bool, tint: [f64; 4]) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    let appearance = forced.and_then(|l| NSAppearance::appearanceNamed(unsafe { if l { NSAppearanceNameAqua } else { NSAppearanceNameDarkAqua } }));
+    app.setAppearance(appearance.as_deref());
+    GLASS.with_borrow_mut(|g| {
+        g.light = light;
+        g.tint_rgba = tint;
+        if let Some(view) = &g.tint {
+            view.setFillColor(&tint_color(tint));
+        }
+        for pane in &g.panes {
+            pane.setTintColor(Some(&glass_tint(light)));
+        }
+    });
 }
 
 thread_local! {
     static GLASS: RefCell<Glass> = RefCell::new(Glass::default());
+}
+
+/// Move the traffic lights 6 pt in and down so they sit inside the left glass
+/// pane (inset 8 pt, 22 pt corners), as macOS 26 does for glass sidebars,
+/// instead of straddling its rounded corner. Re-applied whenever macOS lays
+/// them out again (resize, full screen).
+fn nudge_window_buttons(window: &NSWindow, origins: &mut Vec<NSPoint>) {
+    use objc2_app_kit::NSWindowButton;
+    const SHIFT: f64 = 6.0;
+    let buttons: Vec<_> = [NSWindowButton::CloseButton, NSWindowButton::MiniaturizeButton, NSWindowButton::ZoomButton]
+        .into_iter()
+        .filter_map(|b| window.standardWindowButton(b))
+        .collect();
+    if origins.len() != buttons.len() {
+        *origins = buttons.iter().map(|b| b.frame().origin).collect();
+    }
+    for (button, original) in buttons.iter().zip(origins.iter_mut()) {
+        let flipped = unsafe { button.superview() }.is_some_and(|v| v.isFlipped());
+        let dy = if flipped { SHIFT } else { -SHIFT };
+        let target = NSPoint::new(original.x + SHIFT, original.y + dy);
+        let now = button.frame().origin;
+        if now != target {
+            // A position other than ours is a fresh layout by macOS: adopt it as the base.
+            if now != *original {
+                *original = now;
+            }
+            button.setFrameOrigin(NSPoint::new(original.x + SHIFT, original.y + dy));
+        }
+    }
 }
 
 /// Place the glass surfaces for this frame. Main thread only (egui's update).
@@ -145,6 +216,7 @@ pub fn sync_glass(rects: &[GlassRect]) {
             g.window = app.mainWindow().or_else(|| app.windows().firstObject());
         }
         let Some(window) = g.window.clone() else { return };
+        nudge_window_buttons(&window, &mut g.button_origins);
         let Some(content) = window.contentView() else { return };
         let Some(host) = (unsafe { content.superview() }) else { return };
 
@@ -157,12 +229,23 @@ pub fn sync_glass(rects: &[GlassRect]) {
             bg.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
             host.addSubview_positioned_relativeTo(&bg, NSWindowOrderingMode::Below, Some(&content));
             g.background = Some(bg);
+
+            // One flat tint over the blur for the whole window (the
+            // conversation area and the gaps around the panes alike).
+            let tint = objc2_app_kit::NSBox::new(mtm);
+            tint.setBoxType(objc2_app_kit::NSBoxType::Custom);
+            tint.setTitlePosition(objc2_app_kit::NSTitlePosition::NoTitle);
+            tint.setBorderWidth(0.0);
+            tint.setFillColor(&tint_color(g.tint_rgba));
+            tint.setFrame(host.bounds());
+            tint.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable);
+            host.addSubview_positioned_relativeTo(&tint, NSWindowOrderingMode::Below, Some(&content));
+            g.tint = Some(tint);
         }
         while g.panes.len() < rects.len() {
             let pane = NSGlassEffectView::new(mtm);
             pane.setStyle(NSGlassEffectViewStyle::Regular);
-            // A dark tint keeps the dark theme's contrast on bright wallpapers.
-            pane.setTintColor(Some(&objc2_app_kit::NSColor::colorWithWhite_alpha(0.08, 0.55)));
+            pane.setTintColor(Some(&glass_tint(g.light)));
             // Directly below the egui layer, above the background blur.
             host.addSubview_positioned_relativeTo(&pane, NSWindowOrderingMode::Below, Some(&content));
             g.panes.push(pane);
@@ -399,4 +482,104 @@ fn image_png(image: &NSImage) -> Option<Vec<u8>> {
     NSGraphicsContext::restoreGraphicsState_class();
     let data = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
     Some(data.to_vec())
+}
+
+// ---- Clipboard files ----
+
+/// Files on the clipboard (copied in Finder), as paths. Empty when the
+/// clipboard holds no file URLs.
+pub fn pasteboard_files() -> Vec<std::path::PathBuf> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeFileURL};
+    let board = NSPasteboard::generalPasteboard();
+    let Some(items) = board.pasteboardItems() else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|item| item.stringForType(unsafe { NSPasteboardTypeFileURL }))
+        .filter_map(|url| url::Url::parse(&url.to_string()).ok()?.to_file_path().ok())
+        .filter(|p| p.is_file())
+        .collect()
+}
+
+// ---- Video player ----
+//
+// Videos play in a native window with AVKit's player (streaming the link;
+// local files for encrypted chats). One at a time: opening another replaces
+// it, and closing the window stops playback.
+
+use objc2_av_foundation::AVPlayer;
+use objc2_av_kit::AVPlayerView;
+
+thread_local! {
+    static VIDEO: RefCell<Option<(Retained<NSWindow>, Retained<AVPlayer>)>> = const { RefCell::new(None) };
+}
+
+/// Play `url` (https link, `file://` URL or path) in the player window, sized
+/// to the video's `width`×`height` (0 when unknown). Main thread only.
+pub fn play_video(url: &str, title: &str, width: f32, height: f32) {
+    use objc2_app_kit::{NSBackingStoreType, NSWindowStyleMask};
+    use objc2_foundation::NSURL;
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let ns_url = if let Some(path) = url.strip_prefix("file://") {
+        NSURL::fileURLWithPath(&NSString::from_str(path))
+    } else if url.starts_with('/') {
+        NSURL::fileURLWithPath(&NSString::from_str(url))
+    } else {
+        let Some(u) = NSURL::URLWithString(&NSString::from_str(url)) else { return };
+        u
+    };
+    stop_video();
+
+    // Fit the video in 960×640 (and at least 320 wide), keeping its shape.
+    let (w, h) = if width > 0.0 && height > 0.0 { (width as f64, height as f64) } else { (640.0, 360.0) };
+    let scale = (960.0 / w).min(640.0 / h);
+    let (mut w, mut h) = (w * scale, h * scale);
+    if w < 320.0 {
+        h *= 320.0 / w;
+        w = 320.0;
+    }
+
+    let player = unsafe { AVPlayer::playerWithURL(&ns_url, mtm) };
+    let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Resizable | NSWindowStyleMask::Miniaturizable;
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(mtm.alloc(), rect, style, NSBackingStoreType::Buffered, false)
+    };
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setTitle(&NSString::from_str(if title.is_empty() { "Video" } else { title }));
+    window.setContentAspectRatio(NSSize::new(w, h));
+    let view = unsafe { AVPlayerView::initWithFrame(mtm.alloc(), rect) };
+    unsafe { view.setPlayer(Some(&player)) };
+    window.setContentView(Some(&view));
+    // Over the main window's center.
+    let app = NSApplication::sharedApplication(mtm);
+    if let Some(main) = app.mainWindow() {
+        let f = main.frame();
+        let frame = window.frame();
+        window.setFrameOrigin(NSPoint::new(
+            f.origin.x + (f.size.width - frame.size.width) / 2.0,
+            f.origin.y + (f.size.height - frame.size.height) / 2.0,
+        ));
+    } else {
+        window.center();
+    }
+    window.makeKeyAndOrderFront(None);
+    unsafe { player.play() };
+    VIDEO.with_borrow_mut(|v| *v = Some((window, player)));
+}
+
+fn stop_video() {
+    VIDEO.with_borrow_mut(|v| {
+        if let Some((window, player)) = v.take() {
+            unsafe { player.pause() };
+            window.close();
+        }
+    });
+}
+
+/// Stop playback once the user closed the player window (called every frame).
+pub fn reap_video() {
+    let closed = VIDEO.with_borrow(|v| v.as_ref().is_some_and(|(window, _)| !window.isVisible() && !window.isMiniaturized()));
+    if closed {
+        stop_video();
+    }
 }

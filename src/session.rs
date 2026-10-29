@@ -59,6 +59,10 @@ pub struct Bootstrap {
     /// app id it belongs to; empty when the page doesn't carry them.
     pub e2ee_cat: String,
     pub e2ee_app_id: String,
+    /// The mailbox's region (`MessengerWebRegion.regionNullable`, e.g. "ATN"),
+    /// sent to DGW as `x-dgw-regionhint`; without it the gateway answers syncs
+    /// but never pushes live changes.
+    pub region: Option<String>,
 }
 
 pub struct Session {
@@ -140,10 +144,12 @@ impl Session {
             }
         }
 
+        let region = capture(&html, r#""MessengerWebRegion",\[\],\{"regionNullable":"([A-Z0-9]+)"#);
+
         Ok(Session {
             http,
             cookies,
-            boot: Bootstrap { fbid, dtsg, lsd, ls_app_id, mqtt_app_id, mqtt_endpoint, ls_doc_id, ls_version, page_params, e2ee_cat, e2ee_app_id },
+            boot: Bootstrap { fbid, dtsg, lsd, ls_app_id, mqtt_app_id, mqtt_endpoint, ls_doc_id, ls_version, page_params, e2ee_cat, e2ee_app_id, region },
             req_counter: Default::default(),
             device_id: uuid::Uuid::new_v4().to_string(),
         })
@@ -215,21 +221,38 @@ impl Session {
     }
 
     /// `LSPlatformGraphQLLightspeedRequestQuery`: type 1 = database sync, 3 = tasks.
-    async fn ls_request(&self, request_type: i64, request_payload: String) -> Result<String> {
+    pub async fn ls_request(&self, request_type: i64, request_payload: String) -> Result<String> {
         let variables = json!({
             "deviceId": self.device_id,
             "requestId": 0,
             "requestPayload": request_payload,
             "requestType": request_type,
-        })
-        .to_string();
+        });
+        let v = self.graphql("LSPlatformGraphQLLightspeedRequestQuery", &self.boot.ls_doc_id, &variables).await?;
+        let first = v.to_string();
+        let viewer = v
+            .pointer("/data/viewer")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("unexpected GraphQL response: {}", first.chars().take(300).collect::<String>()))?;
+        // The field name has changed between releases (lightspeed_web_request,
+        // lightspeed_web_request_for_us, ...) — take whichever holds a payload.
+        viewer
+            .values()
+            .find_map(|f| f.get("payload").and_then(Value::as_str))
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("no Lightspeed payload in response"))
+    }
+
+    /// Run a GraphQL query by its persisted `doc_id` the way the web client
+    /// does (same form fields and headers); returns the first JSON object.
+    pub async fn graphql(&self, friendly_name: &str, doc_id: &str, variables: &Value) -> Result<Value> {
         let mut form = self.base_form();
         form.extend([
             ("fb_api_caller_class", "RelayModern".to_string()),
-            ("fb_api_req_friendly_name", "LSPlatformGraphQLLightspeedRequestQuery".into()),
+            ("fb_api_req_friendly_name", friendly_name.to_string()),
             ("server_timestamps", "true".into()),
-            ("doc_id", self.boot.ls_doc_id.clone()),
-            ("variables", variables),
+            ("doc_id", doc_id.to_string()),
+            ("variables", variables.to_string()),
         ]);
         let text = self
             .http
@@ -238,7 +261,7 @@ impl Session {
             .header("Origin", BASE)
             .header("Referer", format!("{BASE}/messages/"))
             .header("X-FB-LSD", &self.boot.lsd)
-            .header("X-FB-Friendly-Name", "LSPlatformGraphQLLightspeedRequestQuery")
+            .header("X-FB-Friendly-Name", friendly_name)
             .header("Accept", "*/*")
             .header("Accept-Language", "en-US,en;q=0.9")
             .header("Sec-Fetch-Dest", "empty")
@@ -255,17 +278,43 @@ impl Session {
         if let Some(err) = v.get("errors") {
             bail!("GraphQL error: {err}");
         }
-        let viewer = v
-            .pointer("/data/viewer")
-            .and_then(Value::as_object)
-            .ok_or_else(|| anyhow!("unexpected GraphQL response: {}", first.chars().take(300).collect::<String>()))?;
-        // The field name has changed between releases (lightspeed_web_request,
-        // lightspeed_web_request_for_us, ...) — take whichever holds a payload.
-        viewer
-            .values()
-            .find_map(|f| f.get("payload").and_then(Value::as_str))
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("no Lightspeed payload in response"))
+        Ok(v)
+    }
+
+    /// The sticker packs in the user's sticker tray (the web picker's tabs).
+    pub async fn sticker_packs(&self) -> Result<Vec<StickerPack>> {
+        let vars = json!({"feedbackID": null, "scale": 3, "stickerInterface": "MESSAGES"});
+        let v = self.graphql("CometStickerPickerCardQuery", STICKER_TRAY_DOC, &vars).await?;
+        let edges = v.pointer("/data/picker_plugins/sticker_picker/sticker_store/tray_packs/edges").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(edges
+            .iter()
+            .filter_map(|e| {
+                let n = &e["node"];
+                Some(StickerPack {
+                    id: n["id"].as_str()?.to_string(),
+                    name: n["name"].as_str().unwrap_or_default().to_string(),
+                    thumbnail: n.pointer("/thumbnail_image/uri").or(n.get("thumbnail_image")).and_then(Value::as_str).unwrap_or_default().to_string(),
+                })
+            })
+            .collect())
+    }
+
+    /// The stickers of one pack (first page, like the web picker).
+    pub async fn sticker_pack(&self, pack_id: &str) -> Result<Vec<Sticker>> {
+        let vars = json!({"packID": pack_id, "stickerWidth": 128, "stickerHeight": 128, "scale": 3});
+        let v = self.graphql("CometStickerPickerPackContentRootQuery", STICKER_PACK_DOC, &vars).await?;
+        let edges = v.pointer("/data/sticker_pack/stickers/edges").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(edges
+            .iter()
+            .filter_map(|e| {
+                let n = &e["node"];
+                Some(Sticker {
+                    id: n["id"].as_str()?.parse().ok()?,
+                    image: n.pointer("/image/uri").and_then(Value::as_str)?.to_string(),
+                    label: n["label"].as_str().or(n["accessibility_label"].as_str()).unwrap_or_default().to_string(),
+                })
+            })
+            .collect())
     }
 
     /// Upload a file for sending as an attachment. Returns the attachment fbid.
@@ -331,6 +380,24 @@ fn mime_for(name: &str) -> &'static str {
 pub fn new_otid() -> i64 {
     let rand = (uuid::Uuid::new_v4().as_u128() & 0x3f_ffff) as i64;
     (now_ms() << 22) | rand
+}
+
+/// Persisted query ids of the web sticker picker (see README "Protocol notes").
+const STICKER_TRAY_DOC: &str = "28475074195489368";
+const STICKER_PACK_DOC: &str = "25236323532672635";
+
+#[derive(Clone, Debug)]
+pub struct StickerPack {
+    pub id: String,
+    pub name: String,
+    pub thumbnail: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct Sticker {
+    pub id: i64,
+    pub image: String,
+    pub label: String,
 }
 
 /// `sync_params` for Lightspeed database syncs (GraphQL and MQTT alike). The

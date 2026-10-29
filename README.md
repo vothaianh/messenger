@@ -60,6 +60,7 @@ one small native app (about 20 MB) that opens instantly with your recent chats.
 
 ### Media and links
 - Photos, videos, stickers, files and voice messages
+- Photos open in an in-app viewer; videos play in a native AVKit player window
 - Shared posts and reels as preview cards (picture, title, source)
 
 ### End-to-end encrypted (🔒) chats
@@ -175,6 +176,12 @@ Verified against the live web app (October 2026):
   - `insertXmaAttachment` (shares): 8 preview, 11 MIME type, 13/14 size,
     25 thread, 30 mid, 58 title, 59 source, 102 page name
   - `executeFirstBlockForSyncTransactionV4`: 3 cursor
+- Stickers use the web picker's GraphQL queries: `CometStickerPickerCardQuery`
+  (doc `28475074195489368`, `{"feedbackID":null,"scale":3,"stickerInterface":"MESSAGES"}`)
+  for the tray, `picker_plugins.sticker_picker.sticker_store.tray_packs`;
+  `CometStickerPickerPackContentRootQuery` (doc `25236323532672635`,
+  `{"packID","stickerWidth":128,"stickerHeight":128,"scale":3}`) for a pack's
+  stickers. A sticker is sent with task 46, `send_type` 2 and `sticker_id`.
 - Task labels (from the open-source mautrix-meta and the web client): 46 send,
   21 read, 29 react, 33 unsend, 742 edit, 228 fetch messages, 145 fetch
   threads, 144 mute; typing is request type 4, label 3. Uploads go to

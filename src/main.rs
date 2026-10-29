@@ -390,7 +390,7 @@ fn main() -> anyhow::Result<()> {
         let hello = std::env::args().nth(2).as_deref() == Some("hello");
         return tokio::runtime::Runtime::new()?.block_on(async {
             let s = session::Session::connect(cookies).await?;
-            let url = dgw::lightspeed_url(&s.boot.ls_app_id, s.boot.fbid, &s.device_id);
+            let url = dgw::lightspeed_url(&s.boot.ls_app_id, s.boot.fbid, &s.device_id, s.boot.region.as_deref());
             let mut ws = dgw::Socket::open(&url, &s.cookies.0, session::USER_AGENT).await?;
             println!("connected");
             if hello {
@@ -418,6 +418,21 @@ fn main() -> anyhow::Result<()> {
                     Ok(Err(e)) => { println!("error: {e:#}"); break; }
                     Err(_) => println!("(nothing for 8s)"),
                 }
+            }
+            Ok(())
+        });
+    }
+
+    // Read-only: the sticker tray and the first pack's stickers (counts only).
+    if std::env::args().nth(1).as_deref() == Some("debug-stickers") {
+        let cookies = Cookies::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        return tokio::runtime::Runtime::new()?.block_on(async {
+            let s = session::Session::connect(cookies).await?;
+            let packs = s.sticker_packs().await?;
+            println!("{} packs; thumbnails present: {}", packs.len(), packs.iter().filter(|p| p.thumbnail.starts_with("http")).count());
+            if let Some(first) = packs.first() {
+                let stickers = s.sticker_pack(&first.id).await?;
+                println!("first pack: {} stickers, images present: {}", stickers.len(), stickers.iter().filter(|s| s.image.starts_with("http")).count());
             }
             Ok(())
         });
