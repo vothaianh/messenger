@@ -591,6 +591,17 @@ impl Store {
                 );
             }
             if known.contains(&m.id) {
+                // A label restored earlier and now known better: a call card
+                // first shown as "📷 Photo".
+                if m.attachments.is_empty() && !m.text.is_empty() {
+                    if let Some(old) = self.messages.get_mut(&thread_key).and_then(|v| v.iter_mut().find(|x| x.id == m.id)) {
+                        if old.attachments.is_empty() && is_media_label(&old.text) && old.text != m.text {
+                            old.text = m.text;
+                            added += 1;
+                        }
+                    }
+                    continue;
+                }
                 // A photo first restored as a "📷 Photo" label, now with its picture.
                 if !m.attachments.is_empty() {
                     if let Some(old) = self.messages.get_mut(&thread_key).and_then(|v| v.iter_mut().find(|x| x.id == m.id)) {

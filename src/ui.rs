@@ -976,10 +976,18 @@ fn web_probe(ctx: &egui::Context) {
     let (stage, id, since) = PROBE.get();
     match stage {
         0 => {
-            crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
+            if std::env::var("MESSENGER_WEB_PROBE").as_deref() != Ok("media") {
+                crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
+            }
             PROBE.set((1, 0, Some(Instant::now())));
         }
-        1 if crate::macos::web_loaded() && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(8)) => {
+        // The media probe reads the chat the history job opened instead.
+        1 if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("media") && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(40)) => {
+            if let Some(id) = crate::macos::web_call(MEDIA_PROBE_JS) {
+                PROBE.set((2, id, since));
+            }
+        }
+        1 if std::env::var("MESSENGER_WEB_PROBE").as_deref() != Ok("media") && crate::macos::web_loaded() && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(8)) => {
             let body = if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("restore") { RESTORE_PROBE_JS } else if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("media") { MEDIA_PROBE_JS } else { r#"
                 const out = {path: location.pathname, hasRequire: typeof require};
                 try { out.vesta = Object.keys(require('VestaClient')); } catch (e) { out.vestaErr = String(e).slice(0, 80); }
@@ -1047,15 +1055,23 @@ const OPEN_THREAD_JS: &str = r#"
 /// Read-only probe (`MESSENGER_WEB_PROBE=media`): where the web keeps the
 /// keys of encrypted media. Database, store and field names only, no content.
 const MEDIA_PROBE_JS: &str = r#"
-    const want = ['MAWGetAttachmentThumbnailBlob', 'MAWFetchAndPersistMedia', 'MWMediaManager', 'MAWDownloadMediaInWorker'];
-    const out = {};
-    for (const src of Array.from(document.scripts).map((s) => s.src).filter(Boolean)) {
+    // Run with the hidden page on an encrypted chat (the app opens the
+    // selected one). Table and field names only.
+    await new Promise((ok) => setTimeout(ok, 20000));
+    const I64 = require('I64');
+    const ReQL = require('ReQL');
+    const db = await require('LSDatabaseSingleton').getLSDatabaseSingletonPromiseOrValue();
+    const str = (v) => v == null ? null : (Array.isArray(v) ? I64.to_string(v) : String(v));
+    const key = (location.pathname.match(/\/t\/(\d+)/) || [])[1];
+    const msgs = (await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables.messages))).filter((r) => str(r.threadKey) === key);
+    const ids = new Set(msgs.map((m) => m.messageId));
+    const out = { path: location.pathname, messages: msgs.length, tables: {}, msgFields: {} };
+    for (const m of msgs) for (const k of Object.keys(m)) if (m[k] != null && m[k] !== '' && m[k] !== false) out.msgFields[k] = (out.msgFields[k] || 0) + 1;
+    for (const name of Object.keys(db.tables)) {
         try {
-            const t = await (await fetch(src)).text();
-            for (const w of want) {
-                const i = t.indexOf('__d("' + w + '"');
-                if (i >= 0 && !out[w]) out[w] = t.slice(i, i + 2500);
-            }
+            const rows = await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables[name]));
+            const hit = rows.filter((r) => r && (ids.has(r.messageId) || ids.has(r.message_id)));
+            if (hit.length && name !== 'messages') out.tables[name] = { rows: hit.length, fields: Object.keys(hit[0]) };
         } catch (e) {}
     }
     return JSON.stringify(out);
@@ -1076,15 +1092,17 @@ const READ_THREAD_JS: &str = r#"
         if (!vault || !vault.isVaulted(v)) return v;
         try { const t = await vault.unvault(v); return typeof t === 'string' ? t : ''; } catch (e) { return ''; }
     };
-    // Scroll the open chat's message list to the top, like a user reading
-    // back, so the web loads (and restores) older messages for the next read.
+    // Scroll the open chat's message list back, like a user reading, so the
+    // web loads (and restores) older messages and media for the next read.
     try {
         const root = document.querySelector('[role="main"]') || document.body;
         let list = null;
         for (const el of root.querySelectorAll('div')) {
             if (el.scrollHeight > el.clientHeight + 100 && /auto|scroll/.test(getComputedStyle(el).overflowY) && (!list || el.scrollHeight > list.scrollHeight)) list = el;
         }
-        if (list) list.scrollTop = 0;
+        // One screen per read: the web restores a message's media when it
+        // renders it, so every message has to pass through view.
+        if (list) list.scrollTop = Math.max(0, list.scrollTop - list.clientHeight * 0.8);
     } catch (e) {}
     const rows = (await all(db.tables.messages)).filter((r) => str(r.threadKey) === threadKey);
     const ids = new Set(rows.map((r) => r.messageId));
@@ -1119,7 +1137,8 @@ const READ_THREAD_JS: &str = r#"
     const attachments = [];
     for (const a of atts) {
         attachments.push({ id: a.messageId, mime: a.previewUrlMimeType || '', preview: await open(a.previewUrl), w: str(a.previewWidth), h: str(a.previewHeight), title: await open(a.titleText), thumb: await thumbnail(a),
-            media: typeof a.attachmentFbid === 'string' && a.attachmentFbid !== '' && !/^\d+$/.test(a.attachmentFbid) });
+            media: typeof a.attachmentFbid === 'string' && a.attachmentFbid !== '' && !/^\d+$/.test(a.attachmentFbid),
+            xma: !!a.hasXma, cta: typeof a.defaultCtaType === 'string' ? a.defaultCtaType : '' });
     }
     return JSON.stringify({ messages, attachments });
 "#;
@@ -1175,13 +1194,38 @@ fn parse_restored(json: &str) -> Vec<Message> {
                 height: num(&a["h"]) as f32,
             });
         } else if m.text.is_empty() {
-            m.text = if mime.starts_with("video") { "🎬 Video".into() } else { "📷 Photo".into() };
+            m.text = restored_label(a, mime);
         }
     }
     // Nothing to show yet (text the page couldn't open): skip it, a later
     // read may have it.
     out.retain(|m| !m.text.is_empty() || !m.attachments.is_empty() || m.unsent);
     out
+}
+
+/// What to show for a restored attachment the app can't display. Calls are
+/// share cards (XMA) whose default action is `xma_rtc_*`; their title (e.g.
+/// "Video call ended") is used when the page could open it.
+fn restored_label(a: &serde_json::Value, mime: &str) -> String {
+    let cta = a["cta"].as_str().unwrap_or_default();
+    let title = a["title"].as_str().unwrap_or_default().trim();
+    if cta.starts_with("xma_rtc") {
+        if !title.is_empty() && !crate::store::is_secure_text_token(title) {
+            return format!("📞 {title}");
+        }
+        let video = cta.contains("video");
+        return match (cta.contains("missed"), video) {
+            (true, true) => "📞 Missed video call",
+            (true, false) => "📞 Missed call",
+            (false, true) => "📞 Video call",
+            (false, false) => "📞 Audio call",
+        }
+        .into();
+    }
+    if a["xma"].as_bool() == Some(true) {
+        return if title.is_empty() || crate::store::is_secure_text_token(title) { "🔗 Shared link".into() } else { format!("🔗 {title}") };
+    }
+    if mime.starts_with("video") { "🎬 Video".into() } else { "📷 Photo".into() }
 }
 
 /// Save a restored photo (a `data:image/...;base64,` URL from the web) to
