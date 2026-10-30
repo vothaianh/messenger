@@ -132,6 +132,9 @@ pub struct Store {
     /// Reactions for messages we don't have yet (a sync can list them before
     /// the message): message id -> (actor -> emoji, "" = removed).
     pending_reactions: HashMap<String, BTreeMap<i64, String>>,
+    /// Share cards' links by message id: the card's button (CTA) can arrive
+    /// before its message and attachment.
+    share_links: HashMap<String, String>,
     /// thread key -> (contact id -> delivered watermark ms)
     pub delivered_receipts: HashMap<i64, HashMap<i64, i64>>,
     /// Per-chat nicknames: thread -> (contact -> nickname).
@@ -379,6 +382,15 @@ impl Store {
         }
     }
 
+    /// Give a message's share cards the link their button points to.
+    fn link_shares(&self, message_id: &str, attachments: &mut [Attachment]) {
+        if let Some(link) = self.share_links.get(message_id) {
+            if let Some(a) = attachments.iter_mut().find(|a| a.kind == AttachmentKind::Link && a.url.is_empty()) {
+                a.url = link.clone();
+            }
+        }
+    }
+
     fn insert_message(&mut self, mut msg: Message) {
         if let Some(pending) = self.pending_reactions.remove(&msg.id) {
             for (actor, emoji) in pending {
@@ -389,6 +401,7 @@ impl Store {
                 }
             }
         }
+        let (thread_key, id) = (msg.thread_key, msg.id.clone());
         let list = self.messages.entry(msg.thread_key).or_default();
         // Replace an optimistic copy (same otid) or an earlier version (same id).
         if let Some(existing) = list
@@ -407,6 +420,18 @@ impl Store {
         } else {
             let pos = list.partition_point(|m| m.timestamp_ms <= msg.timestamp_ms);
             list.insert(pos, msg);
+        }
+        self.link_message_shares(thread_key, &id);
+    }
+
+    fn link_message_shares(&mut self, thread: i64, message_id: &str) {
+        if !self.share_links.contains_key(message_id) {
+            return;
+        }
+        let Some(mut atts) = self.find_message_mut(Some(thread), message_id).map(|m| std::mem::take(&mut m.attachments)) else { return };
+        self.link_shares(message_id, &mut atts);
+        if let Some(m) = self.find_message_mut(Some(thread), message_id) {
+            m.attachments = atts;
         }
     }
 
@@ -519,7 +544,10 @@ impl Store {
             }
             Content2::None | Content2::Unsupported => {}
         }
-        if !ev.from_me && self.initial_sync_done && matches!(ev.decoded.content, Content2::Text { .. } | Content2::Link { .. } | Content2::Media { .. }) {
+        // Every E2EE message counts as seen, also the ones replayed from disk
+        // at startup, so a redelivered copy doesn't notify again.
+        let fresh = self.seen_ids.insert(ev.id.clone());
+        if !ev.from_me && self.initial_sync_done && fresh && matches!(ev.decoded.content, Content2::Text { .. } | Content2::Link { .. } | Content2::Media { .. }) {
             self.new_incoming.push((thread_key, ev.id.clone()));
         }
         true
@@ -871,12 +899,16 @@ impl Store {
                 // for a link, "xma_open_native" for a post), 9 where it goes.
                 let kind = c.arg(7).string();
                 let target = c.arg(9).string();
+                if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                    let host = url::Url::parse(&target).ok().and_then(|u| u.host_str().map(str::to_string));
+                    let found = self.find_message_mut(None, &c.arg(5).string()).is_some();
+                    eprintln!("[cta] kind={kind:?} target_host={host:?} message_loaded={found}");
+                }
                 if matches!(kind.as_str(), "xma_web_url" | "xma_open_native") && target.starts_with("http") {
-                    let target = unwrap_redirect(&target);
-                    if let Some(m) = self.find_message_mut(None, &c.arg(5).string()) {
-                        if let Some(a) = m.attachments.iter_mut().find(|a| a.kind == AttachmentKind::Link && a.url.is_empty()) {
-                            a.url = target;
-                        }
+                    let mid = c.arg(5).string();
+                    self.share_links.insert(mid.clone(), unwrap_redirect(&target));
+                    if let Some(thread) = self.find_message_mut(None, &mid).map(|m| m.thread_key) {
+                        self.link_message_shares(thread, &mid);
                     }
                 }
             }
@@ -997,6 +1029,8 @@ impl Store {
             if !m.attachments.iter().any(|a| key(a) == key(&att)) {
                 m.attachments.push(att);
             }
+            let (thread, id) = (m.thread_key, m.id.clone());
+            self.link_message_shares(thread, &id);
         }
     }
 }

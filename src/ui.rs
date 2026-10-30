@@ -2632,8 +2632,20 @@ impl MessengerApp {
             return parts.pop().unwrap();
         }
 
+        // A shared link's message text is the link itself: the fallback for a
+        // card whose button (with the link) never reached us.
+        let text_link = {
+            let t = m.text.trim();
+            ((t.starts_with("http://") || t.starts_with("https://")) && !t.contains(char::is_whitespace)).then_some(t)
+        };
         for a in &m.attachments {
-            parts.push(attachment(ui, a, fill, radius));
+            match text_link {
+                Some(link) if a.kind == AttachmentKind::Link && a.url.is_empty() => {
+                    let a = Attachment { url: link.to_string(), ..a.clone() };
+                    parts.push(attachment(ui, &a, fill, radius));
+                }
+                _ => parts.push(attachment(ui, a, fill, radius)),
+            }
         }
 
         if m.attachments.is_empty() && m.sticker_id.is_some() && m.text.is_empty() {
@@ -3115,6 +3127,17 @@ impl MessengerApp {
                 continue;
             }
             let Some(m) = store.messages.get(&thread).and_then(|v| v.iter().find(|m| m.id == mid)) else { continue };
+            // Already read (on another device), or old: messages queued while
+            // the app was closed or a socket was reconnecting arrive again
+            // later, and pinging for them reads as a stale notification.
+            let age_s = (crate::store::now_ms() - m.timestamp_ms) / 1000;
+            let read = m.timestamp_ms <= t.last_read_ms;
+            if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                eprintln!("[notify] e2ee={} age={age_s}s read={read}", t.e2ee);
+            }
+            if read || age_s > 180 {
+                continue;
+            }
             let body = if m.text.is_empty() { "Sent an attachment".to_string() } else { m.text.clone() };
             let title = if t.is_group() {
                 format!("{} — {}", store.member_name(thread, m.sender_id), store.thread_title(t))
