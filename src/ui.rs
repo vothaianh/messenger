@@ -1944,24 +1944,38 @@ impl MessengerApp {
             self.editing = None;
             self.draft.clear();
         }
-        resp.context_menu(|ui| {
-            if ui.button("Mark as read").clicked() {
-                cmds.push(Command::MarkRead { thread: t.key });
-                ui.close();
+        // Right-click: a native menu (drawn as Liquid Glass by macOS).
+        if resp.secondary_clicked() {
+            use crate::macos::MenuEntry;
+            const MUTE: [(&str, i64); 5] = [("For 15 minutes", 15), ("For 1 hour", 60), ("For 8 hours", 480), ("For 24 hours", 1440), ("Until I turn it back on", -1)];
+            let mut entries = vec![
+                MenuEntry::Item { title: "Mark as read".into(), symbol: "checkmark.circle" },
+                MenuEntry::Submenu {
+                    title: "Mute notifications".into(),
+                    symbol: "bell.slash",
+                    entries: MUTE.iter().map(|(label, _)| MenuEntry::Choice { title: (*label).into(), checked: false }).collect(),
+                },
+            ];
+            if t.muted {
+                entries.push(MenuEntry::Item { title: "Unmute".into(), symbol: "bell" });
             }
-            ui.menu_button("Mute notifications", |ui| {
-                for (label, minutes) in [("For 15 minutes", Some(15)), ("For 1 hour", Some(60)), ("For 8 hours", Some(480)), ("For 24 hours", Some(1440)), ("Until I turn it back on", Some(-1))] {
-                    if ui.button(label).clicked() {
-                        cmds.push(Command::Mute { thread: t.key, minutes });
-                        ui.close();
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::Item { title: "Archive chat".into(), symbol: "archivebox" });
+            let unmute = if t.muted { Some(MUTE.len() + 1) } else { None };
+            let archive = MUTE.len() + 1 + usize::from(t.muted);
+            match crate::macos::popup_menu(&entries) {
+                Some(0) => cmds.push(Command::MarkRead { thread: t.key }),
+                Some(i) if (1..=MUTE.len()).contains(&i) => cmds.push(Command::Mute { thread: t.key, minutes: Some(MUTE[i - 1].1) }),
+                Some(i) if Some(i) == unmute => cmds.push(Command::Mute { thread: t.key, minutes: None }),
+                Some(i) if i == archive => {
+                    cmds.push(Command::Archive { thread: t.key });
+                    if self.selected == Some(t.key) {
+                        self.selected = None;
                     }
                 }
-            });
-            if t.muted && ui.button("Unmute").clicked() {
-                cmds.push(Command::Mute { thread: t.key, minutes: None });
-                ui.close();
+                _ => {}
             }
-        });
+        }
     }
 
     fn conversation(&mut self, ui: &mut egui::Ui, store: &Store, thread: &Thread, cmds: &mut Vec<Command>) {
@@ -3195,7 +3209,7 @@ impl MessengerApp {
         let incoming = std::mem::take(&mut store.new_incoming);
         for (thread, mid) in incoming {
             let Some(t) = store.threads.get(&thread) else { continue };
-            if t.muted || (self.focused && self.selected == Some(thread)) {
+            if t.muted || !t.in_inbox() || (self.focused && self.selected == Some(thread)) {
                 continue;
             }
             let Some(m) = store.messages.get(&thread).and_then(|v| v.iter().find(|m| m.id == mid)) else { continue };
@@ -3221,7 +3235,7 @@ impl MessengerApp {
     }
 
     fn update_dock_badge(&self, store: &Store) {
-        let unread = store.threads.values().filter(|t| t.unread() && !t.muted).count();
+        let unread = store.threads.values().filter(|t| t.unread() && !t.muted && t.in_inbox()).count();
         crate::macos::set_dock_badge(unread);
     }
 }

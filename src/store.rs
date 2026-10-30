@@ -39,9 +39,16 @@ pub struct Thread {
     /// End-to-end encrypted chat (sync group 95). Messages need the Signal
     /// transport, which this client doesn't implement yet.
     pub e2ee: bool,
+    /// The thread's folder (`deleteThenInsertThread` / `upsertThread` arg
+    /// 10): "inbox", or "archived" once hidden; empty when unknown.
+    pub folder: String,
 }
 
 impl Thread {
+    /// Shown in the chat list: the inbox (or a folder we haven't been told).
+    pub fn in_inbox(&self) -> bool {
+        self.folder.is_empty() || self.folder == "inbox"
+    }
     pub fn unread(&self) -> bool {
         self.last_activity_ms > self.last_read_ms
     }
@@ -314,7 +321,7 @@ impl Store {
     }
 
     pub fn sorted_threads(&self) -> Vec<&Thread> {
-        let mut v: Vec<_> = self.threads.values().collect();
+        let mut v: Vec<_> = self.threads.values().filter(|t| t.in_inbox()).collect();
         v.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
         v
     }
@@ -691,6 +698,34 @@ impl Store {
         for c in calls {
             self.apply_one(c);
         }
+        self.hide_missing_from_snapshot(calls);
+    }
+
+    /// A mailbox snapshot (database 1 from no cursor) lists the inbox's newest
+    /// chats. A cached regular chat newer than the oldest one listed but not
+    /// in it has left the inbox (hidden while we weren't listening).
+    fn hide_missing_from_snapshot(&mut self, calls: &[Call]) {
+        let snapshot = calls.iter().any(|c| {
+            c.name == "executeFirstBlockForSyncTransactionV4" && c.arg(0).int() == 1 && c.arg(2).str().is_none_or(str::is_empty)
+        });
+        if !snapshot {
+            return;
+        }
+        let listed: Vec<(i64, i64)> = calls
+            .iter()
+            .filter(|c| c.name == "deleteThenInsertThread")
+            .map(|c| (c.arg(7).int(), c.arg(0).int()))
+            .collect();
+        let Some(oldest) = listed.iter().map(|(_, ts)| *ts).min() else { return };
+        let keys: HashSet<i64> = listed.iter().map(|(k, _)| *k).collect();
+        for t in self.threads.values_mut() {
+            if !t.e2ee && t.in_inbox() && t.last_activity_ms > oldest && !keys.contains(&t.key) {
+                if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                    eprintln!("[folder] a cached chat isn't in the inbox snapshot: hidden");
+                }
+                t.folder = "archived".into();
+            }
+        }
     }
 
     fn apply_one(&mut self, c: &Call) {
@@ -714,6 +749,9 @@ impl Store {
                     t.picture = p.to_string();
                 }
                 t.thread_type = c.arg(9).int();
+                if let Some(f) = c.arg(10).str().filter(|f| !f.is_empty()) {
+                    t.folder = f.to_string();
+                }
                 t.e2ee = c.arg(83).int() == 95 || t.thread_type == 15;
             }
             "deleteThenInsertThread" => {
@@ -726,6 +764,10 @@ impl Store {
                 t.name = c.arg(3).string();
                 t.picture = c.arg(4).string();
                 t.thread_type = c.arg(9).int();
+                // (..., 10 folderName, 35 parentThreadKey, ...): an archived chat
+                // has no folder name and parent -10, like the web's
+                // LSMoveThreadToArchivedFolder writes.
+                t.folder = if c.arg(35).int() == -10 { "archived".into() } else { c.arg(10).string() };
                 // (..., 31 customEmoji, ...)
                 t.emoji = c.arg(31).string();
                 t.has_more_before = true;
@@ -748,6 +790,18 @@ impl Store {
             "updateThreadMuteSetting" => {
                 if let Some(t) = self.threads.get_mut(&c.arg(0).int()) {
                     t.muted = c.arg(1).int() != 0;
+                }
+            }
+            // Hiding a chat archives it; a new message or unhiding brings it back.
+            // A chat moved to the E2EE cutover folder continues as an encrypted one.
+            "moveThreadToArchivedFolder" | "moveThreadToInboxAndUpdateParent" | "moveThreadToE2EECutoverFolder" => {
+                if let Some(t) = self.threads.get_mut(&c.arg(0).int()) {
+                    t.folder = match c.name.as_str() {
+                        "moveThreadToArchivedFolder" => "archived",
+                        "moveThreadToInboxAndUpdateParent" => "inbox",
+                        _ => "e2ee_cutover",
+                    }
+                    .to_string();
                 }
             }
             "deleteThread" => {

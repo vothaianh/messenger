@@ -47,6 +47,8 @@ one small native app (about 20 MB) that opens instantly with your recent chats.
 - Older history loads automatically as you scroll up
 - Unread count on the Dock icon, and native macOS notifications that skip muted
   and open chats
+- Right-click a chat for a native menu: mark as read, mute or unmute, archive.
+  Archived chats stay out of the inbox, like on the web
 
 ### Messaging
 - Send text, emoji and the chat's quick emoji (👍 or the group's own)
@@ -199,7 +201,7 @@ Verified against the live web app (October 2026):
   stickers. A sticker is sent with task 46, `send_type` 2 and `sticker_id`.
 - Task labels (from the open-source mautrix-meta and the web client): 46 send,
   21 read, 29 react, 33 unsend, 742 edit, 228 fetch messages, 145 fetch
-  threads, 144 mute; typing is request type 4, label 3. Reactions (29, queue
+  threads, 144 mute, 146 remove thread (archive); typing is request type 4, label 3. Reactions (29, queue
   `reaction:<message id>`) go on a DGW stream; over HTTP they fail. Uploads go to
   `ajax/mercury/upload.php` with the web client's browser headers.
 

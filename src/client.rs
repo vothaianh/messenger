@@ -50,6 +50,8 @@ pub enum Command {
     SendSticker { thread: i64, sticker_id: i64, image: String, label: String },
     LoadMoreThreads,
     Mute { thread: i64, minutes: Option<i64> },
+    /// Archive (hide) a chat, like the web's "Archive chat".
+    Archive { thread: i64 },
 }
 
 #[derive(Default)]
@@ -1163,6 +1165,20 @@ impl Conn {
                 // encrypted chats live in database 95.
                 let p = json!({"thread_key": thread, "mailbox_type": 0, "mute_expire_time_ms": expire, "sync_group": if e2ee { 95 } else { 1 }});
                 self.tasks(vec![("144", p, thread.to_string())])
+            }
+            Command::Archive { thread } => {
+                // The web's LSOptimisticRemoveThread: task 146 on the thread's
+                // queue, remove type 1 (LSThreadRemoveType.ARCHIVE_THREAD).
+                let e2ee = {
+                    let mut st = self.shared.store.lock().unwrap();
+                    st.threads.get_mut(&thread).map_or(false, |t| {
+                        t.folder = "archived".into();
+                        t.e2ee
+                    })
+                };
+                (self.repaint)();
+                let p = json!({"thread_key": thread, "remove_type": 1, "sync_group": if e2ee { 95 } else { 1 }});
+                self.tasks(vec![("146", p, thread.to_string())])
             }
         }))
     }

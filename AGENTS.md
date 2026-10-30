@@ -2,6 +2,10 @@
 
 Notes for coding agents working on Messenger Desktop (native Rust macOS client).
 
+## Release
+
+When I say "release" that means release, commit and push it
+
 ## After every change to the app
 
 Rebuild the bundle, then quit the running app and relaunch it yourself. Don't
