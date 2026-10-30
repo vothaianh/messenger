@@ -24,6 +24,9 @@ pub fn run() -> Result<()> {
         .with_user_agent(USER_AGENT)
         .build(&window)?;
 
+    // After an expired session the web view may still hold the old cookies;
+    // only a new `xs` means the user logged in again.
+    let stale_xs = Cookies::load().and_then(|c| c.get("xs").map(str::to_owned));
     let mut last_check = Instant::now();
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(500));
@@ -41,7 +44,7 @@ pub fn run() -> Result<()> {
                     .collect::<Vec<_>>()
                     .join("; ");
                 let cookies = Cookies(header);
-                if cookies.is_logged_in() {
+                if cookies.is_logged_in() && cookies.get("xs") != stale_xs.as_deref() {
                     if let Err(e) = cookies.save() {
                         eprintln!("{e:#}");
                         std::process::exit(1);

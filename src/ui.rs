@@ -173,6 +173,8 @@ pub struct MessengerApp {
     /// The PIN restore succeeded once (kept): encrypted chats then fetch
     /// their restored history from the hidden web engine.
     history_restored: bool,
+    /// The login window was opened for an expired session (once per run).
+    login_opened: bool,
     /// Encrypted chats whose restored history was fetched this run, and the
     /// one being fetched.
     history_fetched: HashSet<i64>,
@@ -250,6 +252,7 @@ impl MessengerApp {
             sticker_store: false,
             pin_restore: None,
             history_restored: stored("history_restored").is_some_and(|v| v == "true"),
+            login_opened: false,
             history_fetched: HashSet::new(),
             history_job: None,
             restore_check: None,
@@ -1286,8 +1289,11 @@ impl MessengerApp {
                 ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
             }
             if let Status::LoggedOut(_) = status {
-                if ui.button("Log in").clicked() {
-                    relaunch_with_login();
+                // Open the login window right away; the button reopens it if
+                // the user closed it.
+                if !self.login_opened || ui.button("Log in").clicked() {
+                    self.login_opened = true;
+                    open_login_window();
                 }
             }
             if let Some(e) = err {
@@ -3237,6 +3243,19 @@ fn long_time(ms: i64) -> String {
     } else {
         dt.format("%d %b %Y, %H:%M").to_string()
     }
+}
+
+/// Expired session: show the login window (a child process) over the app.
+/// Once it saves fresh cookies the app relaunches with them; if the user
+/// closes it, the old cookies stay and the "Log in" button reopens it.
+fn open_login_window() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    std::thread::spawn(move || {
+        if std::process::Command::new(&exe).arg("login").status().is_ok_and(|s| s.success()) {
+            let _ = std::process::Command::new(exe).spawn();
+            std::process::exit(0);
+        }
+    });
 }
 
 fn relaunch_with_login() {
