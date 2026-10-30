@@ -52,6 +52,27 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Offline, read-only: the shape of received encrypted media (no content,
+    // no keys): is the file reference there, is it in the cache.
+    if std::env::args().nth(1).as_deref() == Some("debug-e2ee-media") {
+        use base64::Engine;
+        for rec in e2ee_listen::read_inbox() {
+            let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&rec.plaintext) else { continue };
+            let Ok(d) = armadillo::decode(&raw) else { continue };
+            if let armadillo::Content2::Media { kind, file, .. } = &d.content {
+                match file {
+                    None => println!("{} {kind:?}: no file reference", rec.timestamp),
+                    Some(f) => println!(
+                        "{} {kind:?}: path {} key {} sha {} enc {} mime {:?} cached {}",
+                        rec.timestamp, !f.direct_path.is_empty(), f.media_key.len(), f.file_sha256.len(), f.file_enc_sha256.len(), f.mimetype,
+                        e2ee_media::cached_path(f).is_some_and(|p| p.exists()),
+                    ),
+                }
+            }
+        }
+        return Ok(());
+    }
+
     // Diagnostics: bootstrap + one Lightspeed sync, printing a summary.
     if std::env::args().nth(1).as_deref() == Some("debug-sync") {
         let cookies = Cookies::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;

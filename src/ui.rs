@@ -329,7 +329,9 @@ impl MessengerApp {
                             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                             let atts = v["attachments"].as_array().map_or(0, Vec::len);
                             let thumbs = v["attachments"].as_array().map_or(0, |l| l.iter().filter(|a| a["thumb"].as_str().is_some_and(|t| !t.is_empty())).count());
-                            eprintln!("[history] read: {} messages, {atts} attachments, {thumbs} pictures", v["messages"].as_array().map_or(0, Vec::len));
+                            let media = v["attachments"].as_array().map_or(0, |l| l.iter().filter(|a| a["media"].as_bool() == Some(true)).count());
+                            let span = v["messages"].as_array().map(|l| l.iter().filter_map(|m| m["ts"].as_str()?.parse::<i64>().ok()).fold((i64::MAX, 0), |(lo, hi), t| (lo.min(t), hi.max(t))));
+                            eprintln!("[history] read: {} messages {span:?}, {atts} attachments, {media} encrypted media, {thumbs} pictures", v["messages"].as_array().map_or(0, Vec::len));
                         }
                         let restored = parse_restored(&text);
                         let added = self.shared.store.lock().unwrap().add_restored(job.thread, restored);
@@ -1074,6 +1076,16 @@ const READ_THREAD_JS: &str = r#"
         if (!vault || !vault.isVaulted(v)) return v;
         try { const t = await vault.unvault(v); return typeof t === 'string' ? t : ''; } catch (e) { return ''; }
     };
+    // Scroll the open chat's message list to the top, like a user reading
+    // back, so the web loads (and restores) older messages for the next read.
+    try {
+        const root = document.querySelector('[role="main"]') || document.body;
+        let list = null;
+        for (const el of root.querySelectorAll('div')) {
+            if (el.scrollHeight > el.clientHeight + 100 && /auto|scroll/.test(getComputedStyle(el).overflowY) && (!list || el.scrollHeight > list.scrollHeight)) list = el;
+        }
+        if (list) list.scrollTop = 0;
+    } catch (e) {}
     const rows = (await all(db.tables.messages)).filter((r) => str(r.threadKey) === threadKey);
     const ids = new Set(rows.map((r) => r.messageId));
     const atts = (await all(db.tables.attachments)).filter((a) => ids.has(a.messageId));
@@ -1106,7 +1118,8 @@ const READ_THREAD_JS: &str = r#"
     };
     const attachments = [];
     for (const a of atts) {
-        attachments.push({ id: a.messageId, mime: a.previewUrlMimeType || '', preview: await open(a.previewUrl), w: str(a.previewWidth), h: str(a.previewHeight), title: await open(a.titleText), thumb: await thumbnail(a) });
+        attachments.push({ id: a.messageId, mime: a.previewUrlMimeType || '', preview: await open(a.previewUrl), w: str(a.previewWidth), h: str(a.previewHeight), title: await open(a.titleText), thumb: await thumbnail(a),
+            media: typeof a.attachmentFbid === 'string' && a.attachmentFbid !== '' && !/^\d+$/.test(a.attachmentFbid) });
     }
     return JSON.stringify({ messages, attachments });
 "#;
