@@ -859,3 +859,24 @@ pub fn clear_web_data(then: impl Fn() + 'static) {
         store.removeDataOfTypes_modifiedSince_completionHandler(&types, &objc2_foundation::NSDate::distantPast(), &RcBlock::new(then));
     }
 }
+
+/// A press on a drawn titlebar strip: hand the mouse-down straight to AppKit,
+/// which moves the window with the pointer from the first pixel (like a real
+/// titlebar), or zooms it on a double click. Returns false when the current
+/// event isn't that mouse-down (the caller then falls back to egui's drag).
+pub fn titlebar_mouse_down() -> bool {
+    use objc2_app_kit::NSEventType;
+    let Some(mtm) = MainThreadMarker::new() else { return false };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(event) = app.currentEvent() else { return false };
+    if event.r#type() != NSEventType::LeftMouseDown {
+        return false;
+    }
+    let Some(window) = event.window(mtm).or_else(|| app.mainWindow()) else { return false };
+    if event.clickCount() >= 2 {
+        window.performZoom(None);
+    } else {
+        window.performWindowDragWithEvent(&event);
+    }
+    true
+}

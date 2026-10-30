@@ -2894,6 +2894,11 @@ fn group_corners(mine: bool, first: bool, last: bool) -> CornerRadius {
 /// double-click toggles maximize like a native titlebar.
 fn titlebar_drag(ui: &mut egui::Ui, rect: Rect) {
     let r = ui.interact(rect, ui.scope_id().with("titlebar_drag"), Sense::click_and_drag());
+    // Move the window natively from the press: egui's drag only starts after
+    // the pointer has moved a few points, so the window lagged behind it.
+    if r.hovered() && ui.input(|i| i.pointer.primary_pressed()) && crate::macos::titlebar_mouse_down() {
+        return;
+    }
     if r.drag_started() {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
