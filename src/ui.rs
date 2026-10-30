@@ -1205,12 +1205,16 @@ fn parse_restored(json: &str) -> Vec<Message> {
     out
 }
 
-/// A call length like the phone shows it: "4 min 26 sec", "1 hr 3 min", "12 sec".
+fn secs_word(s: i64) -> &'static str {
+    if s == 1 { "sec" } else { "secs" }
+}
+
+/// A call length like the phone shows it: "4 min 26 secs", "1 hr 3 min", "12 secs".
 fn call_duration(secs: i64) -> String {
     let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
     match (h, m) {
-        (0, 0) => format!("{s} sec"),
-        (0, _) => format!("{m} min {s} sec"),
+        (0, 0) => format!("{s} {}", secs_word(s)),
+        (0, _) => format!("{m} min {s} {}", secs_word(s)),
         _ => format!("{h} hr {m} min"),
     }
 }
@@ -1243,7 +1247,12 @@ fn restored_label(a: &serde_json::Value, mime: &str) -> String {
     // `call_type` (video/audio), `call_state`, `call_duration_sec`.
     let call = serde_json::from_str::<serde_json::Value>(a["dataclass"].as_str().unwrap_or("{}")).ok().map(|v| v["content"]["custom_template_data"].clone()).filter(|c| c.is_object());
     if let Some(c) = call.filter(|_| cta.starts_with("xma_rtc")) {
-        let video = c["call_type"].as_str().map_or(cta.contains("video"), |t| t.contains("video"));
+        // Values are upper case on some cards ("VIDEO"), so compare lower case.
+        let call_type = c["call_type"].as_str().unwrap_or_default().to_lowercase();
+        let video = if call_type.is_empty() { cta.contains("video") } else { call_type.contains("video") };
+        if std::env::var_os("MESSENGER_DEBUG").is_some() {
+            eprintln!("[history] call type {:?} state {:?} cta {cta:?}", c["call_type"], c["call_state"]);
+        }
         let secs = c["call_duration_sec"].as_i64().unwrap_or(0);
         let state = c["call_state"].as_str().unwrap_or_default().to_lowercase();
         // 📹 for video, 📞 for audio; the length on its own line, like the phone.
