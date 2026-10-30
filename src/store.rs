@@ -138,6 +138,11 @@ pub struct Store {
     pub nicknames: HashMap<i64, HashMap<i64, String>>,
     pub initial_sync_done: bool,
     seen_ids: HashSet<String>,
+    /// Contacts online at the last presence check, and when (ms).
+    pub active_now: HashSet<i64>,
+    pub presence_checked_ms: i64,
+    /// Contact -> when they were last active (unix seconds).
+    pub last_active: HashMap<i64, i64>,
 }
 
 /// What's kept on disk between launches so the app shows the inbox at once
@@ -357,6 +362,10 @@ impl Store {
     /// our own reactions right away, before the server echoes them.
     pub fn set_reaction(&mut self, thread: i64, message_id: &str, actor: i64, emoji: String) {
         let thread = (thread != 0).then_some(thread);
+        if std::env::var_os("MESSENGER_DEBUG").is_some() {
+            let found = self.find_message_mut(thread, message_id).is_some();
+            eprintln!("[reaction] thread={thread:?} actor={actor} removed={} found={found}", emoji.is_empty());
+        }
         match self.find_message_mut(thread, message_id) {
             Some(m) if emoji.is_empty() => {
                 m.reactions.remove(&actor);
@@ -494,13 +503,7 @@ impl Store {
                 self.touch_thread(thread_key, ev.timestamp_ms, format!("{snippet_prefix}{label}"));
             }
             Content2::Reaction { target_id, emoji } => {
-                if let Some(m) = self.find_message_mut(Some(thread_key), target_id) {
-                    if emoji.is_empty() {
-                        m.reactions.remove(&ev.sender);
-                    } else {
-                        m.reactions.insert(ev.sender, emoji.clone());
-                    }
-                }
+                self.set_reaction(thread_key, target_id, ev.sender, emoji.clone());
             }
             Content2::Edit { target_id, text } => {
                 if let Some(m) = self.find_message_mut(Some(thread_key), target_id) {
@@ -1088,5 +1091,35 @@ mod tests {
 pub fn write_cache(bytes: &[u8]) {
     if let Some(path) = cache_path() {
         let _ = crate::e2ee_media::write_private(&path, bytes);
+    }
+}
+
+impl Store {
+    pub fn set_presence(&mut self, p: crate::session::Presence) {
+        let now = now_ms();
+        self.active_now = p.active.into_iter().collect();
+        for (id, t) in p.last_active {
+            let e = self.last_active.entry(id).or_default();
+            *e = (*e).max(t);
+        }
+        for id in &self.active_now {
+            self.last_active.insert(*id, now / 1000);
+        }
+        self.presence_checked_ms = now;
+    }
+
+    /// "Active now" / "Active 5m ago" for a contact, like Messenger's header.
+    pub fn active_status(&self, id: i64) -> Option<String> {
+        if self.active_now.contains(&id) {
+            return Some("Active now".into());
+        }
+        let secs = (now_ms() / 1000 - *self.last_active.get(&id)?).max(60);
+        let ago = match secs {
+            s if s < 3600 => format!("{}m", s / 60),
+            s if s < 86_400 => format!("{}h", s / 3600),
+            s if s < 7 * 86_400 => format!("{}d", s / 86_400),
+            _ => return None,
+        };
+        Some(format!("Active {ago} ago"))
     }
 }

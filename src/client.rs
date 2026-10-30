@@ -138,6 +138,7 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
     };
     let mut backoff = 1u64;
     let mut e2ee_started = false;
+    let mut presence_started = false;
     if !cookies.is_logged_in() {
         set_status(Status::LoggedOut("not logged in".into()));
         return;
@@ -164,6 +165,25 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
                 *st = Store::default(); // the cache belongs to another account
             }
             st.me = session.boot.fbid;
+            st.set_presence(session.boot.presence.clone());
+        }
+        if !presence_started {
+            // The page's presence snapshot goes stale: reload it every few minutes.
+            presence_started = true;
+            let (session, shared, repaint) = (session.clone(), shared.clone(), repaint.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    match session.fetch_presence().await {
+                        Ok(p) if !p.active.is_empty() || !p.last_active.is_empty() => {
+                            shared.store.lock().unwrap().set_presence(p);
+                            repaint();
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[presence] {e:#}"),
+                    }
+                }
+            });
         }
 
         set_status(Status::Syncing);
@@ -267,6 +287,8 @@ struct Conn {
     sync_streams: HashMap<u16, i64>,
     /// Sync streams still waiting for their snapshot (type 1) answer.
     snapshot_streams: std::collections::HashSet<u16>,
+    /// Streams carrying a task sent on DGW (reactions), for the debug log.
+    task_streams: std::collections::HashSet<u16>,
     /// The snapshots are in: connections now open with delta syncs.
     subscribed: bool,
     request_id: i64,
@@ -278,7 +300,7 @@ struct Conn {
 
 impl Conn {
     fn new(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) -> Self {
-        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
+        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
     }
 
     /// A Lightspeed request body (the JSON the web client sends on a DGW stream).
@@ -296,6 +318,10 @@ impl Conn {
 
     /// Wrap Lightspeed tasks (label + payload + queue) in a type-3 request.
     fn tasks(&mut self, tasks: Vec<(&str, Value, String)>) -> Vec<u8> {
+        if std::env::var_os("MESSENGER_DEBUG").is_some() {
+            let labels: Vec<&str> = tasks.iter().map(|t| t.0).collect();
+            eprintln!("[task] sending labels {labels:?}");
+        }
         let tasks: Vec<Value> = tasks
             .into_iter()
             .map(|(label, payload, queue)| {
@@ -440,6 +466,12 @@ impl Conn {
                                         reply.extend(dgw::establish(fresh));
                                         reply.extend(dgw::data(fresh, 0, &body));
                                     }
+                                } else if self.task_streams.remove(&stream) {
+                                    if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                                        eprintln!("[dgw] task answer on stream {stream}");
+                                    }
+                                    // No End here: after we closed a task stream the server
+                                    // dropped the whole connection on the next task.
                                 } else {
                                     // A request stream carries one answer; close our side.
                                     reply.extend(dgw::end(stream));
@@ -462,6 +494,9 @@ impl Conn {
                 }
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { return Ok(false) };
+                    // Reactions go on DGW like the web: over HTTP the server
+                    // fails task 29 with error 1357038.
+                    let on_dgw = matches!(cmd, Command::React { .. });
                     // Commands go over HTTP or the E2EE connection, so they don't
                     // wait for the DGW socket (they used to be dropped while it
                     // reconnected).
@@ -470,6 +505,17 @@ impl Conn {
                         // socket, the server answers and then drops the whole
                         // connection, losing live updates until we reconnect. DGW
                         // carries only the database sync streams.
+                        Ok(Some(body)) if on_dgw => {
+                            let stream = self.next_stream;
+                            self.next_stream += 1;
+                            self.task_streams.insert(stream);
+                            let mut out = dgw::establish(stream);
+                            out.extend(dgw::data(stream, 0, &body));
+                            if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                                eprintln!("[dgw] task on stream {stream}");
+                            }
+                            ws.send(out).await?;
+                        }
                         Ok(Some(body)) => match lightspeed_request(&body) {
                             Some((kind, payload)) => self.send_request_http(kind, payload),
                             None => eprintln!("[command] malformed request body"),
@@ -509,6 +555,9 @@ impl Conn {
                 names.sort();
                 names.dedup();
                 eprintln!("[ls_resp] request_id={} calls={} procs={names:?}", v.get("request_id").unwrap_or(&Value::Null), calls.len());
+                for c in calls.iter().filter(|c| c.name == "issueNewError") {
+                    eprintln!("  issueNewError {:?}", c.args);
+                }
                 if calls.len() <= 2 && ls.len() > 500 && std::env::var_os("MESSENGER_SHAPE_ONCE").is_some() {
                     // Structure only: every string literal that isn't a plain
                     // identifier (procedure names) is masked.
@@ -565,13 +614,41 @@ impl Conn {
         let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
         tokio::spawn(async move {
             // Typing (type 4) and some tasks answer with an empty payload.
-            let result = session.ls_request(kind, payload).await.and_then(|ls| if ls.trim().is_empty() { Ok(Vec::new()) } else { decode_payload(&ls) });
+            let result = session.ls_request(kind, payload).await.and_then(|ls| {
+                if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                    // The raw follow-up task (expressions the app doesn't evaluate).
+                    if let Some(i) = ls.find("\"issueNewTask\"") {
+                        let i = (i.saturating_sub(1800)..=i).find(|&j| ls.is_char_boundary(j)).unwrap_or(i);
+                        let end = (i + 2000).min(ls.len());
+                        let end = (end..ls.len()).find(|&j| ls.is_char_boundary(j)).unwrap_or(ls.len());
+                        eprintln!("  raw issueNewTask {}", &ls[i..end]);
+                    }
+                }
+                if ls.trim().is_empty() { Ok(Vec::new()) } else { decode_payload(&ls) }
+            });
             if std::env::var_os("MESSENGER_DEBUG").is_some() && kind == 3 {
                 match &result {
                     Ok(calls) => {
                         let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
                         eprintln!("[task] answer {names:?}");
                         // Shape of edit answers: strings as their length only.
+                        // The server's error for a failed task (its own wording, no message content).
+                        for c in calls.iter().filter(|c| c.name == "issueNewError") {
+                            eprintln!("  issueNewError {:?}", c.args);
+                        }
+                        // A follow-up task the server asks for: its queue, label
+                        // and payload keys (values omitted).
+                        for c in calls.iter().filter(|c| c.name == "issueNewTask") {
+                            let shape: Vec<String> = c.args.iter().map(|a| match a {
+                                crate::lightspeed::Arg::Str(s) => match serde_json::from_str::<serde_json::Value>(s) {
+                                    Ok(serde_json::Value::Object(o)) => format!("json{:?}", o.keys().collect::<Vec<_>>()),
+                                    _ if s.len() < 40 => format!("{s:?}"),
+                                    _ => format!("str({})", s.len()),
+                                },
+                                other => format!("{other:?}"),
+                            }).collect();
+                            eprintln!("  issueNewTask {shape:?}");
+                        }
                         for c in calls.iter().filter(|c| c.name == "editMessage" || c.name == "taskExists" || c.name == "removeTask") {
                             let shape: Vec<String> = c.args.iter().map(|a| match a {
                                 crate::lightspeed::Arg::Str(s) => format!("str({})", s.chars().count()),
@@ -890,15 +967,19 @@ impl Conn {
                 self.tasks(vec![("46", p, thread.to_string())])
             }
             Command::React { thread, message_id, emoji } => {
+                // Exactly what the web client sends (captured October 2026):
+                // task 29 on the queue "reaction:<message id>", with the null
+                // keys included. An empty `reaction` removes ours.
                 // Show it right away, like the web client; the server's echo agrees.
                 self.shared.store.lock().unwrap().set_reaction(thread, &message_id, me, emoji.clone());
                 (self.repaint)();
                 let p = json!({
                     "thread_key": thread, "timestamp_ms": now_ms(), "message_id": message_id,
                     "actor_id": me, "reaction": emoji, "reaction_style": null, "sync_group": 1,
-                    "send_attribution": 65537,
+                    "send_attribution": 65537, "dataclass_params": null, "attachment_fbid": null,
+                    "offline_threading_id": null,
                 });
-                let queue = json!(["reaction", message_id]).to_string();
+                let queue = format!("reaction:{message_id}");
                 self.tasks(vec![("29", p, queue)])
             }
             Command::Unsend { thread, message_id } => {
@@ -1039,17 +1120,29 @@ impl Conn {
                 return Ok(None);
             }
             Command::LoadMoreThreads => {
-                let oldest = {
-                    let st = self.shared.store.lock().unwrap();
-                    st.threads.values().min_by_key(|t| t.last_activity_ms).map(|t| (t.key, t.last_activity_ms))
-                };
-                let Some((key, ts)) = oldest else { return Ok(None) };
-                let p = json!({
-                    "is_after": 0, "parent_thread_key": 0, "reference_thread_key": key,
-                    "reference_activity_timestamp": ts, "additional_pages_to_fetch": 0,
-                    "cursor": null, "messaging_tag": null, "sync_group": 1,
-                });
-                self.tasks(vec![("145", p, "trq".into())])
+                // Like the web: task 145 per thread list, from the oldest chat
+                // loaded, with that database's current sync cursor (null makes
+                // the server fail the task) and no `messaging_tag` key.
+                // Database 1 holds regular chats, 95 encrypted ones.
+                let http_cursor = self.shared.http_cursor.lock().unwrap().clone();
+                let st = self.shared.store.lock().unwrap();
+                let mut tasks = Vec::new();
+                for (db, e2ee) in [(1, false), (95, true)] {
+                    let oldest = st.threads.values().filter(|t| t.e2ee == e2ee).min_by_key(|t| t.last_activity_ms);
+                    let Some(t) = oldest else { continue };
+                    let cursor = if db == 1 { http_cursor.clone().or_else(|| st.cursors.get(&1).cloned()) } else { st.cursors.get(&95).cloned() };
+                    let p = json!({
+                        "is_after": 0, "parent_thread_key": 0, "reference_thread_key": t.key,
+                        "reference_activity_timestamp": t.last_activity_ms, "additional_pages_to_fetch": 0,
+                        "cursor": cursor, "sync_group": db,
+                    });
+                    tasks.push(("145", p, "trq".to_string()));
+                }
+                drop(st);
+                if tasks.is_empty() {
+                    return Ok(None);
+                }
+                self.tasks(tasks)
             }
             Command::Mute { thread, minutes } => {
                 let expire = match minutes {

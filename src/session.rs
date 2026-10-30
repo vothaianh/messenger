@@ -66,6 +66,33 @@ pub struct Bootstrap {
     /// Where the page loads the Vesta (backup PIN) client module from: bx
     /// asset 72238, `"72238":{"uri":"…wasm…"}`.
     pub vesta_wasm_url: Option<String>,
+    /// Who's online and when contacts were last active, as the page had it.
+    pub presence: Presence,
+}
+
+/// The page's `AvailableListInitialData`: `activeList` (ids online now) and
+/// `lastActiveTimes` (id -> unix seconds). The web keeps it live over its
+/// realtime presence stream; we refresh it by reloading the page now and then.
+#[derive(Debug, Clone, Default)]
+pub struct Presence {
+    pub active: Vec<i64>,
+    pub last_active: std::collections::HashMap<i64, i64>,
+}
+
+pub fn parse_presence(html: &str) -> Presence {
+    let Some(i) = html.find("\"AvailableListInitialData\",[],") else { return Presence::default() };
+    let rest = &html[i + "\"AvailableListInitialData\",[],".len()..];
+    let Some(Ok(v)) = serde_json::Deserializer::from_str(rest).into_iter::<serde_json::Value>().next() else {
+        return Presence::default();
+    };
+    let id = |x: &serde_json::Value| x.as_str().and_then(|s| s.parse().ok()).or_else(|| x.as_i64());
+    Presence {
+        active: v["activeList"].as_array().map(|a| a.iter().filter_map(id).collect()).unwrap_or_default(),
+        last_active: v["lastActiveTimes"]
+            .as_object()
+            .map(|o| o.iter().filter_map(|(k, t)| Some((k.parse().ok()?, t.as_i64()?))).collect())
+            .unwrap_or_default(),
+    }
 }
 
 pub struct Session {
@@ -85,6 +112,23 @@ fn capture(html: &str, re: &str) -> Option<String> {
 }
 
 impl Session {
+    /// Reload the messages page for fresh presence (who's active, last active).
+    pub async fn fetch_presence(&self) -> Result<Presence> {
+        let html = self
+            .http
+            .get(format!("{BASE}/messages/"))
+            .header("Cookie", &self.cookies.0)
+            .header("Accept", "text/html,application/xhtml+xml")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-Dest", "document")
+            .send()
+            .await?
+            .text()
+            .await?;
+        Ok(parse_presence(&html))
+    }
+
     pub async fn connect(cookies: Cookies) -> Result<Session> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
@@ -148,12 +192,13 @@ impl Session {
         }
 
         let region = capture(&html, r#""MessengerWebRegion",\[\],\{"regionNullable":"([A-Z0-9]+)"#);
+        let presence = parse_presence(&html);
         let vesta_wasm_url = capture(&html, r#""72238":\{"uri":"([^"]+\.wasm[^"]*)""#).map(|u| u.replace("\\/", "/"));
 
         Ok(Session {
             http,
             cookies,
-            boot: Bootstrap { fbid, dtsg, lsd, ls_app_id, mqtt_app_id, mqtt_endpoint, ls_doc_id, ls_version, page_params, e2ee_cat, e2ee_app_id, region, vesta_wasm_url },
+            boot: Bootstrap { fbid, dtsg, lsd, ls_app_id, mqtt_app_id, mqtt_endpoint, ls_doc_id, ls_version, page_params, e2ee_cat, e2ee_app_id, region, vesta_wasm_url, presence },
             req_counter: Default::default(),
             device_id: uuid::Uuid::new_v4().to_string(),
         })
@@ -499,4 +544,18 @@ pub fn ls_sync_params() -> String {
         "preview_height_large": 360, "preview_width_large": 480, "scale": 2,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_presence() {
+        let html = r#"x,["AvailableListInitialData",[],{"activeList":["42","7"],"lastActiveTimes":{"42":1700000000,"9":1690000000},"chatNotif":0,"playingNow":[]},123],["Next""#;
+        let p = parse_presence(html);
+        assert_eq!(p.active, vec![42, 7]);
+        assert_eq!(p.last_active.get(&9), Some(&1690000000));
+        assert!(parse_presence("nothing").active.is_empty());
+    }
 }

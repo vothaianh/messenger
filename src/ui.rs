@@ -908,6 +908,190 @@ fn circle_action(ui: &mut egui::Ui, symbol: &str, quiet: bool, busy: bool) -> eg
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Split emoji text into single emoji: a ZWJ sequence, a flag (two regional
+/// indicators) or an emoji with its modifiers counts as one.
+fn split_emoji(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut prev_zwj = false;
+    let mut open_flag = false;
+    for c in text.trim().chars() {
+        let attaches = matches!(c, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}') || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c) || ('\u{E0020}'..='\u{E007F}').contains(&c);
+        let regional = ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+        match out.last_mut() {
+            Some(last) if attaches || prev_zwj || (regional && open_flag) => last.push(c),
+            _ => out.push(c.to_string()),
+        }
+        open_flag = regional && !open_flag;
+        prev_zwj = c == '\u{200D}';
+    }
+    out
+}
+
+/// Messenger's own artwork for an emoji, as the web client loads it
+/// (`EmojiImageURL.getEmoji3URL`): codepoints in hex joined by "_" without
+/// FE0F, at pixel ratio 3, and a one-byte checksum of that path. The pictures
+/// are Meta's, fetched at runtime and never bundled.
+fn fb_emoji_url(emoji: &str, size: u32) -> String {
+    let key = emoji.chars().filter(|&c| c != '\u{FE0F}').map(|c| format!("{:x}", c as u32)).collect::<Vec<_>>().join("_");
+    let path = format!("3/{size}/{key}.png");
+    let mut sum: u32 = 317_426_846;
+    for b in path.bytes() {
+        sum = (sum << 5).wrapping_sub(sum).wrapping_add(b as u32);
+    }
+    format!("https://static.xx.fbcdn.net/images/emoji.php/v9/t{:x}/{path}", sum & 0xff)
+}
+
+/// Paint one emoji in `rect` with Messenger's picture, or the system glyph
+/// while it loads or when Messenger has no picture for it.
+fn paint_emoji(ui: &egui::Ui, rect: Rect, emoji: &str) {
+    let size = if rect.height() > 24.0 { 32 } else { 16 };
+    let uri = fb_emoji_url(emoji, size);
+    match ui.ctx().try_load_texture(&uri, egui::TextureOptions::LINEAR, egui::SizeHint::default()) {
+        Ok(egui::load::TexturePoll::Ready { texture }) => {
+            ui.painter().image(texture.id, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        _ => {
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, emoji, egui::FontId::proportional(rect.height() * 0.85), pal().text);
+        }
+    }
+}
+
+/// The web client's emoticons (`EmoticonsList`) and the emoji they become.
+/// Messenger's own pictures for `:3`, `:v` and `(y)`-style "like" aren't
+/// Unicode emoji, so `:3` and `:v` stay text and "like" is 👍.
+const EMOTICONS: &[(&str, &str)] = &[
+    ("O:)", "😇"), ("O:-)", "😇"), ("0:)", "😇"), ("0:-)", "😇"), ("'-_-", "😓"),
+    ("o.O", "😳"), ("O_O", "😳"), ("o_o", "😳"), ("0_0", "😳"), ("O.o", "😳"),
+    (":'(", "😢"), (":'-(", "😢"), ("3:)", "😈"), ("3:-)", "😈"), (":dog:", "🐶"), ("-3-", "😚"),
+    (":(", "🙁"), (":-(", "🙁"), (":[", "🙁"), ("=(", "🙁"), (")=", "🙁"),
+    (":o", "😮"), (":-O", "😮"), (":O", "😮"), (":-o", "😮"),
+    ("=D", "😃"), (":-D", "😃"), (":D", "😃"), (">:(", "😠"), (">:-(", "😠"),
+    ("<3", "❤"), ("&lt;3", "❤"), ("^_^", "😊"), ("^~^", "😊"), (":*", "😘"), (":-*", "😘"),
+    ("(y)", "👍"), (":like:", "👍"), ("(Y)", "👍"),
+    ("T_T", "😭"), ("T-T", "😭"), ("ToT", "😭"), ("T.T", "😭"), (":-|", "😐"), (":|", "😐"),
+    ("<(\")", "🐧"), (">_<", "😣"), (">.<", "😣"), (":poop:", "💩"), (":|]", "🤖"), ("(^^^)", "🦈"),
+    (":)", "🙂"), (":-)", "🙂"), (":]", "🙂"), ("(:", "🙂"), ("=)", "😊"), ("(=", "😊"), ("-_-", "😑"),
+    ("B|", "😎"), ("8-|", "😎"), ("8|", "😎"), ("B-|", "😎"), ("B-)", "😎"), ("8-)", "😎"), ("8)", "😎"),
+    ("(n)", "👎"), ("(N)", "👎"), (":+1:", "👍"), (":thumbsup:", "👍"),
+    (":P", "😛"), (":-P", "😛"), (":-p", "😛"), (":p", "😛"), ("=P", "😛"),
+    (":/", "😕"), (":-/", "😕"), (":\\", "😕"), (":-\\", "😕"), ("=/", "😕"), ("=\\", "😕"),
+    (">:o", "😠"), (">:O", "😠"), (">:-O", "😠"), (">:-o", "😠"), (";)", "😉"), (";-)", "😉"),
+    (";*", "😘"), (";-*", "😘"), (";-P", "😜"), (";P", "😜"), (";-p", "😜"), (";p", "😜"),
+    (":cheese:", "🧀"), (":eyes:", "👀"), (":peek:", "👀"), (":clown:", "🤡"),
+];
+
+#[derive(Debug, PartialEq)]
+enum Piece {
+    Text(String),
+    Emoji(String),
+}
+
+/// Split message text into plain text and emoji, turning emoticons into emoji
+/// where the web client does: after the start, a space, a quote, "." or "(",
+/// and before the end, a space, a quote or `.,!?)`. A few (`;)`, `O:)`, `3:)`,
+/// `(y)`) don't match when another ")" follows.
+fn emoji_pieces(text: &str) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::new();
+    let mut plain = String::new();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = 0;
+    let flush = |plain: &mut String, out: &mut Vec<Piece>| {
+        if !plain.is_empty() {
+            out.push(Piece::Text(std::mem::take(plain)));
+        }
+    };
+    while i < chars.len() {
+        let (at, c) = chars[i];
+        let before_ok = i == 0 || matches!(chars[i - 1].1, '\'' | '"' | '.' | '(') || chars[i - 1].1.is_whitespace();
+        if before_ok {
+            let rest = &text[at..];
+            let hit = EMOTICONS
+                .iter()
+                .filter(|(e, _)| rest.starts_with(e))
+                .filter(|(e, _)| {
+                    let next = rest[e.len()..].chars().next();
+                    let no_paren = matches!(*e, "O:)" | "0:)" | "O:-)" | "0:-)" | "3:)" | "3:-)" | "(y)" | "(Y)" | ";)" | ";-)");
+                    match next {
+                        None => true,
+                        Some(')') => !no_paren,
+                        Some(n) => n.is_whitespace() || matches!(n, '\'' | '"' | '.' | ',' | '!' | '?'),
+                    }
+                })
+                .max_by_key(|(e, _)| e.len());
+            if let Some((e, emoji)) = hit {
+                flush(&mut plain, &mut out);
+                out.push(Piece::Emoji(emoji.to_string()));
+                i += e.chars().count();
+                continue;
+            }
+        }
+        let wide = ('\u{1F000}'..='\u{1FAFF}').contains(&c) || ('\u{2600}'..='\u{27BF}').contains(&c) || ('\u{2B00}'..='\u{2BFF}').contains(&c);
+        let with_fe0f = chars.get(i + 1).is_some_and(|n| n.1 == '\u{FE0F}');
+        if wide || (with_fe0f && !c.is_ascii()) {
+            // The whole cluster: modifiers, FE0F, ZWJ parts, a flag's pair.
+            let start = at;
+            let mut j = i + 1;
+            let mut flag = ('\u{1F1E6}'..='\u{1F1FF}').contains(&c);
+            while j < chars.len() {
+                let n = chars[j].1;
+                let attaches = matches!(n, '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}') || ('\u{1F3FB}'..='\u{1F3FF}').contains(&n) || ('\u{E0020}'..='\u{E007F}').contains(&n);
+                if attaches {
+                    j += 1;
+                } else if n == '\u{200D}' && j + 1 < chars.len() {
+                    j += 2;
+                } else if flag && ('\u{1F1E6}'..='\u{1F1FF}').contains(&n) {
+                    flag = false;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            let end = chars.get(j).map_or(text.len(), |n| n.0);
+            flush(&mut plain, &mut out);
+            out.push(Piece::Emoji(text[start..end].to_string()));
+            i = j;
+            continue;
+        }
+        plain.push(c);
+        i += 1;
+    }
+    flush(&mut plain, &mut out);
+    out
+}
+
+/// Message text with Messenger's emoji pictures in the line, wrapping by
+/// word. Text without emoji or emoticons stays one selectable label.
+fn rich_text(ui: &mut egui::Ui, text: &str, size: f32, ink: Color32) -> egui::Response {
+    let pieces = emoji_pieces(text);
+    if !pieces.iter().any(|p| matches!(p, Piece::Emoji(_))) {
+        return ui.add(egui::Label::new(sf(text, size, 400).color(ink)).wrap().halign(Align::LEFT));
+    }
+    let side = size * 1.25 * text_scale();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        for p in &pieces {
+            match p {
+                Piece::Emoji(e) => {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(side), Sense::hover());
+                    paint_emoji(ui, rect.shrink(1.0), e);
+                }
+                Piece::Text(t) => {
+                    for (n, line) in t.split('\n').enumerate() {
+                        if n > 0 {
+                            ui.end_row();
+                        }
+                        // One label per word (with its trailing space) so lines wrap.
+                        for word in line.split_inclusive(' ') {
+                            ui.add(egui::Label::new(sf(word, size, 400).color(ink)).extend());
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .response
+}
+
 /// Up to three emoji and nothing else, shown large like Messenger does.
 /// Emoticons such as "=))" or ":)" are punctuation, not emoji: they stay text.
 fn is_big_emoji(text: &str) -> bool {
@@ -979,9 +1163,7 @@ fn web_probe(ctx: &egui::Context) {
     let (stage, id, since) = PROBE.get();
     match stage {
         0 => {
-            if std::env::var("MESSENGER_WEB_PROBE").as_deref() != Ok("media") {
-                crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
-            }
+            crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
             PROBE.set((1, 0, Some(Instant::now())));
         }
         // The media probe reads the chat the history job opened instead.
@@ -1058,13 +1240,15 @@ const OPEN_THREAD_JS: &str = r#"
 /// Read-only probe (`MESSENGER_WEB_PROBE=media`): where the web keeps the
 /// keys of encrypted media. Database, store and field names only, no content.
 const MEDIA_PROBE_JS: &str = r#"
-    // Where the web builds the mute task (label 144): read its own scripts.
+    // Where the web builds a task: read its own scripts around a payload key.
     const out = [];
     for (const src of Array.from(document.scripts).map((s) => s.src).filter(Boolean)) {
         try {
             const t = await (await fetch(src)).text();
-            let i = -1;
-            while ((i = t.indexOf('mute_expire_time_ms', i + 1)) >= 0 && out.length < 6) out.push(t.slice(Math.max(0, i - 700), i + 300));
+            for (const key of ['__d("LSIssueNewTaskWithExtraOperations"', 'TaskSerializerReactionV2', 'reaction_v2']) {
+                let i = -1, n = 0;
+                while ((i = t.indexOf(key, i + 1)) >= 0 && n++ < 2 && out.length < 8) out.push(key + ' @ ' + t.slice(Math.max(0, i - 300), i + 2200));
+            }
         } catch (e) {}
     }
     return JSON.stringify(out);
@@ -1417,6 +1601,24 @@ mod emoji_tests {
     use super::is_big_emoji;
 
     #[test]
+    fn emoticons_become_emoji() {
+        use super::Piece::{Emoji, Text};
+        assert_eq!(super::emoji_pieces("em quá mạnh rồi :D"), vec![Text("em quá mạnh rồi ".into()), Emoji("😃".into())]);
+        assert_eq!(super::emoji_pieces("xem https://a.b/c :)"), vec![Text("xem https://a.b/c ".into()), Emoji("🙂".into())]);
+        assert_eq!(super::emoji_pieces("a:Db"), vec![Text("a:Db".into())]);
+        assert_eq!(super::emoji_pieces("ok 👍🏻!"), vec![Text("ok ".into()), Emoji("👍🏻".into()), Text("!".into())]);
+        assert_eq!(super::emoji_pieces("<3"), vec![Emoji("❤".into())]);
+    }
+
+    #[test]
+    fn messenger_emoji_urls() {
+        // Checked against the web client's own URLs.
+        assert_eq!(super::fb_emoji_url("😆", 16), "https://static.xx.fbcdn.net/images/emoji.php/v9/t12/3/16/1f606.png");
+        assert_eq!(super::fb_emoji_url("❤️", 16), "https://static.xx.fbcdn.net/images/emoji.php/v9/t6e/3/16/2764.png");
+        assert_eq!(super::split_emoji("👍🏻❤️🇻🇳👨‍👩‍👧"), vec!["👍🏻", "❤️", "🇻🇳", "👨‍👩‍👧"]);
+    }
+
+    #[test]
     fn big_emoji_only_for_real_emoji() {
         assert!(is_big_emoji("👍"));
         assert!(is_big_emoji("😆😆😆"));
@@ -1732,7 +1934,12 @@ impl MessengerApp {
                     // avatar (a plain `vertical` would hug the top of the header).
                     let font = |size: f32, weight: u16| egui::FontId::new(size * text_scale(), egui::FontFamily::Name(format!("sf-{weight}").into()));
                     let line = |size: f32, weight: u16| ui.painter().layout_no_wrap("Ag".into(), font(size, weight), pal().text).size().y;
-                    let subtitle = thread.is_group().then(|| format!("{} members", thread.participants.len()));
+                    let subtitle = if thread.is_group() {
+                        Some(format!("{} members", thread.participants.len()))
+                    } else {
+                        let other = thread.participants.iter().copied().find(|&p| p != store.me).unwrap_or(thread.key);
+                        store.active_status(other)
+                    };
                     let height = line(17.0, 600) + if subtitle.is_some() { line(13.0, 400) } else { 0.0 };
                     let width = (ui.available_width() - 140.0).max(80.0);
                     ui.allocate_ui_with_layout(Vec2::new(width, height), Layout::top_down(Align::Min), |ui| {
@@ -1934,17 +2141,21 @@ impl MessengerApp {
                     None => counts.push((e.clone(), 1)),
                 }
             }
-            let mut text = counts.iter().map(|(e, _)| e.as_str()).collect::<String>();
-            if m.reactions.len() > 1 {
-                text.push_str(&format!(" {}", m.reactions.len()));
-            }
-            let galley = ui.painter().layout_no_wrap(text, egui::FontId::proportional(16.0 * text_scale()), pal().text);
-            let size = galley.size() + Vec2::new(12.0, 4.0);
+            // Messenger's emoji pictures, then the count.
+            let icon = 16.0 * text_scale();
+            let count = (m.reactions.len() > 1).then(|| m.reactions.len().to_string());
+            let galley = ui.painter().layout_no_wrap(count.map(|c| format!(" {c}")).unwrap_or_default(), egui::FontId::proportional(14.0 * text_scale()), pal().text);
+            let size = Vec2::new(icon * counts.len() as f32 + 2.0 * (counts.len() - 1) as f32 + galley.size().x + 12.0, icon.max(galley.size().y) + 4.0);
             let x = bubble_rect.right() - size.x - 4.0;
             let pill = Rect::from_min_size(Pos2::new(x, bubble_rect.bottom() - 6.0), size);
             ui.painter().rect_filled(pill, CornerRadius::same(10), pal().quote);
             ui.painter().rect_stroke(pill, CornerRadius::same(10), Stroke::new(2.0, pal().bg), egui::StrokeKind::Outside);
-            ui.painter().galley(pill.min + Vec2::new(6.0, 2.0), galley, pal().text);
+            let mut left = pill.min.x + 6.0;
+            for (e, _) in &counts {
+                paint_emoji(ui, Rect::from_min_size(Pos2::new(left, pill.center().y - icon / 2.0), Vec2::splat(icon)), e);
+                left += icon + 2.0;
+            }
+            ui.painter().galley(Pos2::new(left - 2.0, pill.center().y - galley.size().y / 2.0), galley, pal().text);
             let who = m.reactions.iter().map(|(id, e)| format!("{e} {}", store.member_name(thread.key, *id))).collect::<Vec<_>>().join("\n");
             ui.interact(pill, ui.scope_id().with(("reactions", &m.id)), Sense::hover()).on_hover_text(who);
             ui.add_space(size.y);
@@ -2439,7 +2650,13 @@ impl MessengerApp {
         if !m.text.is_empty() && !(bare_link && has_card) {
             let big_emoji = is_big_emoji(&m.text);
             let r = if big_emoji {
-                ui.label(RichText::new(&m.text).size(40.0))
+                let emoji = split_emoji(&m.text);
+                let side = 40.0 * text_scale();
+                let (rect, r) = ui.allocate_exact_size(Vec2::new(emoji.len() as f32 * (side + 2.0), side + 4.0), Sense::hover());
+                for (i, e) in emoji.iter().enumerate() {
+                    paint_emoji(ui, Rect::from_min_size(rect.min + Vec2::new(i as f32 * (side + 2.0), 2.0), Vec2::splat(side)), e);
+                }
+                r
             } else {
                 Frame::default()
                     .fill(fill)
@@ -2450,7 +2667,7 @@ impl MessengerApp {
                         // White only on the blue of own messages; others use the theme's ink.
                         let ink = if mine { Color32::WHITE } else { pal().text };
                         // Lines start at the left even in our right-aligned bubbles.
-                        ui.add(egui::Label::new(sf(&m.text, 15.0, 400).color(ink)).wrap().halign(Align::LEFT));
+                        rich_text(ui, &m.text, 15.0, ink);
                         if m.edited {
                             ui.label(sf("Edited", 11.0, 400).color(if mine { Color32::from_white_alpha(170) } else { pal().muted }));
                         }

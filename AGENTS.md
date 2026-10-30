@@ -168,10 +168,12 @@ aren't sent yet; old history needs the PIN restore (in progress, see
   MQTT (`edge-chat`) to Meta's DGW gateway
   (`wss://gateway.facebook.com/ws/lightspeed`); MQTT still answers requests but
   never pushes. DGW auth = session cookie + `x-dgw-uuid` set to the user's fbid.
-  DGW is for receiving only: every task (send, react, read, history 228, ...)
-  goes over HTTP as a GraphQL request type 3 (`Conn::send_tasks_http`,
-  `Conn::load_older`). A task sent on the DGW socket is acked, then the server
-  drops the whole connection. Older history: task 228, then a delta sync of
+  Tasks (send, read, history 228, ...) go over HTTP as a GraphQL request type 3
+  (`Conn::send_tasks_http`, `Conn::load_older`). Reactions (task 29) are the
+  exception: over HTTP the server fails them with error 1357038, so they go on
+  a fresh DGW stream like the web client. Earlier, tasks on DGW made the server
+  drop the connection; for reactions the app no longer sends End on the task
+  stream (whether that alone fixes it is still being checked). Older history: task 228, then a delta sync of
   database 1 from the cursor with request type 2 (type 1 ignores the cursor and
   returns a snapshot). The first database 1 sync on DGW sometimes answers
   `handleSyncFailure`; the client then resyncs that database from a snapshot.
