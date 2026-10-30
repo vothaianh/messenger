@@ -641,7 +641,9 @@ thread_local! {
 pub fn glass_window(title: &str, radius: f64) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     let app = NSApplication::sharedApplication(mtm);
-    let Some(window) = app.windows().iter().find(|w| w.title().to_string() == title) else { return };
+    // A closed panel's window can stay in the app's list (the map below keeps
+    // it alive), so take the visible one, or the reopened panel gets no glass.
+    let Some(window) = app.windows().iter().filter(|w| w.isVisible() && w.title().to_string() == title).last() else { return };
     let light = GLASS.with_borrow(|g| g.light);
     GLASS_WINDOWS.with_borrow_mut(|map| {
         if let Some((known, pane)) = map.get(title) {
