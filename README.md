@@ -6,6 +6,8 @@ Apple **Liquid Glass** interface, real-time messaging, group chats, reactions,
 photos, and **end-to-end encrypted chats**. No Electron and no embedded browser:
 one small native app (about 20 MB) that opens instantly with your recent chats.
 
+![Messenger Desktop on macOS: chat list, a group conversation and the chat info panel in Liquid Glass](assets/screenshot.jpg)
+
 > **Unofficial project.** Messenger Desktop is not affiliated with, endorsed by,
 > or sponsored by Meta Platforms, Inc. "Messenger" and "Facebook" are trademarks
 > of Meta. Meta offers no public API for personal chats, so using a third-party
