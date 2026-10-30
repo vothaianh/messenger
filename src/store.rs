@@ -581,6 +581,15 @@ impl Store {
             if m.id.is_empty() {
                 continue;
             }
+            if std::env::var_os("MESSENGER_DEBUG").is_some() && !m.attachments.is_empty() {
+                // Timing only: the nearest stored message from the same sender.
+                let near = self.messages.get(&thread_key).and_then(|v| v.iter().filter(|x| x.sender_id == m.sender_id).min_by_key(|x| (x.timestamp_ms - m.timestamp_ms).abs()));
+                eprintln!(
+                    "[history] picture at {} known={} nearest same-sender Δ{:?} ms, label={:?}, has_media={:?}",
+                    m.timestamp_ms, known.contains(&m.id),
+                    near.map(|x| x.timestamp_ms - m.timestamp_ms), near.map(|x| is_media_label(&x.text)), near.map(|x| !x.attachments.is_empty()),
+                );
+            }
             if known.contains(&m.id) {
                 // A photo first restored as a "📷 Photo" label, now with its picture.
                 if !m.attachments.is_empty() {
