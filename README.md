@@ -104,9 +104,10 @@ it runs on your own Mac. To give the app to other people, sign it with a
 
 ### First launch
 
-1. A Facebook login window opens. Sign in there yourself; two-factor
-   authentication and security checks work as usual.
-2. The window closes and your inbox appears. Only the session cookies (never
+1. The app opens on Facebook's login page, inside its own window. Sign in
+   there yourself; two-factor authentication and security checks work as
+   usual. The same page comes back if your session expires.
+2. The app restarts with your inbox. Only the session cookies (never
    your password) are saved, in the macOS Keychain under `messenger-rs`.
 3. Encrypted chats need a one-time device registration
    (`messenger-rs e2ee-register`). This adds "Messenger Desktop" as a device on
@@ -140,7 +141,7 @@ Messenger Desktop speaks the same private protocols as facebook.com/messages:
 
 | File | Role |
 |---|---|
-| `src/login.rs` | WebKit login window; saves the session cookies to the Keychain |
+| `src/login.rs` | Standalone WebKit login window (`messenger-rs login`); the app itself shows the login page in its main window (`macos::login_view`) |
 | `src/session.rs` | Page bootstrap (tokens, versions), GraphQL Lightspeed requests, uploads |
 | `src/dgw.rs` | DGW gateway transport: frames, streams, acks |
 | `src/client.rs` | Background engine: sync, live updates, commands, history, recovery |

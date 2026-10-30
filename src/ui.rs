@@ -173,8 +173,10 @@ pub struct MessengerApp {
     /// The PIN restore succeeded once (kept): encrypted chats then fetch
     /// their restored history from the hidden web engine.
     history_restored: bool,
-    /// The login window was opened for an expired session (once per run).
-    login_opened: bool,
+    /// Expired session: the old `xs` cookie (a login only counts once it
+    /// changes) and when the login page's cookies were last checked.
+    login_stale_xs: Option<Option<String>>,
+    login_poll: f64,
     /// Encrypted chats whose restored history was fetched this run, and the
     /// one being fetched.
     history_fetched: HashSet<i64>,
@@ -252,7 +254,8 @@ impl MessengerApp {
             sticker_store: false,
             pin_restore: None,
             history_restored: stored("history_restored").is_some_and(|v| v == "true"),
-            login_opened: false,
+            login_stale_xs: None,
+            login_poll: 0.0,
             history_fetched: HashSet::new(),
             history_job: None,
             restore_check: None,
@@ -571,6 +574,11 @@ impl eframe::App for MessengerApp {
         web_probe(&ctx);
         image_viewer(&ctx);
         let status = self.shared.status.lock().unwrap().clone();
+        if let Status::LoggedOut(msg) = &status {
+            self.login_screen(ui, msg);
+            crate::macos::sync_glass(&self.glass);
+            return;
+        }
         let shared = self.shared.clone();
         let mut store = shared.store.lock().unwrap();
         let mut cmds = Vec::new();
@@ -1271,6 +1279,44 @@ fn glass_rect(r: Rect, radius: f32) -> crate::macos::GlassRect {
 }
 
 impl MessengerApp {
+    /// Logged out or session expired: Facebook's login page inside the main
+    /// window. Once it yields a new session, save it and relaunch with it.
+    fn login_screen(&mut self, ui: &mut egui::Ui, msg: &str) {
+        const LOGIN_URL: &str = "https://www.facebook.com/login/?next=https%3A%2F%2Fwww.facebook.com%2Fmessages%2F";
+        let full = ui.available_rect_before_wrap();
+        ui.allocate_rect(full, Sense::hover());
+        titlebar_drag(ui, full.with_max_y(full.top() + TITLEBAR));
+
+        let heading = if msg.contains("expired") { "Your session expired. Log in to continue." } else { "Log in to Messenger Desktop" };
+        let top = full.top() + TITLEBAR + 12.0;
+        let title = Rect::from_min_size(Pos2::new(full.left(), top), Vec2::new(full.width(), 28.0));
+        ui.put(title, egui::Label::new(sf(heading, 17.0, 600).color(pal().text)));
+        let width = 480.0f32.min(full.width() - 2.0 * (GLASS_INSET + 16.0));
+        let card = Rect::from_min_size(Pos2::new(full.center().x - width / 2.0, title.bottom() + 16.0), Vec2::new(width, (full.bottom() - title.bottom() - 40.0).min(780.0)));
+        self.glass.push(glass_rect(card.expand(GLASS_INSET), GLASS_RADIUS));
+        crate::macos::login_view(LOGIN_URL, crate::session::USER_AGENT, [card.left(), card.top(), card.width(), card.height()]);
+
+        let stale = self.login_stale_xs.get_or_insert_with(|| crate::session::Cookies::load().and_then(|c| c.get("xs").map(str::to_owned)));
+        if let Some(header) = crate::macos::login_cookies() {
+            let cookies = crate::session::Cookies(header);
+            if cookies.is_logged_in() && cookies.get("xs") != stale.as_deref() {
+                match cookies.save() {
+                    Ok(()) => {
+                        crate::macos::login_view_close();
+                        relaunch();
+                    }
+                    Err(e) => *self.shared.error.lock().unwrap() = Some(format!("Couldn't save the session: {e:#}")),
+                }
+            }
+        }
+        let now = ui.input(|i| i.time);
+        if now - self.login_poll >= 1.0 {
+            self.login_poll = now;
+            crate::macos::request_login_cookies();
+        }
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+    }
+
     fn status_line(&mut self, ui: &mut egui::Ui, status: &Status) {
         let (text, color) = match status {
             Status::Online => (String::new(), pal().muted),
@@ -1287,14 +1333,6 @@ impl MessengerApp {
             ui.set_width(ui.available_width());
             if !text.is_empty() {
                 ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
-            }
-            if let Status::LoggedOut(_) = status {
-                // Open the login window right away; the button reopens it if
-                // the user closed it.
-                if !self.login_opened || ui.button("Log in").clicked() {
-                    self.login_opened = true;
-                    open_login_window();
-                }
             }
             if let Some(e) = err {
                 // Message wrapped in the column minus room for a drawn close button.
@@ -1340,7 +1378,7 @@ impl MessengerApp {
                     if ui.button("Log out").clicked() {
                         crate::session::Cookies::clear();
                         crate::store::clear_cache();
-                        relaunch_with_login();
+                        crate::macos::clear_web_data(relaunch);
                     }
                 });
             });
@@ -3245,20 +3283,8 @@ fn long_time(ms: i64) -> String {
     }
 }
 
-/// Expired session: show the login window (a child process) over the app.
-/// Once it saves fresh cookies the app relaunches with them; if the user
-/// closes it, the old cookies stay and the "Log in" button reopens it.
-fn open_login_window() {
-    let Ok(exe) = std::env::current_exe() else { return };
-    std::thread::spawn(move || {
-        if std::process::Command::new(&exe).arg("login").status().is_ok_and(|s| s.success()) {
-            let _ = std::process::Command::new(exe).spawn();
-            std::process::exit(0);
-        }
-    });
-}
-
-fn relaunch_with_login() {
+/// Start a fresh copy of the app and quit this one.
+fn relaunch() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe).spawn();
     }

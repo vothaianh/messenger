@@ -138,6 +138,10 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
     };
     let mut backoff = 1u64;
     let mut e2ee_started = false;
+    if !cookies.is_logged_in() {
+        set_status(Status::LoggedOut("not logged in".into()));
+        return;
+    }
     loop {
         set_status(Status::Connecting);
         let session = match Session::connect(cookies.clone()).await {

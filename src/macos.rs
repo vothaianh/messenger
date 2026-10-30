@@ -749,3 +749,92 @@ pub fn web_close() {
         w.results.clear();
     });
 }
+
+// ---- In-window login ----
+//
+// The Facebook login page as a WKWebView inside the main window (not a
+// separate window). It uses the default WebKit data store, so the session it
+// creates is the one the hidden web engine sees too. The user types into
+// Facebook's own page; the app only reads the resulting cookies.
+
+thread_local! {
+    static LOGIN: RefCell<Option<Retained<WKWebView>>> = const { RefCell::new(None) };
+    static LOGIN_COOKIES: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Show the login page in the main window at `rect` (egui points, top-left
+/// origin: x, y, width, height). Creates it once, then only moves it.
+pub fn login_view(url: &str, user_agent: &str, rect: [f32; 4]) {
+    use objc2_foundation::{NSURLRequest, NSURL};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(window) = app.mainWindow().or_else(|| app.windows().firstObject()) else { return };
+    let Some(content) = window.contentView() else { return };
+    let height = content.bounds().size.height;
+    let y = if content.isFlipped() { rect[1] as f64 } else { height - (rect[1] + rect[3]) as f64 };
+    let frame = NSRect::new(NSPoint::new(rect[0] as f64, y), NSSize::new(rect[2] as f64, rect[3] as f64));
+    LOGIN.with_borrow_mut(|slot| {
+        if let Some(view) = slot.as_ref() {
+            if view.frame() != frame {
+                view.setFrame(frame);
+            }
+            return;
+        }
+        let config = unsafe { WKWebViewConfiguration::new(mtm) };
+        let view = unsafe { WKWebView::initWithFrame_configuration(mtm.alloc(), frame, &config) };
+        unsafe { view.setCustomUserAgent(Some(&NSString::from_str(user_agent))) };
+        content.addSubview(&view);
+        if let Some(u) = NSURL::URLWithString(&NSString::from_str(url)) {
+            unsafe { view.loadRequest(&NSURLRequest::requestWithURL(&u)) };
+        }
+        window.makeFirstResponder(Some(&view));
+        *slot = Some(view);
+    });
+}
+
+/// Ask WebKit for the facebook.com cookies (as a `Cookie` header); the answer
+/// arrives in `login_cookies` on a later frame.
+pub fn request_login_cookies() {
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let store = unsafe { objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm).httpCookieStore() };
+    let handler = RcBlock::new(|cookies: std::ptr::NonNull<objc2_foundation::NSArray<objc2_foundation::NSHTTPCookie>>| {
+        let cookies = unsafe { cookies.as_ref() };
+        let header = cookies
+            .iter()
+            .filter(|c| {
+                let d = c.domain().to_string();
+                d.trim_start_matches('.') == "facebook.com" || d.ends_with(".facebook.com")
+            })
+            .map(|c| format!("{}={}", c.name(), c.value()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        LOGIN_COOKIES.with_borrow_mut(|c| *c = Some(header));
+    });
+    unsafe { store.getAllCookies(&handler) };
+}
+
+/// The cookies fetched by `request_login_cookies` (taken).
+pub fn login_cookies() -> Option<String> {
+    LOGIN_COOKIES.with_borrow_mut(Option::take)
+}
+
+/// Remove the login page from the window.
+pub fn login_view_close() {
+    LOGIN.with_borrow_mut(|slot| {
+        if let Some(view) = slot.take() {
+            view.removeFromSuperview();
+        }
+    });
+}
+
+/// Log out of the web side too: delete all WebKit website data (cookies and
+/// the web client's storage), then run `then`. Otherwise the login page would
+/// sign straight back in with the old session.
+pub fn clear_web_data(then: impl Fn() + 'static) {
+    let Some(mtm) = MainThreadMarker::new() else { return then() };
+    unsafe {
+        let store = objc2_web_kit::WKWebsiteDataStore::defaultDataStore(mtm);
+        let types = objc2_web_kit::WKWebsiteDataStore::allWebsiteDataTypes(mtm);
+        store.removeDataOfTypes_modifiedSince_completionHandler(&types, &objc2_foundation::NSDate::distantPast(), &RcBlock::new(then));
+    }
+}

@@ -486,16 +486,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cookies = match Cookies::load() {
-        Some(c) => c,
-        None => {
-            let status = std::process::Command::new(std::env::current_exe()?).arg("login").status()?;
-            if !status.success() {
-                return Ok(());
-            }
-            Cookies::load().ok_or_else(|| anyhow::anyhow!("login did not complete"))?
-        }
-    };
+    // Without a session the app opens on its login screen (in the window).
+    let cookies = Cookies::load().unwrap_or(Cookies(String::new()));
 
     let mut viewport = eframe::egui::ViewportBuilder::default()
             .with_title("Messenger Desktop")
