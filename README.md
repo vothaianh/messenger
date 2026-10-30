@@ -73,7 +73,8 @@ one small native app (about 20 MB) that opens instantly with your recent chats.
 - Receive photos and videos: downloaded, verified and decrypted on your Mac
   (implemented, not yet confirmed against a real incoming photo)
 - Delivery and read receipts
-- Older encrypted history, which needs your Messenger PIN, isn't supported yet
+- Older encrypted history: restore it with your Messenger PIN (text, photos and
+  call logs)
 
 ### macOS design
 - Apple **Liquid Glass**: floating glass sidebars and a glass composer over a
@@ -83,7 +84,12 @@ one small native app (about 20 MB) that opens instantly with your recent chats.
 
 ## Download and build
 
-Messenger Desktop builds from source on macOS (Apple Silicon). You need
+**Download:** the latest signed and notarized build is on the
+[Releases page](https://github.com/vothaianh/messenger/releases/latest)
+(Apple Silicon, macOS 26). Unzip it and move **Messenger Desktop** to
+Applications.
+
+Messenger Desktop also builds from source on macOS (Apple Silicon). You need
 [Rust](https://rustup.rs) and, for the layered app icon, Xcode's command line
 tools.
 
@@ -201,9 +207,9 @@ and no browser tabs to keep open. It's an independent project, not an app
 from Meta.
 
 **Does it work with end-to-end encrypted chats?**
-Yes, for new messages: it receives and sends text, sends photos, and handles
-receipts in 🔒 chats. History from before the device was registered needs the
-Messenger PIN, which isn't supported yet.
+Yes: it receives and sends text, photos and stickers, and handles receipts in
+🔒 chats. History from before the device was registered is restored with your
+Messenger PIN.
 
 **Does it support voice or video calls?**
 Not inside the app. The call buttons open the call in your browser.
@@ -221,7 +227,7 @@ cookies are kept, in the macOS Keychain.
 - Calls, stories, polls, voice recording and starting new chats aren't
   available.
 - Encrypted chats: no group chats yet, and no sending of videos or files yet.
-  Older encrypted history needs the Messenger PIN.
+  Restored encrypted history covers the most recent messages of each chat.
 - Meta can change its private protocols at any time, which can break features
   until they're updated.
 
