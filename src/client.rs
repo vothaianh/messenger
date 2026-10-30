@@ -918,10 +918,35 @@ impl Conn {
             Command::MarkRead { thread } => {
                 // Clear the unread dot right away: the server's read watermark
                 // update isn't always pushed back to us.
-                if let Some(t) = self.shared.store.lock().unwrap().threads.get_mut(&thread) {
+                let (e2ee, unread_ids, peer) = {
+                    let mut st = self.shared.store.lock().unwrap();
+                    let me = st.me;
+                    let Some(t) = st.threads.get_mut(&thread) else { return Ok(None) };
+                    let since = t.last_read_ms;
                     t.last_read_ms = t.last_read_ms.max(t.last_activity_ms);
-                }
+                    let (e2ee, peer) = (t.e2ee, t.participants.iter().copied().find(|p| *p != me));
+                    // Messages received live over E2EE (numeric ids; restored
+                    // copies have web ids) from the peer, not read yet.
+                    let ids: Vec<String> = st.messages.get(&thread).map_or(Vec::new(), |list| {
+                        list.iter()
+                            .rev()
+                            .filter(|m| m.sender_id != me && m.timestamp_ms > since && !m.id.is_empty() && m.id.bytes().all(|b| b.is_ascii_digit()))
+                            .map(|m| m.id.clone())
+                            .take(20)
+                            .collect()
+                    });
+                    (e2ee, ids, peer)
+                };
                 (self.repaint)();
+                if e2ee {
+                    // Encrypted chats: a read receipt over the E2EE socket.
+                    let tx = self.shared.e2ee_tx.lock().unwrap().clone();
+                    if let (Some(tx), Some(peer), false) = (tx, peer, unread_ids.is_empty()) {
+                        let (done, _) = tokio::sync::oneshot::channel();
+                        let _ = tx.send(crate::e2ee_listen::Outgoing { peer, payload: OutgoingPayload::Read(unread_ids), done });
+                    }
+                    return Ok(None);
+                }
                 let p = json!({"thread_id": thread, "last_read_watermark_ts": now_ms(), "sync_group": 1});
                 self.tasks(vec![("21", p, thread.to_string())])
             }

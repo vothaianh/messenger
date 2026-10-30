@@ -96,6 +96,8 @@ pub enum OutgoingPayload {
     /// A sticker picture (link) to download, encrypt, upload and send as a
     /// sticker, with its accessibility label.
     Sticker { url: String, label: String },
+    /// Read receipts for the peer's messages `ids` (newest first).
+    Read(Vec<String>),
 }
 
 /// Messenger message ids: milliseconds since the epoch shifted left 22 bits,
@@ -303,6 +305,20 @@ impl Listener {
         let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::from_rng(&mut rand::rng());
         process_prekey_bundle(&address, &mut sessions, &mut identities, &bundle, &mut rng, UsePQRatchet::No).await?;
         Ok(())
+    }
+
+    /// Tell the peer we read their messages `ids`: one `receipt type="read"`
+    /// for the first id, the others in a `<list>` (the WhatsApp/Armadillo
+    /// shape, as the web client sends when a chat is open).
+    pub async fn send_read(&mut self, peer: i64, ids: &[String]) -> Result<()> {
+        let Some((first, rest)) = ids.split_first() else { return Ok(()) };
+        let t = (crate::store::now_ms() / 1000).to_string();
+        let mut b = NodeBuilder::new("receipt").attr("id", first.clone()).attr("to", jid_value(&format!("{peer}@msgr"))).attr("type", "read").attr("t", t);
+        if !rest.is_empty() {
+            let items = rest.iter().map(|id| NodeBuilder::new("item").attr("id", id.clone()).build());
+            b = b.children([NodeBuilder::new("list").children(items).build()]);
+        }
+        self.send_node(&b.build()).await
     }
 
     pub async fn send_text(&mut self, peer: i64, text: &str, backlog: &mut Vec<Vec<u8>>) -> Result<Received> {
@@ -853,10 +869,19 @@ pub async fn run(
                 };
                 let received = tokio::select! {
                     Some(out) = next_out => {
+                        if let OutgoingPayload::Read(ids) = &out.payload {
+                            let r = listener.send_read(out.peer, ids).await;
+                            if let Err(e) = &r {
+                                log(format!("read receipt failed: {e:#}"));
+                            }
+                            let _ = out.done.send(r.map_err(|e| format!("{e:#}")));
+                            continue;
+                        }
                         let sent = match &out.payload {
                             OutgoingPayload::Text(text) => listener.send_text(out.peer, text, &mut backlog).await,
                             OutgoingPayload::Image(path) => listener.send_image(out.peer, path, &session.http, &mut media_conn, &mut backlog).await,
                             OutgoingPayload::Sticker { url, label } => listener.send_sticker(out.peer, url, label, &session.http, &mut media_conn, &mut backlog).await,
+                            OutgoingPayload::Read(_) => unreachable!("handled above"),
                         };
                         match sent {
                             Ok(rec) => {

@@ -526,6 +526,11 @@ impl Store {
 
 /// The same message under two ids (received live over E2EE, and restored
 /// from the backup): same sender, same content, within 3 seconds.
+/// A placeholder like "📷 Photo" or "🎬 Video: name" standing in for media.
+fn is_media_label(text: &str) -> bool {
+    ["📷 Photo", "🎬 Video"].iter().any(|l| text == *l || text.starts_with(&format!("{l}:")))
+}
+
 fn same_message(a: &Message, b: &Message) -> bool {
     if a.id == b.id {
         return true;
@@ -590,7 +595,16 @@ impl Store {
                 continue;
             }
             // The same message received live over E2EE has another id here.
-            if self.messages.get(&thread_key).is_some_and(|v| v.iter().any(|x| same_message(x, &m))) {
+            // If that copy only got a "📷 Photo" label (its download failed),
+            // give it the restored picture.
+            if let Some(x) = self.messages.get_mut(&thread_key).and_then(|v| v.iter_mut().find(|x| same_message(x, &m))) {
+                if x.attachments.is_empty() && !m.attachments.is_empty() {
+                    x.attachments = m.attachments;
+                    if is_media_label(&x.text) {
+                        x.text.clear();
+                    }
+                    added += 1;
+                }
                 continue;
             }
             m.thread_key = thread_key;
@@ -985,6 +999,17 @@ mod tests {
         let later = Message { id: "mid.other".into(), sender_id: 1, text: "Chua".into(), timestamp_ms: 1_060_000, ..Default::default() };
         assert_eq!(st.add_restored(7, vec![copy, later]), 1, "the copy is skipped, a later repeat isn't");
         assert_eq!(st.messages[&7].len(), 2);
+    }
+
+    #[test]
+    fn restored_picture_replaces_a_photo_label() {
+        let mut st = Store::default();
+        st.insert_message(Message { id: "3EB0LIVE".into(), thread_key: 7, sender_id: 1, text: "📷 Photo".into(), timestamp_ms: 1_000_000, ..Default::default() });
+        let picture = Attachment { kind: AttachmentKind::Image, url: "file:///p.jpg".into(), preview_url: "file:///p.jpg".into(), title: String::new(), subtitle: String::new(), width: 0.0, height: 0.0 };
+        let restored = Message { id: "mid.restored".into(), sender_id: 1, timestamp_ms: 1_000_400, attachments: vec![picture], ..Default::default() };
+        assert_eq!(st.add_restored(7, vec![restored]), 1);
+        let m = &st.messages[&7][0];
+        assert_eq!((m.id.as_str(), m.text.as_str(), m.attachments.len()), ("3EB0LIVE", "", 1));
     }
 
     #[test]

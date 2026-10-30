@@ -1597,7 +1597,7 @@ impl MessengerApp {
         let messages: Vec<Message> = store.messages.get(&key).cloned().unwrap_or_default();
 
         // Mark read when viewing an unread thread while the window is focused.
-        if !thread.e2ee && thread.unread() && self.focused && self.read_sent.insert((key, thread.last_activity_ms)) {
+        if thread.unread() && self.focused && self.read_sent.insert((key, thread.last_activity_ms)) {
             cmds.push(Command::MarkRead { thread: key });
         }
 
