@@ -519,7 +519,9 @@ impl MessengerApp {
         let light = match self.theme {
             ThemePref::Light => true,
             ThemePref::Dark => false,
-            ThemePref::System => ctx.input(|i| i.raw.system_theme) == Some(egui::Theme::Light),
+            // Asked from macOS each frame: egui's `system_theme` can miss a
+            // switch, leaving the palette and the native glass out of step.
+            ThemePref::System => crate::macos::system_is_light(),
         };
         if self.applied_theme == Some((self.theme, light)) {
             return;
@@ -527,12 +529,10 @@ impl MessengerApp {
         self.applied_theme = Some((self.theme, light));
         LIGHT_THEME.store(light, Ordering::Relaxed);
         apply_style(ctx, light);
-        let forced = match self.theme {
-            ThemePref::System => None,
-            _ => Some(light),
-        };
+        // Always force the resolved appearance, so the native glass can't
+        // differ from the egui palette.
         let [r, g, b, a] = pal().bg.to_srgba_unmultiplied();
-        crate::macos::set_appearance(forced, light, [r, g, b, a].map(|c| c as f64 / 255.0));
+        crate::macos::set_appearance(Some(light), light, [r, g, b, a].map(|c| c as f64 / 255.0));
         ctx.request_repaint();
     }
 

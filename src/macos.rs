@@ -156,6 +156,14 @@ fn glass_tint(light: bool) -> Retained<objc2_app_kit::NSColor> {
 /// Set the app's appearance: `Some(light)` forces Aqua or Dark Aqua, `None`
 /// follows the system. `light` is the effective one, for the glass tint.
 /// Main thread only.
+/// Whether macOS itself is in light mode (System Settings › Appearance),
+/// whatever appearance this app forces on its windows.
+pub fn system_is_light() -> bool {
+    let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
+    let style = defaults.stringForKey(&NSString::from_str("AppleInterfaceStyle"));
+    !style.is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
+}
+
 pub fn set_appearance(forced: Option<bool>, light: bool, tint: [f64; 4]) {
     use objc2_app_kit::{NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
     let Some(mtm) = MainThreadMarker::new() else { return };
