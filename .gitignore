@@ -1,1 +1,8 @@
 target/
+
+# Signing / notarization secrets: never commit
+*.p8
+*.p12
+*.cer
+
+.DS_Store
