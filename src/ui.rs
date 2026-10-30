@@ -35,7 +35,6 @@ struct Palette {
     /// Hairline on glass edges and separators.
     border: Color32,
     selected: Color32,
-    chip_on_bg: Color32,
     chip_on_text: Color32,
 }
 
@@ -52,7 +51,6 @@ const DARK: Palette = Palette {
     muted: Color32::from_rgb(147, 164, 191),
     border: Color32::from_rgba_premultiplied(23, 26, 33, 33),
     selected: Color32::from_rgba_premultiplied(20, 38, 72, 77),
-    chip_on_bg: Color32::from_rgba_premultiplied(15, 35, 64, 64),
     chip_on_text: Color32::from_rgb(110, 170, 255),
 };
 
@@ -69,7 +67,6 @@ const LIGHT: Palette = Palette {
     muted: Color32::from_rgb(108, 108, 114),
     border: Color32::from_rgba_premultiplied(0, 0, 0, 24),
     selected: Color32::from_rgba_premultiplied(0, 0, 0, 20),
-    chip_on_bg: Color32::from_rgba_premultiplied(0, 15, 31, 31),
     chip_on_text: Color32::from_rgb(0, 102, 214),
 };
 
@@ -143,6 +140,9 @@ pub struct MessengerApp {
     read_sent: HashSet<(i64, i64)>,
     /// Last older-history request: thread, oldest message id at the time, when.
     older_requested: Option<(i64, Option<String>, Instant)>,
+    /// The reactions pill under the pointer this frame: popover key, rect and
+    /// rows (see `macos::hover_popover`).
+    reaction_hover: Option<(String, [f32; 4], Vec<crate::macos::PopoverRow>)>,
     /// Native glass surfaces for this frame (see `macos::sync_glass`).
     glass: Vec<crate::macos::GlassRect>,
     /// Composer text height last frame (one line, or more for a multi-line draft).
@@ -240,6 +240,7 @@ impl MessengerApp {
             read_sent: HashSet::new(),
             older_requested: None,
             glass: Vec::new(),
+            reaction_hover: None,
             composer_text_h: 0.0,
             mention_picks: Vec::new(),
             mention_sel: 0,
@@ -668,6 +669,7 @@ impl eframe::App for MessengerApp {
         for c in cmds {
             self.send(c);
         }
+        crate::macos::hover_popover(self.reaction_hover.take());
         crate::macos::sync_glass(&self.glass);
     }
 }
@@ -941,6 +943,15 @@ fn fb_emoji_url(emoji: &str, size: u32) -> String {
     format!("https://static.xx.fbcdn.net/images/emoji.php/v9/t{:x}/{path}", sum & 0xff)
 }
 
+/// Messenger's picture for an emoji as PNG bytes, once egui has loaded it
+/// (the reaction pill loads the same picture).
+fn emoji_png(ctx: &egui::Context, emoji: &str) -> Option<Vec<u8>> {
+    match ctx.try_load_bytes(&fb_emoji_url(emoji, 16)) {
+        Ok(egui::load::BytesPoll::Ready { bytes, .. }) => Some(bytes.to_vec()),
+        _ => None,
+    }
+}
+
 /// Paint one emoji in `rect` with Messenger's picture, or the system glyph
 /// while it loads or when Messenger has no picture for it.
 fn paint_emoji(ui: &egui::Ui, rect: Rect, emoji: &str) {
@@ -1067,7 +1078,40 @@ fn rich_text(ui: &mut egui::Ui, text: &str, size: f32, ink: Color32) -> egui::Re
         return ui.add(egui::Label::new(sf(text, size, 400).color(ink)).wrap().halign(Align::LEFT));
     }
     let side = size * 1.25 * text_scale();
-    ui.horizontal_wrapped(|ui| {
+    // The width of a space in this font: "a a" minus "aa".
+    let space = {
+        let font = egui::FontId::new(size * text_scale(), egui::FontFamily::Name("sf-400".into()));
+        let w = |t: &str| ui.painter().layout_no_wrap(t.into(), font.clone(), ink).size().x;
+        (w("a a") - w("aa")).max(size * 0.25)
+    };
+    // The widest line unwrapped, so the bubble hugs short text instead of
+    // taking the whole row (a wrapping layout fills its width).
+    let natural = {
+        let font = egui::FontId::new(size * text_scale(), egui::FontFamily::Name("sf-400".into()));
+        let mut widest: f32 = 0.0;
+        let mut line: f32 = 0.0;
+        for p in &pieces {
+            match p {
+                Piece::Emoji(_) => line += side,
+                Piece::Text(t) => {
+                    for (n, part) in t.split('\n').enumerate() {
+                        if n > 0 {
+                            widest = widest.max(line);
+                            line = 0.0;
+                        }
+                        line += ui.painter().layout_no_wrap(part.trim_end_matches(' ').into(), font.clone(), ink).size().x;
+                        line += space * (part.len() - part.trim_end_matches(' ').len()) as f32;
+                    }
+                }
+            }
+        }
+        widest.max(line).ceil() + 1.0
+    };
+    let width = natural.min(ui.available_width());
+    // Always left to right: own bubbles sit in a right-to-left layout, which
+    // would place the words in reverse.
+    ui.allocate_ui_with_layout(Vec2::new(width, 0.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
+        ui.set_max_width(width);
         ui.spacing_mut().item_spacing = Vec2::ZERO;
         for p in &pieces {
             match p {
@@ -1080,9 +1124,17 @@ fn rich_text(ui: &mut egui::Ui, text: &str, size: f32, ink: Color32) -> egui::Re
                         if n > 0 {
                             ui.end_row();
                         }
-                        // One label per word (with its trailing space) so lines wrap.
+                        // One label per word so lines wrap. A label's trailing
+                        // space has no width, so spaces are explicit gaps.
                         for word in line.split_inclusive(' ') {
-                            ui.add(egui::Label::new(sf(word, size, 400).color(ink)).extend());
+                            let bare = word.trim_end_matches(' ');
+                            if !bare.is_empty() {
+                                ui.add(egui::Label::new(sf(bare, size, 400).color(ink)).extend());
+                            }
+                            let spaces = word.len() - bare.len();
+                            if spaces > 0 {
+                                ui.add_space(space * spaces as f32);
+                            }
                         }
                     }
                 }
@@ -1771,18 +1823,26 @@ impl MessengerApp {
         ui.add_space(8.0);
         pill_search(ui, &mut self.search);
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            for (f, label) in [(Filter::All, "All"), (Filter::Unread, "Unread"), (Filter::Groups, "Groups")] {
-                let on = self.filter == f;
-                let b = egui::Button::new(sf(label, 15.0, if on { 600 } else { 500 }).color(if on { pal().chip_on_text } else { pal().text }))
-                    .fill(if on { pal().chip_on_bg } else { Color32::TRANSPARENT })
-                    .corner_radius(CornerRadius::same(18))
-                    .min_size(Vec2::new(0.0, 36.0));
-                if ui.add(b).clicked() {
-                    self.filter = f;
+        // A Liquid Glass segmented control: a glass capsule holding the
+        // filters, the chosen one a lighter pill inside it.
+        let segments = Frame::default().inner_margin(Margin::same(3)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (f, label) in [(Filter::All, "All"), (Filter::Unread, "Unread"), (Filter::Groups, "Groups")] {
+                    let on = self.filter == f;
+                    let b = egui::Button::new(sf(label, 14.0, if on { 600 } else { 500 }).color(if on { pal().chip_on_text } else { pal().text }))
+                        .fill(if on { pal().selected } else { Color32::TRANSPARENT })
+                        .stroke(if on { Stroke::new(1.0, pal().border) } else { Stroke::NONE })
+                        .corner_radius(CornerRadius::same(15))
+                        .min_size(Vec2::new(64.0, 30.0));
+                    if ui.add(b).clicked() {
+                        self.filter = f;
+                    }
                 }
-            }
+            });
         });
+        let capsule = segments.response.rect;
+        self.glass.push(glass_rect(capsule, capsule.height() / 2.0));
         ui.add_space(6.0);
         self.status_line(ui, status);
 
@@ -2156,8 +2216,20 @@ impl MessengerApp {
                 left += icon + 2.0;
             }
             ui.painter().galley(Pos2::new(left - 2.0, pill.center().y - galley.size().y / 2.0), galley, pal().text);
-            let who = m.reactions.iter().map(|(id, e)| format!("{e} {}", store.member_name(thread.key, *id))).collect::<Vec<_>>().join("\n");
-            ui.interact(pill, ui.scope_id().with(("reactions", &m.id)), Sense::hover()).on_hover_text(who);
+            // Who reacted: a native popover (Liquid Glass) while hovered.
+            if ui.rect_contains_pointer(pill) {
+                let key = format!("{}:{:?}", m.id, m.reactions);
+                let rows = m
+                    .reactions
+                    .iter()
+                    .map(|(id, e)| crate::macos::PopoverRow {
+                        png: emoji_png(ui.ctx(), e),
+                        emoji: e.clone(),
+                        name: if *id == store.me { "You".into() } else { store.member_name(thread.key, *id) },
+                    })
+                    .collect();
+                self.reaction_hover = Some((key, [pill.min.x, pill.min.y, pill.width(), pill.height()], rows));
+            }
             ui.add_space(size.y);
         }
 

@@ -895,3 +895,100 @@ pub fn titlebar_mouse_down() -> bool {
     }
     true
 }
+
+// ---- Hover popover (who reacted) ----
+
+/// One row of the reactions popover: Messenger's emoji picture (PNG) when
+/// it's loaded, else the system emoji, and the person's name.
+pub struct PopoverRow {
+    pub png: Option<Vec<u8>>,
+    pub emoji: String,
+    pub name: String,
+}
+
+thread_local! {
+    static POPOVER: RefCell<Option<(String, Retained<objc2_app_kit::NSPopover>)>> = const { RefCell::new(None) };
+}
+
+/// Show a native popover (Liquid Glass on macOS 26) above `rect` (egui
+/// points, top-left origin: x, y, width, height), or close it with `None`.
+/// `key` identifies the content: the same key keeps the open popover.
+pub fn hover_popover(show: Option<(String, [f32; 4], Vec<PopoverRow>)>) {
+    use objc2_app_kit::{
+        NSImageScaling, NSImageView, NSLayoutAttribute, NSPopover, NSPopoverBehavior, NSStackView, NSTextField, NSUserInterfaceLayoutOrientation,
+        NSView, NSViewController,
+    };
+    use objc2_foundation::{NSData, NSEdgeInsets, NSRectEdge};
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    POPOVER.with_borrow_mut(|slot| {
+        let Some((key, rect, rows)) = show else {
+            if let Some((_, p)) = slot.take() {
+                p.close();
+            }
+            return;
+        };
+        if slot.as_ref().is_some_and(|(k, p)| *k == key && p.isShown()) {
+            return;
+        }
+        if let Some((_, p)) = slot.take() {
+            p.close();
+        }
+        let app = NSApplication::sharedApplication(mtm);
+        let Some(window) = app.mainWindow().or_else(|| app.windows().firstObject()) else { return };
+        let Some(content) = window.contentView() else { return };
+        // Layout (points): icon, gap, name per row; the popover is sized from
+        // the measured names so nothing touches its edges.
+        const ICON: f64 = 18.0;
+        const GAP: f64 = 8.0;
+        const ROW_GAP: f64 = 4.0;
+        const PAD_X: f64 = 14.0;
+        const PAD_Y: f64 = 10.0;
+        let mut widest: f64 = 0.0;
+        let views: Vec<Retained<NSView>> = rows
+            .iter()
+            .map(|r| {
+                let image = r
+                    .png
+                    .as_deref()
+                    .and_then(|b| NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(b)))
+                    .unwrap_or_else(|| emoji_image_sized(&r.emoji, 15.0));
+                image.setSize(NSSize::new(ICON, ICON));
+                let icon = NSImageView::imageViewWithImage(&image, mtm);
+                icon.setImageScaling(NSImageScaling::ScaleProportionallyUpOrDown);
+                icon.widthAnchor().constraintEqualToConstant(ICON).setActive(true);
+                icon.heightAnchor().constraintEqualToConstant(ICON).setActive(true);
+                let label = NSTextField::labelWithString(&NSString::from_str(&r.name), mtm);
+                label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                widest = widest.max(label.fittingSize().width);
+                let parts: [Retained<NSView>; 2] = [Retained::into_super(Retained::into_super(icon)), Retained::into_super(Retained::into_super(label))];
+                let row = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&parts), mtm);
+                row.setSpacing(GAP);
+                Retained::into_super(row)
+            })
+            .collect();
+        let stack = NSStackView::stackViewWithViews(&NSArray::from_retained_slice(&views), mtm);
+        stack.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+        stack.setAlignment(NSLayoutAttribute::Leading);
+        stack.setSpacing(ROW_GAP);
+        stack.setEdgeInsets(NSEdgeInsets { top: PAD_Y, left: PAD_X, bottom: PAD_Y, right: PAD_X });
+        let controller = NSViewController::new(mtm);
+        controller.setView(&stack);
+        let popover = NSPopover::new(mtm);
+        popover.setBehavior(NSPopoverBehavior::ApplicationDefined);
+        popover.setAnimates(false);
+        popover.setContentViewController(Some(&controller));
+        let n = rows.len() as f64;
+        let row_h = ICON.max(17.0);
+        let size = NSSize::new(PAD_X * 2.0 + ICON + GAP + widest.ceil() + 2.0, PAD_Y * 2.0 + n * row_h + (n - 1.0).max(0.0) * ROW_GAP);
+        stack.setFrameSize(size);
+        popover.setContentSize(size);
+        let height = content.bounds().size.height;
+        let flipped = content.isFlipped();
+        let y = if flipped { rect[1] as f64 } else { height - (rect[1] + rect[3]) as f64 };
+        let at = NSRect::new(NSPoint::new(rect[0] as f64, y), NSSize::new(rect[2] as f64, rect[3] as f64));
+        // Above the pill: the top edge is max Y unless the view is flipped.
+        let edge = if flipped { NSRectEdge(1) } else { NSRectEdge(3) };
+        popover.showRelativeToRect_ofView_preferredEdge(at, &content, edge);
+        *slot = Some((key, popover));
+    });
+}
