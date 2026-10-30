@@ -301,6 +301,10 @@ pub enum MenuEntry {
     Item { title: String, symbol: &'static str },
     /// A titled submenu (choices inside are numbered like the rest).
     Submenu { title: String, symbol: &'static str, entries: Vec<MenuEntry> },
+    /// One of a set of options; the chosen one gets a checkmark.
+    Choice { title: String, checked: bool },
+    /// A small section title (not a choice).
+    Header(String),
     Separator,
 }
 
@@ -391,6 +395,15 @@ fn add_entries(mtm: MainThreadMarker, target: &MenuTarget, menu: &NSMenu, entrie
                 holder.setSubmenu(Some(&sub));
                 menu.addItem(&holder);
             }
+            MenuEntry::Choice { title, checked } => {
+                let i = menu_item(mtm, target, title, *next);
+                *next += 1;
+                if *checked {
+                    i.setState(NSControlStateValueOn);
+                }
+                menu.addItem(&i);
+            }
+            MenuEntry::Header(title) => menu.addItem(&NSMenuItem::sectionHeaderWithTitle(&NSString::from_str(title), mtm)),
             MenuEntry::Separator => menu.addItem(&NSMenuItem::separatorItem(mtm)),
         }
     }

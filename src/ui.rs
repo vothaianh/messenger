@@ -1360,22 +1360,25 @@ impl MessengerApp {
             ui.add_space(2.0);
             ui.label(sf("Chats", 24.0, 700));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let menu = egui::Button::new(sf("⋯", 18.0, 700)).fill(pal().input).corner_radius(CornerRadius::same(18)).min_size(Vec2::splat(36.0));
-                egui::containers::menu::MenuButton::from_button(menu).ui(ui, |ui| {
-                    ui.label(sf("Appearance", 12.0, 600).color(pal().muted));
-                    for pref in [ThemePref::System, ThemePref::Light, ThemePref::Dark] {
-                        if ui.radio(self.theme == pref, pref.label()).clicked() {
-                            self.theme = pref;
-                            ui.close();
+                let menu = ui.add(egui::Button::new(sf("⋯", 18.0, 700)).fill(pal().input).corner_radius(CornerRadius::same(18)).min_size(Vec2::splat(36.0)));
+                if menu.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    // Native NSMenu: macOS draws it as Liquid Glass.
+                    use crate::macos::MenuEntry;
+                    const THEMES: [ThemePref; 3] = [ThemePref::System, ThemePref::Light, ThemePref::Dark];
+                    let mut entries = vec![MenuEntry::Header("Appearance".into())];
+                    entries.extend(THEMES.iter().map(|&t| MenuEntry::Choice { title: t.label().into(), checked: self.theme == t }));
+                    entries.push(MenuEntry::Separator);
+                    entries.push(MenuEntry::Item { title: "Log out".into(), symbol: "rectangle.portrait.and.arrow.right" });
+                    match crate::macos::popup_menu(&entries) {
+                        Some(i) if i < THEMES.len() => self.theme = THEMES[i],
+                        Some(_) => {
+                            crate::session::Cookies::clear();
+                            crate::store::clear_cache();
+                            crate::macos::clear_web_data(relaunch);
                         }
+                        None => {}
                     }
-                    ui.separator();
-                    if ui.button("Log out").clicked() {
-                        crate::session::Cookies::clear();
-                        crate::store::clear_cache();
-                        crate::macos::clear_web_data(relaunch);
-                    }
-                });
+                }
             });
         });
         ui.add_space(8.0);
