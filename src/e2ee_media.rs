@@ -190,10 +190,31 @@ pub struct PreparedImage {
 }
 
 pub fn prepare_image(path: &std::path::Path) -> Result<PreparedImage> {
-    let bytes = std::fs::read(path)?;
-    let format = image::guess_format(&bytes).map_err(|_| anyhow!("not a supported image"))?;
-    let mimetype = format.to_mime_type().to_string();
-    let img = image::load_from_memory_with_format(&bytes, format)?;
+    // Like the web client (MAWImagePreProcess), send JPEG: phones show the
+    // encrypted image only as "Attachment" when it's a PNG. Big pictures are
+    // scaled to fit MAX_SIDE; transparency goes onto white.
+    const MAX_SIDE: u32 = 2560;
+    let original = std::fs::read(path)?;
+    let format = image::guess_format(&original).map_err(|_| anyhow!("not a supported image"))?;
+    let mut img = image::load_from_memory_with_format(&original, format)?;
+    let bytes = if format == image::ImageFormat::Jpeg && img.width().max(img.height()) <= MAX_SIDE {
+        original
+    } else {
+        if img.width().max(img.height()) > MAX_SIDE {
+            img = img.resize(MAX_SIDE, MAX_SIDE, image::imageops::FilterType::Lanczos3);
+        }
+        let rgba = img.to_rgba8();
+        let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+        for (dst, src) in rgb.pixels_mut().zip(rgba.pixels()) {
+            let a = src[3] as u32;
+            *dst = image::Rgb([0, 1, 2].map(|i| ((src[i] as u32 * a + 255 * (255 - a)) / 255) as u8));
+        }
+        let mut out = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90).encode_image(&rgb)?;
+        img = image::DynamicImage::ImageRgb8(rgb);
+        out
+    };
+    let mimetype = "image/jpeg".to_string();
     let thumb = img.thumbnail(100, 100).to_rgb8();
     let mut thumbnail = Vec::new();
     image::codecs::jpeg::JpegEncoder::new_with_quality(&mut thumbnail, 70).encode_image(&thumb)?;
@@ -237,6 +258,18 @@ pub async fn upload(http: &reqwest::Client, hosts: &[String], auth: &str, kind: 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn png_is_sent_as_jpeg() {
+        let path = std::env::temp_dir().join(format!("md-test-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(40, 30, image::Rgba([255, 0, 0, 128])).save(&path).unwrap();
+        let img = super::prepare_image(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(img.mimetype, "image/jpeg");
+        assert_eq!(image::guess_format(&img.bytes).unwrap(), image::ImageFormat::Jpeg);
+        assert_eq!((img.width, img.height), (40, 30));
+    }
+
     use super::*;
 
     #[test]
