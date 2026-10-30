@@ -2250,9 +2250,6 @@ impl MessengerApp {
                     .response,
             );
         }
-        if m.pending {
-            parts.push(ui.label(sf("Sending…", 11.0, 400).color(pal().muted)));
-        }
         parts.into_iter().reduce(|a, b| a.union(b)).unwrap()
     }
 
