@@ -573,6 +573,7 @@ impl eframe::App for MessengerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let _timing = FrameTiming::start();
         self.glass.clear();
         self.focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         handle_text_size_keys(&ctx);
@@ -589,7 +590,9 @@ impl eframe::App for MessengerApp {
             return;
         }
         let shared = self.shared.clone();
+        let wait = Instant::now();
         let mut store = shared.store.lock().unwrap();
+        FrameTiming::lock_wait(wait.elapsed());
         let mut cmds = Vec::new();
 
         self.notify(&mut store);
@@ -1699,7 +1702,8 @@ impl MessengerApp {
         }
         let key = thread.key;
         let title = store.thread_title(thread);
-        let messages: Vec<Message> = store.messages.get(&key).cloned().unwrap_or_default();
+        // Borrowed, not copied: this runs every frame.
+        let messages: &[Message] = store.messages.get(&key).map_or(&[], Vec::as_slice);
 
         // Mark read when viewing an unread thread while the window is focused.
         if thread.unread() && self.focused && self.read_sent.insert((key, thread.last_activity_ms)) {
@@ -2307,6 +2311,7 @@ impl MessengerApp {
         enum Act {
             Reply,
             Copy,
+            CopyImage,
             Edit,
             Unsend,
         }
@@ -2320,6 +2325,10 @@ impl MessengerApp {
         }
         if !m.text.is_empty() {
             add(&mut entries, "Copy", "doc.on.doc", Act::Copy);
+        }
+        let picture = m.attachments.iter().find(|a| matches!(a.kind, AttachmentKind::Image | AttachmentKind::Sticker) && !a.preview_url.is_empty());
+        if picture.is_some() {
+            add(&mut entries, "Copy Image", "photo.on.rectangle", Act::CopyImage);
         }
         let editable = !thread.e2ee && mine && !m.unsent && !m.text.is_empty() && now_ms() - m.timestamp_ms < 15 * 60_000;
         if editable {
@@ -2359,6 +2368,22 @@ impl MessengerApp {
                 self.focus_composer = true;
             }
             Some(Act::Copy) => ctx.copy_text(m.text.clone()),
+            Some(Act::CopyImage) => {
+                // The picture shown: a cached file, or the bytes egui already
+                // downloaded for the bubble.
+                let Some(a) = picture else { return };
+                let full = if a.url.starts_with("file://") { &a.url } else { &a.preview_url };
+                let bytes = match full.strip_prefix("file://") {
+                    Some(path) => std::fs::read(path).ok(),
+                    None => match ctx.try_load_bytes(full) {
+                        Ok(egui::load::BytesPoll::Ready { bytes, .. }) => Some(bytes.to_vec()),
+                        _ => None,
+                    },
+                };
+                if !bytes.is_some_and(|b| crate::macos::copy_image(&b)) {
+                    *self.shared.error.lock().unwrap() = Some("Couldn't copy the image (it hasn't loaded yet).".into());
+                }
+            }
             Some(Act::Edit) => {
                 self.editing = Some(m.id.clone());
                 self.reply_to = None;
@@ -3502,6 +3527,46 @@ fn long_time(ms: i64) -> String {
         dt.format("%a %H:%M").to_string()
     } else {
         dt.format("%d %b %Y, %H:%M").to_string()
+    }
+}
+
+/// Debug (`MESSENGER_DEBUG`): every 5 s, frames per second, the average and
+/// slowest time in `ui`, and the longest wait for the store lock (held by
+/// the network thread while it applies updates).
+struct FrameTiming(Instant);
+
+thread_local! {
+    static FRAME_STATS: std::cell::Cell<(Option<Instant>, u32, f64, f64, f64)> = const { std::cell::Cell::new((None, 0, 0.0, 0.0, 0.0)) };
+}
+
+impl FrameTiming {
+    fn start() -> Self {
+        FrameTiming(Instant::now())
+    }
+
+    fn lock_wait(d: std::time::Duration) {
+        let mut s = FRAME_STATS.get();
+        s.4 = s.4.max(d.as_secs_f64());
+        FRAME_STATS.set(s);
+    }
+}
+
+impl Drop for FrameTiming {
+    fn drop(&mut self) {
+        if std::env::var_os("MESSENGER_DEBUG").is_none() {
+            return;
+        }
+        let (since, frames, busy, worst, lock) = FRAME_STATS.get();
+        let since = since.unwrap_or(self.0);
+        let t = self.0.elapsed().as_secs_f64();
+        let (frames, busy, worst) = (frames + 1, busy + t, worst.max(t));
+        let span = since.elapsed().as_secs_f64();
+        if span >= 5.0 {
+            eprintln!("[frames] {:.1}/s, ui avg {:.1} ms, slowest {:.1} ms, longest lock wait {:.1} ms", frames as f64 / span, busy * 1e3 / frames as f64, worst * 1e3, lock * 1e3);
+            FRAME_STATS.set((Some(Instant::now()), 0, 0.0, 0.0, 0.0));
+        } else {
+            FRAME_STATS.set((Some(since), frames, busy, worst, lock));
+        }
     }
 }
 

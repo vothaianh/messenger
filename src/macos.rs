@@ -507,6 +507,21 @@ fn image_png(image: &NSImage) -> Option<Vec<u8>> {
 
 // ---- Clipboard files ----
 
+/// Put a picture (encoded image bytes: JPEG, PNG, WebP, GIF…) on the
+/// clipboard, as an image other apps can paste. False if macOS can't read it.
+pub fn copy_image(bytes: &[u8]) -> bool {
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
+    let Some(_mtm) = MainThreadMarker::new() else { return false };
+    let data = objc2_foundation::NSData::with_bytes(bytes);
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else { return false };
+    let board = NSPasteboard::generalPasteboard();
+    board.clearContents();
+    let item: Retained<ProtocolObject<dyn NSPasteboardWriting>> = ProtocolObject::from_retained(image);
+    board.writeObjects(&objc2_foundation::NSArray::from_retained_slice(&[item]))
+}
+
+
 /// Files on the clipboard (copied in Finder), as paths. Empty when the
 /// clipboard holds no file URLs.
 pub fn pasteboard_files() -> Vec<std::path::PathBuf> {
