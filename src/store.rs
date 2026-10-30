@@ -274,6 +274,25 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// For a group without its own picture: two members' pictures (and
+    /// names), shown overlapping like Messenger. Empty otherwise.
+    pub fn group_pictures(&self, t: &Thread) -> Vec<(String, String)> {
+        if !t.picture.is_empty() || !t.is_group() {
+            return Vec::new();
+        }
+        let mut members: Vec<(String, String)> = t
+            .participants
+            .iter()
+            .filter(|&&p| p != self.me)
+            .filter_map(|p| self.contacts.get(p))
+            .map(|c| (c.picture.clone(), c.name.clone()))
+            .collect();
+        // Members with a picture first (stable, so the pair doesn't change).
+        members.sort_by_key(|(picture, _)| picture.is_empty());
+        members.truncate(2);
+        if members.len() < 2 { Vec::new() } else { members }
+    }
+
     pub fn sorted_threads(&self) -> Vec<&Thread> {
         let mut v: Vec<_> = self.threads.values().collect();
         v.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));

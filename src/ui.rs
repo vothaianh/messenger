@@ -1446,7 +1446,7 @@ impl MessengerApp {
         let inner = Frame::default().fill(fill).corner_radius(CornerRadius::same(10)).inner_margin(Margin::symmetric(8, 8)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                avatar(ui, &store.thread_picture(t), &title, 56.0);
+                thread_avatar(ui, store, t, &title, 56.0);
                 ui.add_space(4.0);
                 let right_w = 44.0;
                 ui.allocate_ui_with_layout(
@@ -1531,7 +1531,7 @@ impl MessengerApp {
             .show(ui, |ui| {
                 titlebar_drag(ui, ui.max_rect());
                 ui.horizontal_centered(|ui| {
-                    avatar(ui, &store.thread_picture(thread), &title, 40.0);
+                    thread_avatar(ui, store, thread, &title, 40.0);
                     ui.add_space(2.0);
                     // Measure the text block so the row can center it next to the
                     // avatar (a plain `vertical` would hug the top of the header).
@@ -2606,7 +2606,7 @@ impl MessengerApp {
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(8.0);
-                avatar(ui, &store.thread_picture(t), &title, 72.0);
+                thread_avatar(ui, store, t, &title, 72.0);
                 ui.add_space(6.0);
                 ui.label(sf(&title, 17.0, 600));
                 ui.add_space(12.0);
@@ -3229,6 +3229,25 @@ fn seen_by_row(ui: &mut egui::Ui, store: &Store, thread: i64, readers: &[(i64, i
 fn avatar(ui: &mut egui::Ui, url: &str, name: &str, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     paint_avatar(ui, rect, url, name);
+}
+
+/// A chat's avatar. A group without its own picture shows two members,
+/// overlapping (Messenger's layout): one up right, one down left in front,
+/// cut out from the back one by a ring of the background color.
+fn thread_avatar(ui: &mut egui::Ui, store: &Store, t: &Thread, title: &str, size: f32) {
+    let pair = store.group_pictures(t);
+    let [(back_url, back_name), (front_url, front_name)] = pair.as_slice() else {
+        avatar(ui, &store.thread_picture(t), title, size);
+        return;
+    };
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let small = size * 0.68;
+    let back = Rect::from_min_size(Pos2::new(rect.right() - small, rect.top()), Vec2::splat(small));
+    let front = Rect::from_min_size(Pos2::new(rect.left(), rect.bottom() - small), Vec2::splat(small));
+    paint_avatar(ui, back, back_url, back_name);
+    let ring = if LIGHT_THEME.load(Ordering::Relaxed) { Color32::from_rgb(236, 238, 242) } else { Color32::from_rgb(24, 32, 50) };
+    ui.painter().circle_filled(front.center(), small / 2.0 + size * 0.04, ring);
+    paint_avatar(ui, front, front_url, front_name);
 }
 
 /// A round avatar: the picture once loaded, a grey disc while it loads, and the
