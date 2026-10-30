@@ -2764,7 +2764,15 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
             let max = if matches!(a.kind, AttachmentKind::Sticker) { 120.0 } else { 300.0 };
             let scale = (max / w).min(max / h).min(1.0).max(0.0);
             let size = Vec2::new((w * scale).max(80.0), (h * scale).max(80.0));
-            let r = ui.add(media_image(ui.ctx(), &a.preview_url).fit_to_exact_size(size).corner_radius(radius).sense(Sense::click()));
+            let image = media_image(ui.ctx(), &a.preview_url).fit_to_exact_size(size).corner_radius(radius).sense(Sense::click());
+            let loading = matches!(image.load_for_size(ui.ctx(), size), Ok(egui::load::TexturePoll::Pending { .. }));
+            // egui's own spinner fills the whole picture; while it loads show
+            // a quiet placeholder with a small spinner instead.
+            let r = ui.add(image.show_loading_spinner(false));
+            if loading {
+                ui.painter().rect_filled(r.rect, radius, pal().quote);
+                egui::Spinner::new().size(18.0).color(pal().muted).paint_at(ui, Rect::from_center_size(r.rect.center(), Vec2::splat(18.0)));
+            }
             if matches!(a.kind, AttachmentKind::Video) {
                 ui.painter().circle_filled(r.rect.center(), 24.0, Color32::from_black_alpha(150));
                 ui.painter().text(r.rect.center() + Vec2::new(2.0, 0.0), egui::Align2::CENTER_CENTER, "▶", egui::FontId::proportional(22.0), Color32::WHITE);
