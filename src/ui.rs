@@ -3235,7 +3235,7 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
             r
         }
         // A shared post or reel with a picture: the picture, then title and source.
-        AttachmentKind::Link if a.preview_url.starts_with("http") && a.url.is_empty() => {
+        AttachmentKind::Link if a.preview_url.starts_with("http") && a.preview_url != a.url => {
             // Fit the picture in 280×360 keeping its aspect ratio (portrait reel
             // thumbnails would otherwise be squashed); the card is as wide as it.
             let (w, h) = if a.width > 0.0 && a.height > 0.0 { (a.width, a.height) } else { (280.0, 160.0) };
@@ -3259,12 +3259,10 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
                         }
                     });
                 })
-                .response
-                .interact(Sense::click());
-            if r.clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(&a.preview_url));
-            }
-            r.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .response;
+            // The shared link (from the card's button), else the picture.
+            click_to_open(ui, &r, if a.url.is_empty() { &a.preview_url } else { &a.url });
+            r
         }
         AttachmentKind::Audio | AttachmentKind::File | AttachmentKind::Link => {
             let icon = match a.kind {
@@ -3294,13 +3292,24 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
                         });
                     });
                 })
-                .response
-                .interact(Sense::click());
-            if r.clicked() && !a.url.is_empty() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(&a.url));
-            }
-            r.on_hover_cursor(egui::CursorIcon::PointingHand)
+                .response;
+            click_to_open(ui, &r, &a.url);
+            r
         }
+    }
+}
+
+/// Open `target` in the browser when the card is clicked. The bubble's own
+/// click sense (for its menu) sits on top, so this tests the pointer directly
+/// instead of `Response::clicked`.
+fn click_to_open(ui: &egui::Ui, r: &egui::Response, target: &str) {
+    let viewer_open = ui.ctx().data(|d| d.get_temp::<Option<String>>(egui::Id::new(IMAGE_VIEWER))).flatten().is_some();
+    if target.is_empty() || viewer_open || !ui.rect_contains_pointer(r.rect) {
+        return;
+    }
+    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    if ui.input(|i| i.pointer.primary_clicked()) {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(target));
     }
 }
 

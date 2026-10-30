@@ -866,6 +866,20 @@ impl Store {
                 };
                 self.attach(c.arg(27).int(), &c.arg(32).string(), att);
             }
+            "insertAttachmentCta" => {
+                // A share card's button: 5 message id, 7 its kind ("xma_web_url"
+                // for a link, "xma_open_native" for a post), 9 where it goes.
+                let kind = c.arg(7).string();
+                let target = c.arg(9).string();
+                if matches!(kind.as_str(), "xma_web_url" | "xma_open_native") && target.starts_with("http") {
+                    let target = unwrap_redirect(&target);
+                    if let Some(m) = self.find_message_mut(None, &c.arg(5).string()) {
+                        if let Some(a) = m.attachments.iter_mut().find(|a| a.kind == AttachmentKind::Link && a.url.is_empty()) {
+                            a.url = target;
+                        }
+                    }
+                }
+            }
             "insertXmaAttachment" => {
                 // Shares (posts, reels, photos from pages). Observed layout:
                 // 8 preview image, 11 its MIME type, 13/14 its size, 25 thread,
@@ -1121,5 +1135,25 @@ impl Store {
             _ => return None,
         };
         Some(format!("Active {ago} ago"))
+    }
+}
+
+/// Facebook wraps outside links in `l.facebook.com/l.php?u=<link>&h=…`: open
+/// the link itself.
+fn unwrap_redirect(link: &str) -> String {
+    url::Url::parse(link)
+        .ok()
+        .filter(|u| matches!(u.host_str(), Some("l.facebook.com" | "lm.facebook.com")))
+        .and_then(|u| u.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()))
+        .filter(|u| u.starts_with("http"))
+        .unwrap_or_else(|| link.to_string())
+}
+
+#[cfg(test)]
+mod redirect_tests {
+    #[test]
+    fn unwraps_facebook_redirect() {
+        assert_eq!(super::unwrap_redirect("https://l.facebook.com/l.php?u=https%3A%2F%2Fgithub.com%2Fa%2Fb&h=AT0"), "https://github.com/a/b");
+        assert_eq!(super::unwrap_redirect("https://www.facebook.com/reel/1"), "https://www.facebook.com/reel/1");
     }
 }
