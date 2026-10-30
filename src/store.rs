@@ -238,6 +238,18 @@ impl Store {
         if !t.name.is_empty() {
             return t.name.clone();
         }
+        // One-to-one chats show the other person's nickname, like Messenger.
+        // An encrypted chat may carry it, or the regular chat with them
+        // (keyed by their id).
+        if !t.is_group() {
+            let other = if t.thread_type == 1 { Some(t.key) } else { t.participants.iter().copied().find(|p| *p != self.me) };
+            if let Some(other) = other {
+                let nick = [t.key, other].iter().find_map(|k| self.nicknames.get(k).and_then(|n| n.get(&other)).filter(|n| !n.trim().is_empty()));
+                if let Some(nick) = nick {
+                    return nick.clone();
+                }
+            }
+        }
         if t.thread_type == 1 {
             if let Some(c) = self.contacts.get(&t.key) {
                 return c.name.clone();
