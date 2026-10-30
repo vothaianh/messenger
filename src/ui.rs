@@ -1138,7 +1138,9 @@ const READ_THREAD_JS: &str = r#"
     for (const a of atts) {
         attachments.push({ id: a.messageId, mime: a.previewUrlMimeType || '', preview: await open(a.previewUrl), w: str(a.previewWidth), h: str(a.previewHeight), title: await open(a.titleText), thumb: await thumbnail(a),
             media: typeof a.attachmentFbid === 'string' && a.attachmentFbid !== '' && !/^\d+$/.test(a.attachmentFbid),
-            xma: !!a.hasXma, cta: typeof a.defaultCtaType === 'string' ? a.defaultCtaType : '' });
+            xma: !!a.hasXma, cta: typeof a.defaultCtaType === 'string' ? a.defaultCtaType : '',
+            subtitle: await open(a.subtitleText), description: await open(a.descriptionText),
+            dataclass: typeof a.xmaDataclass === 'string' ? a.xmaDataclass : '' });
     }
     return JSON.stringify({ messages, attachments });
 "#;
@@ -1203,15 +1205,61 @@ fn parse_restored(json: &str) -> Vec<Message> {
     out
 }
 
+/// A call length like the phone shows it: "4 min 26 sec", "1 hr 3 min", "12 sec".
+fn call_duration(secs: i64) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    match (h, m) {
+        (0, 0) => format!("{s} sec"),
+        (0, _) => format!("{m} min {s} sec"),
+        _ => format!("{h} hr {m} min"),
+    }
+}
+
 /// What to show for a restored attachment the app can't display. Calls are
 /// share cards (XMA) whose default action is `xma_rtc_*`; their title (e.g.
 /// "Video call ended") is used when the page could open it.
 fn restored_label(a: &serde_json::Value, mime: &str) -> String {
     let cta = a["cta"].as_str().unwrap_or_default();
-    let title = a["title"].as_str().unwrap_or_default().trim();
+    let readable = |k: &str| a[k].as_str().map(str::trim).filter(|t| !t.is_empty() && !crate::store::is_secure_text_token(t)).map(str::to_string);
+    let title = readable("title").unwrap_or_default();
+    let title = title.as_str();
+    if std::env::var_os("MESSENGER_DEBUG").is_some() && cta.starts_with("xma_rtc") {
+        // Which fields are readable, not their text.
+        fn paths(v: &serde_json::Value, at: String, out: &mut Vec<String>) {
+            match v {
+                serde_json::Value::Object(o) => o.iter().for_each(|(k, x)| paths(x, format!("{at}.{k}"), out)),
+                serde_json::Value::Array(l) => l.iter().take(2).enumerate().for_each(|(i, x)| paths(x, format!("{at}[{i}]"), out)),
+                serde_json::Value::String(s) => out.push(format!("{at}:str{}", s.len())),
+                other => out.push(format!("{at}:{}", if other.is_number() { "num" } else { "other" })),
+            }
+        }
+        let mut dataclass_keys = Vec::new();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(a["dataclass"].as_str().unwrap_or("{}")) {
+            paths(&v, String::new(), &mut dataclass_keys);
+        }
+        eprintln!("[history] call card: title {} subtitle {} description {} dataclass keys {dataclass_keys:?}", !title.is_empty(), readable("subtitle").is_some(), readable("description").is_some());
+    }
+    // Call cards keep the call in `xmaDataclass.content.custom_template_data`:
+    // `call_type` (video/audio), `call_state`, `call_duration_sec`.
+    let call = serde_json::from_str::<serde_json::Value>(a["dataclass"].as_str().unwrap_or("{}")).ok().map(|v| v["content"]["custom_template_data"].clone()).filter(|c| c.is_object());
+    if let Some(c) = call.filter(|_| cta.starts_with("xma_rtc")) {
+        let video = c["call_type"].as_str().map_or(cta.contains("video"), |t| t.contains("video"));
+        let secs = c["call_duration_sec"].as_i64().unwrap_or(0);
+        let state = c["call_state"].as_str().unwrap_or_default().to_lowercase();
+        let kind = if video { "Video call" } else { "Audio call" };
+        if state.contains("miss") || (secs == 0 && cta.contains("missed")) {
+            return format!("📞 Missed {}", kind.to_lowercase());
+        }
+        return if secs > 0 { format!("📞 {kind} · {}", call_duration(secs)) } else { format!("📞 {kind}") };
+    }
     if cta.starts_with("xma_rtc") {
-        if !title.is_empty() && !crate::store::is_secure_text_token(title) {
-            return format!("📞 {title}");
+        // "Video call" plus the duration line ("4 min 26 sec"), like the phone.
+        let detail = readable("subtitle").or_else(|| readable("description"));
+        if !title.is_empty() {
+            return match detail {
+                Some(d) => format!("📞 {title} · {d}"),
+                None => format!("📞 {title}"),
+            };
         }
         let video = cta.contains("video");
         return match (cta.contains("missed"), video) {
