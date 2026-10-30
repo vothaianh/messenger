@@ -324,6 +324,13 @@ impl MessengerApp {
             HistoryStage::Reading(id) => {
                 if let Some(result) = crate::macos::web_result(id) {
                     if let Ok(text) = result {
+                        if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                            // Counts only.
+                            let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                            let atts = v["attachments"].as_array().map_or(0, Vec::len);
+                            let thumbs = v["attachments"].as_array().map_or(0, |l| l.iter().filter(|a| a["thumb"].as_str().is_some_and(|t| !t.is_empty())).count());
+                            eprintln!("[history] read: {} messages, {atts} attachments, {thumbs} pictures", v["messages"].as_array().map_or(0, Vec::len));
+                        }
                         let restored = parse_restored(&text);
                         let added = self.shared.store.lock().unwrap().add_restored(job.thread, restored);
                         job.found += added;
@@ -971,7 +978,7 @@ fn web_probe(ctx: &egui::Context) {
             PROBE.set((1, 0, Some(Instant::now())));
         }
         1 if crate::macos::web_loaded() && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(8)) => {
-            let body = if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("restore") { RESTORE_PROBE_JS } else { r#"
+            let body = if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("restore") { RESTORE_PROBE_JS } else if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("media") { MEDIA_PROBE_JS } else { r#"
                 const out = {path: location.pathname, hasRequire: typeof require};
                 try { out.vesta = Object.keys(require('VestaClient')); } catch (e) { out.vestaErr = String(e).slice(0, 80); }
                 try {
@@ -1035,6 +1042,23 @@ const OPEN_THREAD_JS: &str = r#"
 
 /// Read one chat's messages (`threadKey`) and their attachments from the web
 /// client's database, as JSON. 64-bit columns are I64 pairs in that database.
+/// Read-only probe (`MESSENGER_WEB_PROBE=media`): where the web keeps the
+/// keys of encrypted media. Database, store and field names only, no content.
+const MEDIA_PROBE_JS: &str = r#"
+    const want = ['MAWGetAttachmentThumbnailBlob', 'MAWFetchAndPersistMedia', 'MWMediaManager', 'MAWDownloadMediaInWorker'];
+    const out = {};
+    for (const src of Array.from(document.scripts).map((s) => s.src).filter(Boolean)) {
+        try {
+            const t = await (await fetch(src)).text();
+            for (const w of want) {
+                const i = t.indexOf('__d("' + w + '"');
+                if (i >= 0 && !out[w]) out[w] = t.slice(i, i + 2500);
+            }
+        } catch (e) {}
+    }
+    return JSON.stringify(out);
+"#;
+
 const READ_THREAD_JS: &str = r#"
     const I64 = require('I64');
     const ReQL = require('ReQL');
@@ -1057,9 +1081,32 @@ const READ_THREAD_JS: &str = r#"
     for (const r of rows) {
         messages.push({ id: r.messageId, ts: str(r.timestampMs), sender: str(r.senderId), text: await open(r.text), unsent: !!r.isUnsent, admin: !!r.isAdminMessage });
     }
+    // Encrypted photos have no link: ask the web's media backend for the
+    // picture by its plaintext hash (attachmentFbid), as the web's own
+    // thumbnail view does, and hand it over as a data: URL.
+    const toDataUrl = async (url) => {
+        if (typeof url !== 'string' || !url) return '';
+        if (url.startsWith('data:')) return url;
+        if (!url.startsWith('blob:')) return '';
+        const blob = await (await fetch(url)).blob();
+        return await new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(String(r.result)); r.onerror = () => ok(''); r.readAsDataURL(blob); });
+    };
+    const thumbnail = async (a) => {
+        try {
+            const preview = await open(a.previewUrl);
+            if (preview && !String(preview).startsWith('http')) return await toDataUrl(preview);
+            const hash = a.attachmentFbid;
+            if (typeof hash !== 'string' || !hash || /^\d+$/.test(hash)) return '';
+            const url = await Promise.race([
+                require('MAWBridgeSendAndReceive').sendAndReceive('backend', 'getThumbnailBlobDataUrlByHashedPlaintextHash', { description: 'messenger_desktop', plaintextHash: require('WAHashUtils').stringToPlaintextHash(hash) }),
+                new Promise((ok) => setTimeout(() => ok(''), 10000)),
+            ]);
+            return await toDataUrl(url);
+        } catch (e) { return ''; }
+    };
     const attachments = [];
     for (const a of atts) {
-        attachments.push({ id: a.messageId, mime: a.previewUrlMimeType || '', preview: await open(a.previewUrl), w: str(a.previewWidth), h: str(a.previewHeight), title: await open(a.titleText) });
+        attachments.push({ id: a.messageId, mime: a.previewUrlMimeType || '', preview: await open(a.previewUrl), w: str(a.previewWidth), h: str(a.previewHeight), title: await open(a.titleText), thumb: await thumbnail(a) });
     }
     return JSON.stringify({ messages, attachments });
 "#;
@@ -1090,7 +1137,21 @@ fn parse_restored(json: &str) -> Vec<Message> {
         let Some(m) = out.iter_mut().find(|m| m.id == a["id"].as_str().unwrap_or_default()) else { continue };
         let mime = a["mime"].as_str().unwrap_or_default();
         let preview = a["preview"].as_str().unwrap_or_default();
-        if preview.starts_with("http") {
+        let local = a["thumb"].as_str().and_then(save_restored_picture);
+        if let Some(uri) = local {
+            m.attachments.push(Attachment {
+                kind: AttachmentKind::Image,
+                url: uri.clone(),
+                preview_url: uri,
+                title: String::new(),
+                subtitle: String::new(),
+                width: num(&a["w"]) as f32,
+                height: num(&a["h"]) as f32,
+            });
+            if matches!(m.text.as_str(), "📷 Photo" | "🎬 Video") {
+                m.text.clear();
+            }
+        } else if preview.starts_with("http") {
             m.attachments.push(Attachment {
                 kind: if mime.starts_with("video") { AttachmentKind::Video } else { AttachmentKind::Image },
                 url: preview.to_string(),
@@ -1108,6 +1169,22 @@ fn parse_restored(json: &str) -> Vec<Message> {
     // read may have it.
     out.retain(|m| !m.text.is_empty() || !m.attachments.is_empty() || m.unsent);
     out
+}
+
+/// Save a restored photo (a `data:image/...;base64,` URL from the web) to
+/// the media cache, 0600, named by its hash. Returns its `file://` URL.
+fn save_restored_picture(data_url: &str) -> Option<String> {
+    use base64::Engine;
+    use sha2::Digest;
+    let (head, body) = data_url.strip_prefix("data:")?.split_once(',')?;
+    let ext = head.strip_prefix("image/")?.split(';').next()?.replace("jpeg", "jpg");
+    let bytes = base64::engine::general_purpose::STANDARD.decode(body).ok()?;
+    let name: String = sha2::Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+    let path = crate::e2ee_media::cache_dir().ok()?.join(format!("{name}.{ext}"));
+    if !path.exists() {
+        crate::e2ee_media::write_private(&path, &bytes).ok()?;
+    }
+    Some(format!("file://{}", path.display()))
 }
 
 #[derive(Default)]

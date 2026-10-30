@@ -573,7 +573,20 @@ impl Store {
         let known: HashSet<String> = self.messages.get(&thread_key).map(|v| v.iter().map(|m| m.id.clone()).collect()).unwrap_or_default();
         let mut added = 0;
         for mut m in messages {
-            if m.id.is_empty() || known.contains(&m.id) {
+            if m.id.is_empty() {
+                continue;
+            }
+            if known.contains(&m.id) {
+                // A photo first restored as a "📷 Photo" label, now with its picture.
+                if !m.attachments.is_empty() {
+                    if let Some(old) = self.messages.get_mut(&thread_key).and_then(|v| v.iter_mut().find(|x| x.id == m.id)) {
+                        if old.attachments.is_empty() {
+                            old.attachments = m.attachments;
+                            old.text = m.text;
+                            added += 1;
+                        }
+                    }
+                }
                 continue;
             }
             // The same message received live over E2EE has another id here.
