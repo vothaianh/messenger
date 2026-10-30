@@ -1057,7 +1057,18 @@ impl Conn {
                     Some(-1) => -1,
                     Some(m) => now_ms() + m * 60_000,
                 };
-                let p = json!({"thread_key": thread, "mailbox_type": 0, "mute_expire_time_ms": expire, "sync_group": 1});
+                // Show it right away; the server's update may not be pushed back.
+                let e2ee = {
+                    let mut st = self.shared.store.lock().unwrap();
+                    st.threads.get_mut(&thread).map_or(false, |t| {
+                        t.muted = expire != 0;
+                        t.e2ee
+                    })
+                };
+                (self.repaint)();
+                // The web sends the thread's own sync group (default 1);
+                // encrypted chats live in database 95.
+                let p = json!({"thread_key": thread, "mailbox_type": 0, "mute_expire_time_ms": expire, "sync_group": if e2ee { 95 } else { 1 }});
                 self.tasks(vec![("144", p, thread.to_string())])
             }
         }))

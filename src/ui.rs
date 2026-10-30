@@ -982,7 +982,7 @@ fn web_probe(ctx: &egui::Context) {
             PROBE.set((1, 0, Some(Instant::now())));
         }
         // The media probe reads the chat the history job opened instead.
-        1 if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("media") && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(40)) => {
+        1 if std::env::var("MESSENGER_WEB_PROBE").as_deref() == Ok("media") && crate::macos::web_loaded() && since.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(40)) => {
             if let Some(id) = crate::macos::web_call(MEDIA_PROBE_JS) {
                 PROBE.set((2, id, since));
             }
@@ -1055,23 +1055,13 @@ const OPEN_THREAD_JS: &str = r#"
 /// Read-only probe (`MESSENGER_WEB_PROBE=media`): where the web keeps the
 /// keys of encrypted media. Database, store and field names only, no content.
 const MEDIA_PROBE_JS: &str = r#"
-    // Run with the hidden page on an encrypted chat (the app opens the
-    // selected one). Table and field names only.
-    await new Promise((ok) => setTimeout(ok, 20000));
-    const I64 = require('I64');
-    const ReQL = require('ReQL');
-    const db = await require('LSDatabaseSingleton').getLSDatabaseSingletonPromiseOrValue();
-    const str = (v) => v == null ? null : (Array.isArray(v) ? I64.to_string(v) : String(v));
-    const key = (location.pathname.match(/\/t\/(\d+)/) || [])[1];
-    const msgs = (await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables.messages))).filter((r) => str(r.threadKey) === key);
-    const ids = new Set(msgs.map((m) => m.messageId));
-    const out = { path: location.pathname, messages: msgs.length, tables: {}, msgFields: {} };
-    for (const m of msgs) for (const k of Object.keys(m)) if (m[k] != null && m[k] !== '' && m[k] !== false) out.msgFields[k] = (out.msgFields[k] || 0) + 1;
-    for (const name of Object.keys(db.tables)) {
+    // Where the web builds the mute task (label 144): read its own scripts.
+    const out = [];
+    for (const src of Array.from(document.scripts).map((s) => s.src).filter(Boolean)) {
         try {
-            const rows = await ReQL.toArrayAsync(ReQL.fromTableAscending(db.tables[name]));
-            const hit = rows.filter((r) => r && (ids.has(r.messageId) || ids.has(r.message_id)));
-            if (hit.length && name !== 'messages') out.tables[name] = { rows: hit.length, fields: Object.keys(hit[0]) };
+            const t = await (await fetch(src)).text();
+            let i = -1;
+            while ((i = t.indexOf('mute_expire_time_ms', i + 1)) >= 0 && out.length < 6) out.push(t.slice(Math.max(0, i - 700), i + 300));
         } catch (e) {}
     }
     return JSON.stringify(out);
@@ -2805,11 +2795,9 @@ impl MessengerApp {
                 ui.add_space(12.0);
             });
             // Round action buttons, centered as a group.
-            let actions: Vec<(&str, &str)> = if t.thread_type == 1 {
-                vec![("👤", "Profile"), (if t.muted { "🔔" } else { "🔕" }, if t.muted { "Unmute" } else { "Mute" })]
-            } else {
-                vec![(if t.muted { "🔔" } else { "🔕" }, if t.muted { "Unmute" } else { "Mute" })]
-            };
+            // SF Symbols, not emoji (AGENTS.md).
+            let mute = if t.muted { ("bell", "Unmute") } else { ("bell.slash", "Mute") };
+            let actions: Vec<(&str, &str)> = if t.thread_type == 1 { vec![("person", "Profile"), mute] } else { vec![mute] };
             let group_w = actions.len() as f32 * 72.0;
             ui.horizontal(|ui| {
                 ui.add_space(((ui.available_width() - group_w) / 2.0).max(0.0));
@@ -3196,7 +3184,19 @@ fn round_action(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
     ui.allocate_ui_with_layout(Vec2::new(64.0, 64.0), Layout::top_down(Align::Center), |ui| {
         let (rect, r) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
         ui.painter().circle_filled(rect.center(), 18.0, if r.hovered() { pal().border } else { pal().input });
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(16.0), pal().text);
+        let ink = pal().text;
+        match crate::macos::sf_symbol_png(icon, 15.0, [ink.r(), ink.g(), ink.b()]) {
+            Some(png) => {
+                let dim = |i: usize| png.get(i..i + 4).map_or(1.0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f32);
+                let (w, h) = (dim(16), dim(20));
+                let scale = 18.0 / w.max(h);
+                let target = Rect::from_center_size(rect.center(), Vec2::new(w * scale, h * scale));
+                egui::Image::from_bytes(format!("bytes://sf/{icon}-{:?}.png", ink.to_array()), png).paint_at(ui, target);
+            }
+            None => {
+                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, &icon[..1], egui::FontId::proportional(16.0), ink);
+            }
+        }
         ui.label(sf(label, 12.0, 400));
         clicked = r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
     });
