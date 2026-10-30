@@ -2228,9 +2228,11 @@ impl MessengerApp {
                     .inner_margin(Margin::symmetric(12, 8))
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.add(egui::Label::new(sf(&m.text, 15.0, 400).color(Color32::WHITE)).wrap());
+                        // White only on the blue of own messages; others use the theme's ink.
+                        let ink = if mine { Color32::WHITE } else { pal().text };
+                        ui.add(egui::Label::new(sf(&m.text, 15.0, 400).color(ink)).wrap());
                         if m.edited {
-                            ui.label(sf("Edited", 11.0, 400).color(Color32::from_white_alpha(170)));
+                            ui.label(sf("Edited", 11.0, 400).color(if mine { Color32::from_white_alpha(170) } else { pal().muted }));
                         }
                     })
                     .response
