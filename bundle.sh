@@ -24,6 +24,7 @@ else
   iconutil -c icns target/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 fi
 cp "target/$PROFILE/messenger-rs" "$APP/Contents/MacOS/Messenger Desktop"
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -34,27 +35,56 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
 # Sign with a stable identity when one exists, so Keychain's "Always Allow"
 # survives rebuilds (ad-hoc signatures change every build). Override with
-# SIGN_IDENTITY=... ; falls back to ad-hoc signing.
-IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -1)}"
+# SIGN_IDENTITY=... ; falls back to ad-hoc signing. Distribution builds use
+# the "Developer ID Application" certificate (needed outside this Mac).
+find_identity() { security find-identity -v -p codesigning | sed -n "s/.*\"\($1:[^\"]*\)\".*/\1/p" | head -1; }
+DEV_IDENTITY="$(find_identity "Apple Development")"
+if [ -n "$DIST" ]; then
+  IDENTITY="${SIGN_IDENTITY:-$(find_identity "Developer ID Application")}"
+  IDENTITY="${IDENTITY:-$DEV_IDENTITY}"
+else
+  IDENTITY="${SIGN_IDENTITY:-$DEV_IDENTITY}"
+fi
 if [ -n "$DIST" ] && [ -n "$IDENTITY" ]; then
   codesign --force --deep --options runtime --timestamp -s "$IDENTITY" "$APP"
 else
   codesign --force --deep -s "${IDENTITY:--}" "$APP"
 fi
-echo "Signed with: ${IDENTITY:-ad-hoc}"
-# Sign the bare binary (used by debug-* commands) with the same identity and
-# identifier, so it matches the Keychain grant and doesn't prompt either.
-codesign --force -s "${IDENTITY:--}" --identifier dev.local.messenger-desktop target/release/messenger-rs
+echo "Signed with: ${IDENTITY:-ad-hoc} (version $VERSION)"
+# Sign the bare binary (used by debug-* commands) with the development
+# identity and the app's identifier, so it matches the Keychain grant.
+if [ -f target/release/messenger-rs ]; then
+  codesign --force -s "${DEV_IDENTITY:--}" --identifier dev.local.messenger-desktop target/release/messenger-rs
+fi
 echo "Built $APP"
 if [ -n "$DIST" ]; then
-  rm -f "target/Messenger Desktop.zip"
-  ditto -c -k --keepParent "$APP" "target/Messenger Desktop.zip"
-  echo "Zipped target/Messenger Desktop.zip"
+  ZIP="target/Messenger Desktop.zip"
+  rm -f "$ZIP"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+  # Notarize when credentials were saved once with
+  #   xcrun notarytool store-credentials messenger-notary --apple-id ... --team-id ...
+  # (NOTARY_PROFILE picks another name), then staple the ticket and re-zip.
+  NOTARY_PROFILE="${NOTARY_PROFILE:-messenger-notary}"
+  case "$IDENTITY" in
+    "Developer ID Application:"*)
+      if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+        xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
+        xcrun stapler staple "$APP"
+        rm -f "$ZIP"
+        ditto -c -k --keepParent "$APP" "$ZIP"
+        echo "Notarized and stapled"
+      else
+        echo "Not notarized: no notarytool profile \"$NOTARY_PROFILE\" (see bundle.sh)"
+      fi
+      ;;
+  esac
+  echo "Zipped $ZIP"
 fi
