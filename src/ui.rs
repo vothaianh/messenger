@@ -574,8 +574,8 @@ impl eframe::App for MessengerApp {
         web_probe(&ctx);
         image_viewer(&ctx);
         let status = self.shared.status.lock().unwrap().clone();
-        if let Status::LoggedOut(msg) = &status {
-            self.login_screen(ui, msg);
+        if let Status::LoggedOut(_) = &status {
+            self.login_screen(ui);
             crate::macos::sync_glass(&self.glass);
             return;
         }
@@ -1279,22 +1279,17 @@ fn glass_rect(r: Rect, radius: f32) -> crate::macos::GlassRect {
 }
 
 impl MessengerApp {
-    /// Logged out or session expired: Facebook's login page inside the main
+    /// Logged out or session expired: Facebook's login page filling the main
     /// window. Once it yields a new session, save it and relaunch with it.
-    fn login_screen(&mut self, ui: &mut egui::Ui, msg: &str) {
+    fn login_screen(&mut self, ui: &mut egui::Ui) {
         const LOGIN_URL: &str = "https://www.facebook.com/login/?next=https%3A%2F%2Fwww.facebook.com%2Fmessages%2F";
         let full = ui.available_rect_before_wrap();
         ui.allocate_rect(full, Sense::hover());
         titlebar_drag(ui, full.with_max_y(full.top() + TITLEBAR));
 
-        let heading = if msg.contains("expired") { "Your session expired. Log in to continue." } else { "Log in to Messenger Desktop" };
-        let top = full.top() + TITLEBAR + 12.0;
-        let title = Rect::from_min_size(Pos2::new(full.left(), top), Vec2::new(full.width(), 28.0));
-        ui.put(title, egui::Label::new(sf(heading, 17.0, 600).color(pal().text)));
-        let width = 480.0f32.min(full.width() - 2.0 * (GLASS_INSET + 16.0));
-        let card = Rect::from_min_size(Pos2::new(full.center().x - width / 2.0, title.bottom() + 16.0), Vec2::new(width, (full.bottom() - title.bottom() - 40.0).min(780.0)));
-        self.glass.push(glass_rect(card.expand(GLASS_INSET), GLASS_RADIUS));
-        crate::macos::login_view(LOGIN_URL, crate::session::USER_AGENT, [card.left(), card.top(), card.width(), card.height()]);
+        // The page fills the window below the titlebar strip (traffic lights).
+        let page = full.with_min_y(full.top() + TITLEBAR);
+        crate::macos::login_view(LOGIN_URL, crate::session::USER_AGENT, [page.left(), page.top(), page.width(), page.height()]);
 
         let stale = self.login_stale_xs.get_or_insert_with(|| crate::session::Cookies::load().and_then(|c| c.get("xs").map(str::to_owned)));
         if let Some(header) = crate::macos::login_cookies() {
