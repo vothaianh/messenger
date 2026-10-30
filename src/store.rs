@@ -595,7 +595,7 @@ impl Store {
                 // first shown as "📷 Photo".
                 if m.attachments.is_empty() && !m.text.is_empty() {
                     if let Some(old) = self.messages.get_mut(&thread_key).and_then(|v| v.iter_mut().find(|x| x.id == m.id)) {
-                        if old.attachments.is_empty() && (is_media_label(&old.text) || old.text.starts_with("📞")) && old.text != m.text {
+                        if old.attachments.is_empty() && (is_media_label(&old.text) || old.text.starts_with("📞") || old.text.starts_with("📹")) && old.text != m.text {
                             old.text = m.text;
                             added += 1;
                         }

@@ -1246,11 +1246,12 @@ fn restored_label(a: &serde_json::Value, mime: &str) -> String {
         let video = c["call_type"].as_str().map_or(cta.contains("video"), |t| t.contains("video"));
         let secs = c["call_duration_sec"].as_i64().unwrap_or(0);
         let state = c["call_state"].as_str().unwrap_or_default().to_lowercase();
-        let kind = if video { "Video call" } else { "Audio call" };
+        // 📹 for video, 📞 for audio; the length on its own line, like the phone.
+        let (icon, kind) = if video { ("📹", "Video call") } else { ("📞", "Audio call") };
         if state.contains("miss") || (secs == 0 && cta.contains("missed")) {
-            return format!("📞 Missed {}", kind.to_lowercase());
+            return format!("{icon} Missed {}", kind.to_lowercase());
         }
-        return if secs > 0 { format!("📞 {kind} · {}", call_duration(secs)) } else { format!("📞 {kind}") };
+        return if secs > 0 { format!("{icon} {kind}\n{}", call_duration(secs)) } else { format!("{icon} {kind}") };
     }
     if cta.starts_with("xma_rtc") {
         // "Video call" plus the duration line ("4 min 26 sec"), like the phone.
