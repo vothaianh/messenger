@@ -1600,7 +1600,16 @@ impl MessengerApp {
             })
             .collect();
 
-        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        if std::env::var_os("MESSENGER_DEBUG").is_some() {
+            // Why a wheel scroll over the list does nothing (pointer state only).
+            let (delta, down, pos) = ui.input(|i| (i.smooth_scroll_delta, i.pointer.any_down(), i.pointer.hover_pos()));
+            if delta != Vec2::ZERO {
+                eprintln!("[scroll] list wheel {delta:?} over={} button_down={down} dragged={:?} pos={pos:?} rect={:?}", ui.rect_contains_pointer(ui.max_rect()), ui.ctx().dragged_id(), ui.max_rect());
+            }
+        }
+        // Explicit ids: without them this list and the info panel's scroll
+        // area could share one, and each frame one reset the other's offset.
+        ScrollArea::vertical().id_salt("thread_list").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for t in threads {
                 self.thread_row(ui, store, t, cmds);
@@ -2811,7 +2820,7 @@ impl MessengerApp {
         let title = store.thread_title(t);
         let strip = ui.allocate_space(Vec2::new(ui.available_width(), TITLEBAR)).1;
         titlebar_drag(ui, strip);
-        ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ScrollArea::vertical().id_salt("info_panel").auto_shrink([false, false]).show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(8.0);
                 thread_avatar(ui, store, t, &title, 72.0);
