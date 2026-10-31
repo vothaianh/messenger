@@ -525,7 +525,7 @@ impl Conn {
                         Ok(None) => {}
                         Err(e) => {
                             eprintln!("[command] failed: {e:#}");
-                            *self.shared.error.lock().unwrap() = Some(e.to_string());
+                            *self.shared.error.lock().unwrap() = Some("Couldn't complete that.".into());
                             (self.repaint)();
                         }
                     }
@@ -678,7 +678,7 @@ impl Conn {
                 }
                 Err(e) => {
                     eprintln!("[command] task failed: {e:#}");
-                    *shared.error.lock().unwrap() = Some(format!("Couldn't complete that: {e}"));
+                    *shared.error.lock().unwrap() = Some("Couldn't complete that.".into());
                     repaint();
                 }
             }
@@ -779,7 +779,7 @@ impl Conn {
                 Err(e) => {
                     eprintln!("[stickers] tray change: {e:#}");
                     drop(st);
-                    *shared.error.lock().unwrap() = Some(format!("Couldn't {} the sticker pack: {e}", if add { "add" } else { "remove" }));
+                    *shared.error.lock().unwrap() = Some(format!("Couldn't {} the sticker pack.", if add { "add" } else { "remove" }));
                 }
             }
             repaint();
@@ -882,7 +882,8 @@ impl Conn {
             // On success the sent message is already in the store (via the inbox record).
             shared.store.lock().unwrap().remove_pending(thread, otid);
             if let Err(e) = outcome {
-                *shared.error.lock().unwrap() = Some(format!("Couldn't send the encrypted message: {e}"));
+                eprintln!("[e2ee] send failed: {e}");
+                *shared.error.lock().unwrap() = Some("Couldn't send the encrypted message.".into());
             }
             repaint();
         });

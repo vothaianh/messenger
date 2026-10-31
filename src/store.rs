@@ -190,7 +190,15 @@ impl Store {
         let mut store = Store { me: snap.me, ..Default::default() };
         store.contacts = snap.contacts.into_iter().map(|c| (c.id, c)).collect();
         store.threads = snap.threads.into_iter().map(|t| (t.key, t)).collect();
-        for m in snap.messages {
+        for mut m in snap.messages {
+            // Caches from before 1.0.8 can hold the same share many times.
+            let mut kept: Vec<Attachment> = Vec::new();
+            for a in m.attachments.drain(..) {
+                if !kept.iter().any(|k| same_attachment(k, &a)) {
+                    kept.push(a);
+                }
+            }
+            m.attachments = kept;
             store.seen_ids.insert(m.id.clone());
             store.messages.entry(m.thread_key).or_default().push(m);
         }
@@ -1075,12 +1083,7 @@ impl Store {
         }
         let thread = if thread == 0 { None } else { Some(thread) };
         if let Some(m) = self.find_message_mut(thread, message_id) {
-            // The same share can arrive twice with differently signed CDN URLs
-            // (other host, other query): compare the file path only.
-            fn key(a: &Attachment) -> (&str, &str) {
-                (media_path(&a.url), media_path(&a.preview_url))
-            }
-            if !m.attachments.iter().any(|a| key(a) == key(&att)) {
+            if !m.attachments.iter().any(|a| same_attachment(a, &att)) {
                 m.attachments.push(att);
             }
             let (thread, id) = (m.thread_key, m.id.clone());
@@ -1094,6 +1097,20 @@ impl Call {
     /// some versions and 0/1 ints on others.
     fn typing_flag(&self) -> bool {
         self.arg(2).bool()
+    }
+}
+
+/// The same share can arrive again with differently signed CDN URLs (other
+/// host, folder or query), and a share's `url` is filled in later from its
+/// CTA (`link_message_shares`), so a resent one has none: compare the
+/// preview's file name, or the link when there's no preview.
+fn same_attachment(a: &Attachment, b: &Attachment) -> bool {
+    let name = |u: &str| media_path(u).rsplit('/').next().unwrap_or("").to_string();
+    let (pa, pb) = (name(&a.preview_url), name(&b.preview_url));
+    if !pa.is_empty() || !pb.is_empty() {
+        pa == pb
+    } else {
+        media_path(&a.url) == media_path(&b.url)
     }
 }
 
@@ -1235,6 +1252,28 @@ fn unwrap_redirect(link: &str) -> String {
         .and_then(|u| u.query_pairs().find(|(k, _)| k == "u").map(|(_, v)| v.into_owned()))
         .filter(|u| u.starts_with("http"))
         .unwrap_or_else(|| link.to_string())
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[test]
+    fn resent_share_is_the_same_attachment() {
+        let share = |url: &str, preview: &str| Attachment {
+            kind: AttachmentKind::Link,
+            url: url.into(),
+            preview_url: preview.into(),
+            title: "t".into(),
+            subtitle: String::new(),
+            width: 0.0,
+            height: 0.0,
+        };
+        let linked = share("https://example.com/post", "https://a.fbcdn.net/v/t15/1_2_n.jpg?x=1");
+        let resent = share("", "https://b.fbcdn.net/v/t39/1_2_n.jpg?x=2");
+        assert!(same_attachment(&linked, &resent));
+        assert!(!same_attachment(&linked, &share("", "https://a.fbcdn.net/v/t15/3_4_n.jpg")));
+    }
 }
 
 #[cfg(test)]

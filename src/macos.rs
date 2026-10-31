@@ -904,18 +904,29 @@ pub fn titlebar_mouse_down() -> bool {
 /// it's loaded, else the system emoji, and the person's name.
 pub struct PopoverRow {
     pub png: Option<Vec<u8>>,
+    /// Empty (and no `png`): a text-only row, as in a tooltip.
     pub emoji: String,
     pub name: String,
+}
+
+/// What `hover_popover` shows: `key` identifies the content (the same key
+/// keeps the open popover), `window` the title of the egui viewport's window
+/// it belongs to (None: the main window), `rect` where it points (that
+/// window's egui points, top-left origin: x, y, width, height).
+pub struct HoverTip {
+    pub key: String,
+    pub window: Option<String>,
+    pub rect: [f32; 4],
+    pub rows: Vec<PopoverRow>,
 }
 
 thread_local! {
     static POPOVER: RefCell<Option<(String, Retained<objc2_app_kit::NSPopover>)>> = const { RefCell::new(None) };
 }
 
-/// Show a native popover (Liquid Glass on macOS 26) above `rect` (egui
-/// points, top-left origin: x, y, width, height), or close it with `None`.
-/// `key` identifies the content: the same key keeps the open popover.
-pub fn hover_popover(show: Option<(String, [f32; 4], Vec<PopoverRow>)>) {
+/// Show a native popover (Liquid Glass on macOS 26) above the tip's rect, or
+/// close it with `None`. Used for tooltips and who reacted.
+pub fn hover_popover(show: Option<HoverTip>) {
     use objc2_app_kit::{
         NSImageScaling, NSImageView, NSLayoutAttribute, NSPopover, NSPopoverBehavior, NSStackView, NSTextField, NSUserInterfaceLayoutOrientation,
         NSView, NSViewController,
@@ -923,7 +934,7 @@ pub fn hover_popover(show: Option<(String, [f32; 4], Vec<PopoverRow>)>) {
     use objc2_foundation::{NSData, NSEdgeInsets, NSRectEdge};
     let Some(mtm) = MainThreadMarker::new() else { return };
     POPOVER.with_borrow_mut(|slot| {
-        let Some((key, rect, rows)) = show else {
+        let Some(HoverTip { key, window, rect, rows }) = show else {
             if let Some((_, p)) = slot.take() {
                 p.close();
             }
@@ -936,7 +947,11 @@ pub fn hover_popover(show: Option<(String, [f32; 4], Vec<PopoverRow>)>) {
             p.close();
         }
         let app = NSApplication::sharedApplication(mtm);
-        let Some(window) = app.mainWindow().or_else(|| app.windows().firstObject()) else { return };
+        let window = match &window {
+            Some(title) => app.windows().iter().filter(|w| w.isVisible() && w.title().to_string() == *title).last(),
+            None => app.mainWindow().or_else(|| app.windows().firstObject()),
+        };
+        let Some(window) = window else { return };
         let Some(content) = window.contentView() else { return };
         // Layout (points): icon, gap, name per row; the popover is sized from
         // the measured names so nothing touches its edges.
@@ -946,9 +961,16 @@ pub fn hover_popover(show: Option<(String, [f32; 4], Vec<PopoverRow>)>) {
         const PAD_X: f64 = 14.0;
         const PAD_Y: f64 = 10.0;
         let mut widest: f64 = 0.0;
+        let text_only = rows.iter().all(|r| r.png.is_none() && r.emoji.is_empty());
         let views: Vec<Retained<NSView>> = rows
             .iter()
             .map(|r| {
+                if text_only {
+                    let label = NSTextField::labelWithString(&NSString::from_str(&r.name), mtm);
+                    label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+                    widest = widest.max(label.fittingSize().width);
+                    return Retained::into_super(Retained::into_super(label));
+                }
                 let image = r
                     .png
                     .as_deref()
@@ -980,8 +1002,9 @@ pub fn hover_popover(show: Option<(String, [f32; 4], Vec<PopoverRow>)>) {
         popover.setAnimates(false);
         popover.setContentViewController(Some(&controller));
         let n = rows.len() as f64;
-        let row_h = ICON.max(17.0);
-        let size = NSSize::new(PAD_X * 2.0 + ICON + GAP + widest.ceil() + 2.0, PAD_Y * 2.0 + n * row_h + (n - 1.0).max(0.0) * ROW_GAP);
+        let row_h = if text_only { 17.0 } else { ICON.max(17.0) };
+        let icon_w = if text_only { 0.0 } else { ICON + GAP };
+        let size = NSSize::new(PAD_X * 2.0 + icon_w + widest.ceil() + 2.0, PAD_Y * 2.0 + n * row_h + (n - 1.0).max(0.0) * ROW_GAP);
         stack.setFrameSize(size);
         popover.setContentSize(size);
         let height = content.bounds().size.height;

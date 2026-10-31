@@ -142,7 +142,7 @@ pub struct MessengerApp {
     older_requested: Option<(i64, Option<String>, Instant)>,
     /// The reactions pill under the pointer this frame: popover key, rect and
     /// rows (see `macos::hover_popover`).
-    reaction_hover: Option<(String, [f32; 4], Vec<crate::macos::PopoverRow>)>,
+    reaction_hover: Option<crate::macos::HoverTip>,
     /// Native glass surfaces for this frame (see `macos::sync_glass`).
     glass: Vec<crate::macos::GlassRect>,
     /// Composer text height last frame (one line, or more for a multi-line draft).
@@ -177,6 +177,10 @@ pub struct MessengerApp {
     /// changes) and when the login page's cookies were last checked.
     login_stale_xs: Option<Option<String>>,
     login_poll: f64,
+    /// The connection dropped this run; when it came back (shows "You're
+    /// online" for a moment).
+    was_offline: bool,
+    back_online: Option<f64>,
     /// Encrypted chats whose restored history was fetched this run, and the
     /// one being fetched.
     history_fetched: HashSet<i64>,
@@ -257,6 +261,8 @@ impl MessengerApp {
             history_restored: stored("history_restored").is_some_and(|v| v == "true"),
             login_stale_xs: None,
             login_poll: 0.0,
+            was_offline: false,
+            back_online: None,
             history_fetched: HashSet::new(),
             history_job: None,
             restore_check: None,
@@ -669,7 +675,7 @@ impl eframe::App for MessengerApp {
         for c in cmds {
             self.send(c);
         }
-        crate::macos::hover_popover(self.reaction_hover.take());
+        crate::macos::hover_popover(self.reaction_hover.take().or_else(|| GLASS_TIP.take()));
         crate::macos::sync_glass(&self.glass);
     }
 }
@@ -846,7 +852,7 @@ fn sticker_grid(ui: &mut egui::Ui, stickers: &Option<Vec<crate::session::Sticker
                     if ui.is_rect_visible(rect) {
                         media_image(ui.ctx(), &s.image).paint_at(ui, rect.shrink(6.0));
                     }
-                    let resp = if s.label.is_empty() { resp } else { resp.on_hover_text(&s.label) };
+                    let resp = if s.label.is_empty() { resp } else { resp.glass_tip(&s.label) };
                     if resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                         cmds.push(Command::SendSticker { thread, sticker_id: s.id, image: s.image.clone(), label: s.label.clone() });
                         *close = true;
@@ -1631,7 +1637,7 @@ fn image_viewer(ctx: &egui::Context) {
             let st = Stroke::new(1.8, Color32::WHITE);
             ui.painter().line_segment([c + Vec2::splat(-5.5), c + Vec2::splat(5.5)], st);
             ui.painter().line_segment([c + Vec2::new(-5.5, 5.5), c + Vec2::new(5.5, -5.5)], st);
-            if x.on_hover_text("Close").clicked() {
+            if x.glass_tip("Close").clicked() {
                 close = true;
             }
             let c2 = c - Vec2::new(44.0, 0.0);
@@ -1639,7 +1645,7 @@ fn image_viewer(ctx: &egui::Context) {
             ui.painter().line_segment([c2 + Vec2::new(-4.5, 4.5), c2 + Vec2::new(4.5, -4.5)], st);
             ui.painter().line_segment([c2 + Vec2::new(-0.5, -4.5), c2 + Vec2::new(4.5, -4.5)], st);
             ui.painter().line_segment([c2 + Vec2::new(4.5, -4.5), c2 + Vec2::new(4.5, 0.5)], st);
-            if open.on_hover_text("Open in browser").clicked() && url.starts_with("http") {
+            if open.glass_tip("Open in browser").clicked() && url.starts_with("http") {
                 ui.ctx().open_url(egui::OpenUrl::new_tab(&url));
             }
         });
@@ -1752,12 +1758,27 @@ impl MessengerApp {
     }
 
     fn status_line(&mut self, ui: &mut egui::Ui, status: &Status) {
+        // Only offline / online: the network error itself is in the log.
+        let now = ui.input(|i| i.time);
+        match status {
+            Status::Reconnecting(_) => {
+                self.was_offline = true;
+                self.back_online = None;
+            }
+            Status::Online if self.was_offline => {
+                self.was_offline = false;
+                self.back_online = Some(now);
+            }
+            _ => {}
+        }
         let (text, color) = match status {
-            Status::Online => (String::new(), pal().muted),
+            Status::Reconnecting(_) => ("You're offline".to_string(), Color32::from_rgb(240, 180, 60)),
+            Status::Online if self.back_online.is_some_and(|t| now - t < 3.0) => {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                ("You're online".to_string(), Color32::from_rgb(80, 190, 110))
+            }
             // Cached chats show while connecting, so no "loading" notice.
-            Status::Connecting | Status::Syncing => (String::new(), pal().muted),
-            Status::Reconnecting(e) => (format!("Reconnecting — {e}"), Color32::from_rgb(240, 180, 60)),
-            Status::LoggedOut(e) => (e.clone(), Color32::from_rgb(240, 90, 90)),
+            _ => (String::new(), pal().muted),
         };
         let err = self.shared.error.lock().unwrap().clone();
         if text.is_empty() && err.is_none() {
@@ -2026,13 +2047,13 @@ impl MessengerApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         let info = if self.show_info { "info.circle.fill" } else { "info.circle" };
-                        if symbol_button(ui, info, pal().blue).on_hover_text("Conversation information").clicked() {
+                        if symbol_button(ui, info, pal().blue).glass_tip("Conversation information").clicked() {
                             self.show_info = !self.show_info;
                         }
-                        if symbol_button(ui, "video.fill", pal().blue).on_hover_text("Video call (opens browser)").clicked() {
+                        if symbol_button(ui, "video.fill", pal().blue).glass_tip("Video call (opens browser)").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.facebook.com/groupcall/ROOM:{key}/?call_type=video")));
                         }
-                        if symbol_button(ui, "phone.fill", pal().blue).on_hover_text("Audio call (opens browser)").clicked() {
+                        if symbol_button(ui, "phone.fill", pal().blue).glass_tip("Audio call (opens browser)").clicked() {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.facebook.com/groupcall/ROOM:{key}/?call_type=audio")));
                         }
                     });
@@ -2242,12 +2263,12 @@ impl MessengerApp {
                         name: if *id == store.me { "You".into() } else { store.member_name(thread.key, *id) },
                     })
                     .collect();
-                self.reaction_hover = Some((key, [pill.min.x, pill.min.y, pill.width(), pill.height()], rows));
+                self.reaction_hover = Some(crate::macos::HoverTip { key, window: None, rect: [pill.min.x, pill.min.y, pill.width(), pill.height()], rows });
             }
             ui.add_space(size.y);
         }
 
-        let bubble = ui.interact(bubble_rect, ui.scope_id().with(("bubble", &m.id)), Sense::click()).on_hover_text(long_time(m.timestamp_ms));
+        let bubble = ui.interact(bubble_rect, ui.scope_id().with(("bubble", &m.id)), Sense::click()).glass_tip(long_time(m.timestamp_ms));
         // Right-click: a native menu (drawn as Liquid Glass by macOS).
         if bubble.secondary_clicked() {
             self.message_menu(ui.ctx(), store, thread, m, mine, cmds);
@@ -2356,7 +2377,7 @@ impl MessengerApp {
                         ui.add_space(((W - 9.0 * 36.0) / 2.0).max(0.0));
                         for (gi, group) in groups.iter().enumerate() {
                             let color = if gi == active { pal().blue } else { pal().muted };
-                            if symbol_button(ui, emoji_group_label(*group).1, color).on_hover_text(emoji_group_label(*group).0).clicked() {
+                            if symbol_button(ui, emoji_group_label(*group).1, color).glass_tip(emoji_group_label(*group).0).clicked() {
                                 picker.jump_to = Some(gi);
                             }
                         }
@@ -2454,12 +2475,12 @@ impl MessengerApp {
                         if selected {
                             ui.painter().line_segment([rect.left_bottom() + Vec2::new(8.0, 1.0), rect.right_bottom() + Vec2::new(-8.0, 1.0)], Stroke::new(2.0, pal().blue));
                         }
-                        if resp.on_hover_text(&p.name).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                        if resp.glass_tip(&p.name).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                             self.sticker_pack = Some(p.id.clone());
                         }
                     }
                     });
-                    if plus_button(ui).on_hover_text("Sticker Store").clicked() {
+                    if plus_button(ui).glass_tip("Sticker Store").clicked() {
                         self.sticker_store = true;
                         self.store_preview = None;
                     }
@@ -2500,7 +2521,7 @@ impl MessengerApp {
         ui.horizontal(|ui| {
             ui.set_height(32.0);
             if self.store_preview.is_some() {
-                if chevron_button(ui).on_hover_text("Back").clicked() {
+                if chevron_button(ui).glass_tip("Back").clicked() {
                     self.store_preview = None;
                 }
             }
@@ -2576,13 +2597,13 @@ impl MessengerApp {
                             let added = in_tray(&p.id, p.in_tray);
                             let busy = changing.contains(&p.id);
                             if circle_action(ui, if added { "checkmark" } else { "plus" }, added, busy)
-                                .on_hover_text(if added { "Remove from tray" } else { "Add to tray" })
+                                .glass_tip(if added { "Remove from tray" } else { "Add to tray" })
                                 .clicked()
                                 && !busy
                             {
                                 cmds.push(Command::StickerPackTray { pack: p.id.clone(), add: !added });
                             }
-                            if circle_action(ui, "eye", true, false).on_hover_text("Preview").clicked() {
+                            if circle_action(ui, "eye", true, false).glass_tip("Preview").clicked() {
                                 self.store_preview = Some((p.id.clone(), p.name.clone()));
                             }
                         });
@@ -2898,7 +2919,7 @@ impl MessengerApp {
         self.glass.push(glass_rect(pill, PILL_MIN / 2.0));
 
         if let Some(clip) = clip {
-            if paperclip_button(ui, clip).on_hover_text("Attach files").clicked() {
+            if paperclip_button(ui, clip).glass_tip("Attach files").clicked() {
                 if let Some(paths) = rfd::FileDialog::new().set_title("Send files").pick_files() {
                     cmds.push(Command::SendFiles { thread: key, paths, reply_to: self.reply_to.take().map(|r| r.0) });
                 }
@@ -2906,7 +2927,7 @@ impl MessengerApp {
         }
         if let Some(rect) = sticker {
             let color = if self.show_stickers { pal().blue } else { pal().blue.gamma_multiply(0.85) };
-            if ui.put(rect, |ui: &mut egui::Ui| symbol_button(ui, "face.smiling.inverse", color)).on_hover_text("Choose a sticker").clicked() {
+            if ui.put(rect, |ui: &mut egui::Ui| symbol_button(ui, "face.smiling.inverse", color)).glass_tip("Choose a sticker").clicked() {
                 self.show_stickers = !self.show_stickers;
             }
         }
@@ -2914,7 +2935,7 @@ impl MessengerApp {
             self.sticker_panel(ui.ctx(), Pos2::new(pill.left() - 40.0, pill.top() - 8.0), key, cmds);
         }
         let smiley = Rect::from_center_size(Pos2::new(pill.right() - 20.0, mid_y), Vec2::splat(32.0));
-        if smiley_button(ui, smiley, self.show_emoji).on_hover_text("Choose an emoji").clicked() {
+        if smiley_button(ui, smiley, self.show_emoji).glass_tip("Choose an emoji").clicked() {
             self.show_emoji = !self.show_emoji;
         }
 
@@ -3737,7 +3758,7 @@ fn status_row(ui: &mut egui::Ui, status: SendStatus) {
                 check(p, pal().bg.to_opaque());
             }
         }
-        resp.on_hover_text(match status {
+        resp.glass_tip(match status {
             SendStatus::Sending => "Sending",
             SendStatus::Sent => "Sent",
             SendStatus::Delivered => "Delivered",
@@ -3779,26 +3800,31 @@ fn seen_by_row(ui: &mut egui::Ui, store: &Store, thread: i64, readers: &[(i64, i
         if readers.len() > MAX {
             ui.label(sf(&format!("+{}", readers.len() - MAX), 11.0, 500).color(pal().muted));
         }
-        let start = ui.cursor().min;
+        // The hover area is the avatars themselves (the layout runs right to
+        // left, so the cursor isn't where they start).
+        let mut area = Rect::NOTHING;
         for (id, _) in readers.iter().take(MAX) {
             let name = store.member_name(thread, *id);
             let picture = store.contacts.get(id).map(|c| c.picture.clone()).unwrap_or_default();
-            avatar(ui, &picture, &name, SIZE);
+            area = area.union(avatar(ui, &picture, &name, SIZE));
         }
-        let area = Rect::from_two_pos(start, ui.min_rect().left_bottom());
-        let names = readers
+        // Who saw it and when, latest first.
+        let mut seen = readers.to_vec();
+        seen.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+        let names = seen
             .iter()
             .map(|(id, ts)| format!("{} · {}", store.member_name(thread, *id), long_time(*ts)))
             .collect::<Vec<_>>()
             .join("\n");
-        ui.interact(area, ui.scope_id().with("seen_by"), Sense::hover()).on_hover_text(format!("Seen by\n{names}"));
+        ui.interact(area, ui.scope_id().with("seen_by"), Sense::hover()).glass_tip(format!("Seen by\n{names}"));
     });
     ui.add_space(4.0);
 }
 
-fn avatar(ui: &mut egui::Ui, url: &str, name: &str, size: f32) {
+fn avatar(ui: &mut egui::Ui, url: &str, name: &str, size: f32) -> Rect {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     paint_avatar(ui, rect, url, name);
+    rect
 }
 
 /// A chat's avatar. A group without its own picture shows two members,
@@ -3871,6 +3897,38 @@ fn long_time(ms: i64) -> String {
         dt.format("%a %H:%M").to_string()
     } else {
         dt.format("%d %b %Y, %H:%M").to_string()
+    }
+}
+
+thread_local! {
+    /// The tooltip to show this frame (see `GlassTip`).
+    static GLASS_TIP: std::cell::RefCell<Option<crate::macos::HoverTip>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tooltips as native popovers (Liquid Glass) instead of egui's opaque ones:
+/// once the pointer rests on the widget, `ui` shows the last one asked for.
+trait GlassTip {
+    fn glass_tip(self, text: impl Into<String>) -> Self;
+}
+
+impl GlassTip for egui::Response {
+    fn glass_tip(self, text: impl Into<String>) -> Self {
+        if !self.hovered() {
+            return self;
+        }
+        const REST: f32 = 0.4;
+        let still = self.ctx.input(|i| i.pointer.time_since_last_movement());
+        if still < REST {
+            self.ctx.request_repaint_after(std::time::Duration::from_secs_f32(REST - still + 0.02));
+            return self;
+        }
+        let text = text.into();
+        let window = (self.ctx.viewport_id() != egui::ViewportId::ROOT).then(|| self.ctx.input(|i| i.viewport().title.clone())).flatten();
+        let r = self.rect;
+        let rows = text.lines().map(|l| crate::macos::PopoverRow { png: None, emoji: String::new(), name: l.to_string() }).collect();
+        let key = format!("{:?}:{text}", self.id);
+        GLASS_TIP.set(Some(crate::macos::HoverTip { key, window, rect: [r.min.x, r.min.y, r.width(), r.height()], rows }));
+        self
     }
 }
 
