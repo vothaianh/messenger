@@ -139,6 +139,8 @@ pub struct Store {
     /// Reactions for messages we don't have yet (a sync can list them before
     /// the message): message id -> (actor -> emoji, "" = removed).
     pending_reactions: HashMap<String, BTreeMap<i64, String>>,
+    /// Stickers that arrived before their message (applied when it comes).
+    early_stickers: HashMap<String, Attachment>,
     /// Share cards' links by message id: the card's button (CTA) can arrive
     /// before its message and attachment.
     share_links: HashMap<String, String>,
@@ -417,6 +419,7 @@ impl Store {
             }
         }
         let (thread_key, id) = (msg.thread_key, msg.id.clone());
+        let early = self.early_stickers.remove(&id);
         let list = self.messages.entry(msg.thread_key).or_default();
         // Replace an optimistic copy (same otid) or an earlier version (same id).
         if let Some(existing) = list
@@ -437,6 +440,9 @@ impl Store {
             list.insert(pos, msg);
         }
         self.link_message_shares(thread_key, &id);
+        if let Some(sticker) = early {
+            self.attach(thread_key, &id, sticker);
+        }
     }
 
     fn link_message_shares(&mut self, thread: i64, message_id: &str) {
@@ -461,6 +467,30 @@ impl Store {
             timestamp_ms: now,
             otid,
             reply_to_id: reply_to,
+            pending: true,
+            ..Default::default()
+        });
+    }
+
+    /// A sticker being sent: shown as the sticker itself right away.
+    pub fn add_pending_sticker(&mut self, thread_key: i64, otid: i64, image: &str) {
+        let now = now_ms();
+        let sticker = Attachment {
+            kind: AttachmentKind::Sticker,
+            url: image.to_string(),
+            preview_url: image.to_string(),
+            title: String::new(),
+            subtitle: String::new(),
+            width: 120.0,
+            height: 120.0,
+        };
+        self.insert_message(Message {
+            id: format!("pending.{otid}"),
+            thread_key,
+            sender_id: self.me,
+            timestamp_ms: now,
+            otid,
+            attachments: vec![sticker],
             pending: true,
             ..Default::default()
         });
@@ -1083,11 +1113,21 @@ impl Store {
         }
         let thread = if thread == 0 { None } else { Some(thread) };
         if let Some(m) = self.find_message_mut(thread, message_id) {
+            // A message has one sticker: the server's replaces the one shown
+            // while sending (the picker's link to it).
+            if att.kind == AttachmentKind::Sticker {
+                m.attachments.retain(|a| a.kind != AttachmentKind::Sticker);
+            }
             if !m.attachments.iter().any(|a| same_attachment(a, &att)) {
                 m.attachments.push(att);
             }
             let (thread, id) = (m.thread_key, m.id.clone());
             self.link_message_shares(thread, &id);
+        } else if att.kind == AttachmentKind::Sticker {
+            if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                eprintln!("[sticker] arrived before its message");
+            }
+            self.early_stickers.insert(message_id.to_string(), att);
         }
     }
 }

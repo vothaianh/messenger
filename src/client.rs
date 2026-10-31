@@ -2,7 +2,7 @@
 //! keeps the Lightspeed connection (DGW, see `dgw.rs`) alive and turns UI
 //! commands into Lightspeed tasks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -108,6 +108,9 @@ pub struct Shared {
     /// A mailbox poll is in flight.
     polling: std::sync::atomic::AtomicBool,
 }
+
+/// Gap fills run one at a time (see `Conn::fill_gap`).
+static GAP_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (Arc<Shared>, mpsc::UnboundedSender<Command>) {
     let shared = Arc::new(Shared {
@@ -599,7 +602,7 @@ impl Conn {
                 if std::env::var_os("MESSENGER_DEBUG").is_some() {
                     eprintln!("[gap] {thread}: fetching messages before the new range");
                 }
-                self.load_before(thread, ts, mid);
+                self.fill_gap(thread, Some((ts, mid)));
             }
             (self.repaint)();
             return failed;
@@ -833,18 +836,10 @@ impl Conn {
 
     /// Fetch the 20 messages before (`ts`, `mid`) in `thread` (see `load_older`).
     fn load_before(&self, thread: i64, ts: i64, mid: String) {
-        let cursor = self.shared.http_cursor.lock().unwrap().clone();
-        let task = json!({
-            "thread_key": thread, "direction": 0, "reference_timestamp_ms": ts,
-            "reference_message_id": mid, "sync_group": 1, "cursor": cursor,
-        });
         let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
         tokio::spawn(async move {
-            let result = async {
-                session.ls_tasks(&[("228", task, format!("mrq.{thread}"))]).await?;
-                http_delta(&session, &shared).await
-            }
-            .await;
+            let _turn = GAP_TURN.lock().await;
+            let result = fetch_history_page(&session, &shared, thread, ts, &mid).await;
             match result {
                 Ok(calls) => {
                     let mut st = shared.store.lock().unwrap();
@@ -860,6 +855,61 @@ impl Conn {
         });
     }
 
+    /// Re-fetch a chat's newest messages, page by page (20 each, the server
+    /// needs a real message as the reference), until a page's oldest message
+    /// is one we already had: messages that came while the app was closed
+    /// otherwise leave a gap (the sync only brings each chat's latest ones).
+    /// `start`: the message to page back from (None: the newest we have).
+    fn fill_gap(&self, thread: i64, start: Option<(i64, String)>) {
+        const MAX_PAGES: usize = 15;
+        let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
+        tokio::spawn(async move {
+            let newest = |st: &Store| st.messages.get(&thread).and_then(|v| v.iter().rev().find(|m| !m.pending && m.id.starts_with("mid."))).map(|m| (m.timestamp_ms, m.id.clone()));
+            // One at a time: each page is a task plus a delta sync of the
+            // shared HTTP cursor, and two at once take each other's answers.
+            let _turn = GAP_TURN.lock().await;
+            let mut reference = start.or_else(|| newest(&shared.store.lock().unwrap()));
+            for page in 0..MAX_PAGES {
+                let Some((ts, mid)) = reference.take() else { break };
+                let known: HashSet<String> = shared.store.lock().unwrap().messages.get(&thread).map(|v| v.iter().map(|m| m.id.clone()).collect()).unwrap_or_default();
+                let result = fetch_history_page(&session, &shared, thread, ts, &mid).await;
+                let calls = match result {
+                    Ok(calls) => calls,
+                    Err(e) => {
+                        eprintln!("[gap] {thread}: {e:#}");
+                        break;
+                    }
+                };
+                let mut page_ids: HashSet<String> = calls
+                    .iter()
+                    .filter(|c| matches!(c.name.as_str(), "upsertMessage" | "insertMessage") && c.arg(3).int() == thread)
+                    .map(|c| c.arg(8).string())
+                    .collect();
+                let mut st = shared.store.lock().unwrap();
+                st.apply(&calls);
+                // The answer can also come on a DGW stream: count what's new
+                // before the reference too.
+                if let Some(list) = st.messages.get(&thread) {
+                    page_ids.extend(list.iter().filter(|m| !m.pending && m.timestamp_ms < ts && !known.contains(&m.id)).map(|m| m.id.clone()));
+                }
+                // Go on below the page's oldest message while it's new and
+                // there's older history we had to join up with.
+                let list = st.messages.get(&thread).map_or(&[][..], Vec::as_slice);
+                let oldest = list.iter().find(|m| page_ids.contains(&m.id));
+                let next = oldest
+                    .filter(|o| !known.contains(&o.id) && list.iter().any(|m| known.contains(&m.id) && m.timestamp_ms < o.timestamp_ms))
+                    .map(|o| (o.timestamp_ms, o.id.clone()));
+                if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                    let added = page_ids.iter().filter(|id| !known.contains(*id)).count();
+                    eprintln!("[gap] {thread}: page {page}: {} messages, {added} new, continue {}", page_ids.len(), next.is_some());
+                }
+                drop(st);
+                repaint();
+                reference = next;
+            }
+        });
+    }
+
     /// Encrypted 1:1 chats go through the E2EE connection, not Lightspeed.
     /// `shown` is what the pending bubble says until the send completes.
     fn send_e2ee(&self, thread: i64, payload: crate::e2ee_listen::OutgoingPayload, shown: String) -> Result<()> {
@@ -871,7 +921,13 @@ impl Conn {
         let tx = self.shared.e2ee_tx.lock().unwrap().clone();
         let tx = tx.ok_or_else(|| anyhow::anyhow!("encrypted chats aren't connected yet"))?;
         let otid = new_otid();
-        self.shared.store.lock().unwrap().add_pending(thread, otid, shown, None);
+        {
+            let mut st = self.shared.store.lock().unwrap();
+            match &payload {
+                crate::e2ee_listen::OutgoingPayload::Sticker { url, .. } if !url.is_empty() => st.add_pending_sticker(thread, otid, url),
+                _ => st.add_pending(thread, otid, shown, None),
+            }
+        }
         (self.repaint)();
         let (done, result) = tokio::sync::oneshot::channel();
         tx.send(crate::e2ee_listen::Outgoing { peer, payload, done })
@@ -1097,9 +1153,15 @@ impl Conn {
                 self.sticker_pack_tray(pack, add);
                 return Ok(None);
             }
-            Command::SendSticker { thread, sticker_id, .. } => {
+            Command::SendSticker { thread, sticker_id, image, .. } => {
                 let otid = new_otid();
-                self.shared.store.lock().unwrap().add_pending(thread, otid, "Sticker".into(), None);
+                let mut st = self.shared.store.lock().unwrap();
+                if image.is_empty() {
+                    st.add_pending(thread, otid, "Sticker".into(), None);
+                } else {
+                    st.add_pending_sticker(thread, otid, &image);
+                }
+                drop(st);
                 (self.repaint)();
                 // A sticker is a send with send_type 2 and the sticker's id.
                 let p = json!({
@@ -1111,15 +1173,7 @@ impl Conn {
                 self.tasks(vec![("46", p, thread.to_string()), ("21", read, thread.to_string())])
             }
             Command::RefreshRecent { thread } => {
-                // The 20 messages before our newest one (the server needs a real
-                // message as the reference).
-                let newest = {
-                    let st = self.shared.store.lock().unwrap();
-                    st.messages.get(&thread).and_then(|v| v.iter().rev().find(|m| !m.pending && m.id.starts_with("mid."))).map(|m| (m.timestamp_ms, m.id.clone()))
-                };
-                if let Some((ts, mid)) = newest {
-                    self.load_before(thread, ts, mid);
-                }
+                self.fill_gap(thread, None);
                 return Ok(None);
             }
             Command::LoadMoreThreads => {
@@ -1196,6 +1250,42 @@ impl Shared {
             *self.http_cursor.lock().unwrap() = Some(cursor);
         }
     }
+}
+
+/// Run a history task (228, the 20 messages before `ts`/`mid`) for `thread`
+/// and read them from a delta sync. Only a fresh snapshot's cursor reliably
+/// works here (a cursor from an earlier delta is often rejected, and the
+/// snapshot that replaces it doesn't have the history), so take one first,
+/// pass it with the task, and read from it; the server writes the messages a
+/// moment after the task returns, so an empty delta is retried from the same
+/// cursor. Returns the task's answer and the deltas (not the snapshot).
+async fn fetch_history_page(session: &Session, shared: &Shared, thread: i64, ts: i64, mid: &str) -> Result<Vec<crate::lightspeed::Call>> {
+    let snapshot = decode_payload(&session.ls_sync(1, None).await?)?;
+    shared.note_http_cursor(&snapshot);
+    let cursor = shared.http_cursor.lock().unwrap().clone();
+    let Some(cursor) = cursor else { anyhow::bail!("no sync cursor") };
+    let task = json!({
+        "thread_key": thread, "direction": 0, "reference_timestamp_ms": ts,
+        "reference_message_id": mid, "sync_group": 1, "cursor": cursor,
+    });
+    let mut all = decode_payload(&session.ls_tasks(&[("228", task, format!("mrq.{thread}"))]).await?).unwrap_or_default();
+    for attempt in 0..4 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+        let calls = decode_payload(&session.ls_sync(1, Some(&cursor)).await?)?;
+        if calls.iter().any(|c| c.name == "handleSyncFailure") {
+            eprintln!("[history] {thread}: cursor rejected");
+            break;
+        }
+        let got = calls.iter().any(|c| matches!(c.name.as_str(), "upsertMessage" | "insertMessage") && c.arg(3).int() == thread);
+        shared.note_http_cursor(&calls);
+        all.extend(calls);
+        if got {
+            break;
+        }
+    }
+    Ok(all)
 }
 
 /// Delta sync of database 1 over HTTP from the HTTP cursor. If the server
