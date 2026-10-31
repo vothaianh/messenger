@@ -500,8 +500,9 @@ impl Conn {
                 cmd = rx.recv() => {
                     let Some(cmd) = cmd else { return Ok(false) };
                     // Reactions go on DGW like the web: over HTTP the server
-                    // fails task 29 with error 1357038.
-                    let on_dgw = matches!(cmd, Command::React { .. });
+                    // fails task 29 with error 1357038. Archiving too: over
+                    // HTTP task 146 is acknowledged but the chat stays put.
+                    let on_dgw = matches!(cmd, Command::React { .. } | Command::Archive { .. });
                     // Commands go over HTTP or the E2EE connection, so they don't
                     // wait for the DGW socket (they used to be dropped while it
                     // reconnected).
@@ -1232,7 +1233,9 @@ impl Conn {
                     })
                 };
                 (self.repaint)();
-                let p = json!({"thread_key": thread, "remove_type": 1, "sync_group": if e2ee { 95 } else { 1 }});
+                // The web's LSOptimisticRemoveThread payload (remove_type 1 =
+                // ARCHIVE_THREAD).
+                let p = json!({"thread_key": thread, "remove_type": 1, "sync_group": if e2ee { 95 } else { 1 }, "offline_threading_id": ""});
                 self.tasks(vec![("146", p, thread.to_string())])
             }
         }))

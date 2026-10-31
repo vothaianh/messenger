@@ -177,10 +177,6 @@ pub struct MessengerApp {
     /// changes) and when the login page's cookies were last checked.
     login_stale_xs: Option<Option<String>>,
     login_poll: f64,
-    /// The connection dropped this run; when it came back (shows "You're
-    /// online" for a moment).
-    was_offline: bool,
-    back_online: Option<f64>,
     /// Encrypted chats whose restored history was fetched this run, and the
     /// one being fetched.
     history_fetched: HashSet<i64>,
@@ -261,8 +257,6 @@ impl MessengerApp {
             history_restored: stored("history_restored").is_some_and(|v| v == "true"),
             login_stale_xs: None,
             login_poll: 0.0,
-            was_offline: false,
-            back_online: None,
             history_fetched: HashSet::new(),
             history_job: None,
             restore_check: None,
@@ -627,7 +621,7 @@ impl eframe::App for MessengerApp {
         };
         let inset = GLASS_INSET as i8;
         let mut left = column(ui, left_rect, Margin { left: 8 + inset, right: 8 + inset, top: inset, bottom: 8 + inset });
-        self.thread_list(&mut left, &store, &status, &mut cmds);
+        self.thread_list(&mut left, &store, &mut cmds);
         self.glass.push(glass_rect(left_rect.shrink(GLASS_INSET), GLASS_RADIUS));
 
         if let (Some(rect), Some(key)) = (info_rect, self.selected) {
@@ -1757,61 +1751,33 @@ impl MessengerApp {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
     }
 
-    fn status_line(&mut self, ui: &mut egui::Ui, status: &Status) {
-        // Only offline / online: the network error itself is in the log.
-        let now = ui.input(|i| i.time);
-        match status {
-            Status::Reconnecting(_) => {
-                self.was_offline = true;
-                self.back_online = None;
-            }
-            Status::Online if self.was_offline => {
-                self.was_offline = false;
-                self.back_online = Some(now);
-            }
-            _ => {}
-        }
-        let (text, color) = match status {
-            Status::Reconnecting(_) => ("You're offline".to_string(), Color32::from_rgb(240, 180, 60)),
-            Status::Online if self.back_online.is_some_and(|t| now - t < 3.0) => {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-                ("You're online".to_string(), Color32::from_rgb(80, 190, 110))
-            }
-            // Cached chats show while connecting, so no "loading" notice.
-            _ => (String::new(), pal().muted),
-        };
-        let err = self.shared.error.lock().unwrap().clone();
-        if text.is_empty() && err.is_none() {
-            return;
-        }
+    /// The last failed action, if any. There's no connection notice: the app
+    /// reconnects on its own (the status and its errors are in the log).
+    fn status_line(&mut self, ui: &mut egui::Ui) {
+        let Some(e) = self.shared.error.lock().unwrap().clone() else { return };
         Frame::default().fill(pal().quote).corner_radius(CornerRadius::same(8)).inner_margin(Margin::symmetric(10, 6)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            if !text.is_empty() {
-                ui.add(egui::Label::new(RichText::new(text).size(13.0).color(color)).wrap());
-            }
-            if let Some(e) = err {
-                // Message wrapped in the column minus room for a drawn close button.
-                let width = (ui.available_width() - 24.0).max(40.0);
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
-                        ui.set_width(width);
-                        ui.add(egui::Label::new(RichText::new(truncate(&e, 240)).size(13.0).color(Color32::from_rgb(240, 90, 90))).wrap());
-                    });
-                    let (rect, close) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
-                    let color = if close.hovered() { pal().text } else { pal().muted };
-                    let c = rect.center();
-                    ui.painter().line_segment([c + Vec2::splat(-4.0), c + Vec2::splat(4.0)], Stroke::new(1.5, color));
-                    ui.painter().line_segment([c + Vec2::new(-4.0, 4.0), c + Vec2::new(4.0, -4.0)], Stroke::new(1.5, color));
-                    if close.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                        *self.shared.error.lock().unwrap() = None;
-                    }
+            // Message wrapped in the column minus room for a drawn close button.
+            let width = (ui.available_width() - 24.0).max(40.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui(Vec2::new(width, 0.0), |ui| {
+                    ui.set_width(width);
+                    ui.add(egui::Label::new(RichText::new(truncate(&e, 240)).size(13.0).color(Color32::from_rgb(240, 90, 90))).wrap());
                 });
-            }
+                let (rect, close) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::click());
+                let color = if close.hovered() { pal().text } else { pal().muted };
+                let c = rect.center();
+                ui.painter().line_segment([c + Vec2::splat(-4.0), c + Vec2::splat(4.0)], Stroke::new(1.5, color));
+                ui.painter().line_segment([c + Vec2::new(-4.0, 4.0), c + Vec2::new(4.0, -4.0)], Stroke::new(1.5, color));
+                if close.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                    *self.shared.error.lock().unwrap() = None;
+                }
+            });
         });
         ui.add_space(6.0);
     }
 
-    fn thread_list(&mut self, ui: &mut egui::Ui, store: &Store, status: &Status, cmds: &mut Vec<Command>) {
+    fn thread_list(&mut self, ui: &mut egui::Ui, store: &Store, cmds: &mut Vec<Command>) {
         // Leave room for the traffic lights; the strip drags the window.
         let strip = ui.allocate_space(Vec2::new(ui.available_width(), TITLEBAR)).1;
         titlebar_drag(ui, strip);
@@ -1865,7 +1831,7 @@ impl MessengerApp {
         let capsule = segments.response.rect;
         self.glass.push(glass_rect(capsule, capsule.height() / 2.0));
         ui.add_space(6.0);
-        self.status_line(ui, status);
+        self.status_line(ui);
 
         let query = self.search.to_lowercase();
         let threads: Vec<&Thread> = store
@@ -3189,7 +3155,8 @@ impl MessengerApp {
                             let pic = store.contacts.get(p).map(|c| c.picture.clone()).unwrap_or_default();
                             let name = store.member_name(t.key, *p);
                             avatar(ui, &pic, &name, 36.0);
-                            ui.label(sf(&name, 15.0, 500));
+                            // Long names end in "…" within the pane; the full name on hover.
+                            ui.add(egui::Label::new(sf(&name, 15.0, 500)).truncate().show_tooltip_when_elided(false)).glass_tip(name);
                         });
                         ui.add_space(2.0);
                     }
