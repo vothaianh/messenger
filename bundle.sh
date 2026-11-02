@@ -6,7 +6,19 @@ cd "$(dirname "$0")"
 # runtime and a secure timestamp, plus a zip of the app.
 PROFILE=release
 if [ -n "$DIST" ]; then PROFILE=dist; fi
-cargo build --profile "$PROFILE"
+if [ -n "$DIST" ]; then
+  # Universal binary: Apple silicon and Intel (rustup target add
+  # x86_64-apple-darwin once), joined with lipo.
+  for T in aarch64-apple-darwin x86_64-apple-darwin; do
+    cargo build --profile dist --target "$T"
+  done
+  BIN=target/dist/messenger-rs-universal
+  mkdir -p target/dist
+  lipo -create -output "$BIN" target/aarch64-apple-darwin/dist/messenger-rs target/x86_64-apple-darwin/dist/messenger-rs
+else
+  cargo build --profile "$PROFILE"
+  BIN="target/$PROFILE/messenger-rs"
+fi
 APP="target/Messenger Desktop.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -23,7 +35,7 @@ else
   cargo run --release --quiet --example make_icon -- target/AppIcon.iconset
   iconutil -c icns target/AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
 fi
-cp "target/$PROFILE/messenger-rs" "$APP/Contents/MacOS/Messenger Desktop"
+cp "$BIN" "$APP/Contents/MacOS/Messenger Desktop"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

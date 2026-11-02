@@ -17,7 +17,7 @@ one small native app (about 20 MB) that opens instantly with your recent chats.
 
 ## Why Messenger Desktop?
 
-- **Native macOS app, built with Rust.** Small (about 20 MB, a 10 MB download),
+- **Native macOS app, built with Rust.** Small (about 46 MB as one app for Apple silicon and Intel, a 23 MB download),
   low memory, starts in a moment. The UI is drawn with
   [egui](https://github.com/emilk/egui), and the surfaces use real macOS Liquid
   Glass (`NSGlassEffectView`).
@@ -92,7 +92,7 @@ one small native app (about 20 MB) that opens instantly with your recent chats.
 
 **Download:** the latest signed and notarized build is on the
 [Releases page](https://github.com/vothaianh/messenger/releases/latest)
-(Apple Silicon, macOS 26). Unzip it and move **Messenger Desktop** to
+(Apple silicon and Intel, macOS 26). Unzip it and move **Messenger Desktop** to
 Applications.
 
 Messenger Desktop also builds from source on macOS (Apple Silicon). You need

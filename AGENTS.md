@@ -33,7 +33,10 @@ open "target/Messenger Desktop.app"
 ## Useful commands
 
 - `DIST=1 ./bundle.sh`: distribution build (profile `dist`: fat LTO, one
-  codegen unit, stripped; ~3 min). Signs with the hardened runtime and a
+  codegen unit, stripped; ~6 min). Universal: built for
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` and joined with `lipo`
+  (app 46 MB, zip 23 MB on 2026-11-02). Release zips are named
+  `Messenger-Desktop-X.Y.Z-macOS-universal.zip`. Signs with the hardened runtime and a
   secure timestamp and writes `target/Messenger Desktop.zip`. On 2026-10-29:
   app 20 MB (vs 32 MB release), zip 10.7 MB. It's signed with the
   "Apple Development" certificate, so it runs on this Mac but Gatekeeper
