@@ -328,6 +328,8 @@ struct Conn {
     /// Task streams carrying tasks the server asked for (their answers'
     /// own follow-ups aren't sent).
     followup_streams: std::collections::HashSet<u16>,
+    /// Task streams answered and still open on our side.
+    answered_tasks: std::collections::HashSet<u16>,
     /// The snapshots are in: connections now open with delta syncs.
     subscribed: bool,
     request_id: i64,
@@ -339,7 +341,7 @@ struct Conn {
 
 impl Conn {
     fn new(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) -> Self {
-        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), followup_streams: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
+        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), followup_streams: Default::default(), answered_tasks: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
     }
 
     /// A Lightspeed request body (the JSON the web client sends on a DGW stream).
@@ -516,7 +518,9 @@ impl Conn {
                                         eprintln!("[dgw] task answer on stream {stream}");
                                     }
                                     // No End here: after we closed a task stream the server
-                                    // dropped the whole connection on the next task.
+                                    // dropped the whole connection on the next task. We
+                                    // close it once the server has (below).
+                                    self.answered_tasks.insert(stream);
                                     // Tasks the server asks for in its answer (encrypted
                                     // chats' nicknames answer with task 722) are queued and
                                     // sent like the web's task queue does; one level only.
@@ -537,6 +541,11 @@ impl Conn {
                                     // A request stream carries one answer; close our side.
                                     reply.extend(dgw::end(stream));
                                 }
+                            }
+                            // The server closed an answered task stream: close our side
+                            // too, or it drops the whole connection a minute later.
+                            Frame::End { stream } if self.answered_tasks.remove(&stream) => {
+                                reply.extend(dgw::end(stream));
                             }
                             Frame::End { stream } if self.sync_streams.contains_key(&stream) => {
                                 anyhow::bail!("Lightspeed sync stream {stream} closed by the server");
