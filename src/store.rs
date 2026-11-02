@@ -195,7 +195,14 @@ impl Store {
         for mut m in snap.messages {
             // Caches from before 1.0.8 can hold the same share many times.
             let mut kept: Vec<Attachment> = Vec::new();
-            for a in m.attachments.drain(..) {
+            for mut a in m.attachments.drain(..) {
+                // Caches from before 1.0.11 hold GIFs ("gif-<id>") as files: show them as stickers.
+                if matches!(a.kind, AttachmentKind::File | AttachmentKind::Image) && a.title.starts_with("gif-") {
+                    a.kind = AttachmentKind::Sticker;
+                    if a.url.starts_with("http") {
+                        a.preview_url = a.url.clone();
+                    }
+                }
                 if !kept.iter().any(|k| same_attachment(k, &a)) {
                     kept.push(a);
                 }
@@ -246,6 +253,18 @@ impl Store {
             }
         }
         self.contact_name(id)
+    }
+
+    /// Someone's nickname in a chat; empty removes it.
+    pub fn set_nickname(&mut self, thread: i64, contact: i64, nickname: &str) {
+        let nickname = nickname.trim();
+        if nickname.is_empty() {
+            if let Some(n) = self.nicknames.get_mut(&thread) {
+                n.remove(&contact);
+            }
+        } else {
+            self.nicknames.entry(thread).or_default().insert(contact, nickname.to_string());
+        }
     }
 
     pub fn contact_name(&self, id: i64) -> String {
@@ -491,6 +510,47 @@ impl Store {
             timestamp_ms: now,
             otid,
             attachments: vec![sticker],
+            pending: true,
+            ..Default::default()
+        });
+    }
+
+    /// Files being sent: pictures show as themselves right away, anything
+    /// else as a "Sending a file…" line.
+    pub fn add_pending_files(&mut self, thread_key: i64, otid: i64, paths: &[std::path::PathBuf], reply_to: Option<String>) {
+        let mut pictures = Vec::new();
+        let mut others = 0;
+        for path in paths {
+            match image::image_dimensions(path) {
+                Ok((w, h)) => {
+                    let url = format!("file://{}", path.display());
+                    pictures.push(Attachment {
+                        kind: AttachmentKind::Image,
+                        url: url.clone(),
+                        preview_url: url,
+                        title: String::new(),
+                        subtitle: String::new(),
+                        width: w as f32,
+                        height: h as f32,
+                    });
+                }
+                Err(_) => others += 1,
+            }
+        }
+        let text = match others {
+            0 => String::new(),
+            1 => "Sending a file…".to_string(),
+            n => format!("Sending {n} files…"),
+        };
+        self.insert_message(Message {
+            id: format!("pending.{otid}"),
+            thread_key,
+            sender_id: self.me,
+            text,
+            timestamp_ms: now_ms(),
+            otid,
+            reply_to_id: reply_to,
+            attachments: pictures,
             pending: true,
             ..Default::default()
         });
@@ -857,6 +917,10 @@ impl Store {
                     ct.first_name = f.to_string();
                 }
             }
+            "updateThreadParticipantNickname" => {
+                // (threadKey, contactId, nickname, normalizedSearchTerms)
+                self.set_nickname(c.arg(0).int(), c.arg(1).int(), &c.arg(2).string());
+            }
             "addParticipantIdToGroupThread" => {
                 // (threadKey, contactId, readWatermarkTimestampMs, readActionTimestampMs,
                 //  deliveredWatermarkTimestampMs, nickname, ...)
@@ -865,10 +929,8 @@ impl Store {
                 if !t.participants.contains(&p) {
                     t.participants.push(p);
                 }
-                let nickname = c.arg(5).string();
-                if !nickname.trim().is_empty() {
-                    self.nicknames.entry(key).or_default().insert(p, nickname);
-                }
+                // The full row: an empty nickname means none (it was removed).
+                self.set_nickname(key, p, &c.arg(5).string());
                 let delivered = c.arg(4).int();
                 if delivered > 0 {
                     let e = self.delivered_receipts.entry(key).or_default().entry(p).or_default();
@@ -973,8 +1035,14 @@ impl Store {
             "insertBlobAttachment" => {
                 let filename = c.arg(0).string();
                 let playable = c.arg(3).string();
-                let preview = c.arg(8).str().map(str::to_string).unwrap_or_else(|| playable.clone());
-                let kind = attachment_kind(&filename, c.arg(29).int());
+                let mut preview = c.arg(8).str().map(str::to_string).unwrap_or_else(|| playable.clone());
+                // GIFs (and stickers people make, sent as GIFs): show the
+                // animated file itself, not its still preview.
+                if filename.starts_with("gif-") && playable.starts_with("http") {
+                    preview = playable.clone();
+                }
+                // ...and size them like stickers.
+                let kind = if filename.starts_with("gif-") { AttachmentKind::Sticker } else { attachment_kind(&filename, c.arg(29).int()) };
                 let att = Attachment {
                     kind,
                     url: if playable.is_empty() { preview.clone() } else { playable },
@@ -1117,6 +1185,10 @@ impl Store {
             // while sending (the picker's link to it).
             if att.kind == AttachmentKind::Sticker {
                 m.attachments.retain(|a| a.kind != AttachmentKind::Sticker);
+            }
+            // The server's pictures replace the local files shown while sending.
+            if att.url.starts_with("http") || att.preview_url.starts_with("http") {
+                m.attachments.retain(|a| !a.url.starts_with("file://"));
             }
             if !m.attachments.iter().any(|a| same_attachment(a, &att)) {
                 m.attachments.push(att);
@@ -1313,6 +1385,42 @@ mod attachment_tests {
         let resent = share("", "https://b.fbcdn.net/v/t39/1_2_n.jpg?x=2");
         assert!(same_attachment(&linked, &resent));
         assert!(!same_attachment(&linked, &share("", "https://a.fbcdn.net/v/t15/3_4_n.jpg")));
+    }
+
+    #[test]
+    fn nicknames_set_and_remove() {
+        let mut st = Store::default();
+        st.contacts.insert(5, Contact { id: 5, name: "Real Name".into(), ..Default::default() });
+        st.set_nickname(7, 5, "  Bé  ");
+        assert_eq!(st.member_name(7, 5), "Bé");
+        st.set_nickname(7, 5, "");
+        assert_eq!(st.member_name(7, 5), "Real Name");
+    }
+
+    #[test]
+    fn sent_picture_shows_until_the_server_one_arrives() {
+        let dir = std::env::temp_dir().join(format!("messenger-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.png");
+        image::RgbaImage::new(4, 2).save(&path).unwrap();
+        let mut st = Store::default();
+        st.add_pending_files(7, 42, &[path], None);
+        let m = &st.messages[&7][0];
+        assert!(m.text.is_empty());
+        assert_eq!((m.attachments.len(), m.attachments[0].width, m.attachments[0].height), (1, 4.0, 2.0));
+        let server = Attachment {
+            kind: AttachmentKind::Image,
+            url: "https://a.fbcdn.net/v/t1/9_n.png".into(),
+            preview_url: "https://a.fbcdn.net/v/t1/9_n.png".into(),
+            title: String::new(),
+            subtitle: String::new(),
+            width: 4.0,
+            height: 2.0,
+        };
+        st.attach(7, "pending.42", server);
+        assert_eq!(st.messages[&7][0].attachments.len(), 1);
+        assert!(st.messages[&7][0].attachments[0].url.starts_with("https"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

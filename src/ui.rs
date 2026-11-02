@@ -170,6 +170,8 @@ pub struct MessengerApp {
     sticker_store: bool,
     /// The "restore encrypted history with your PIN" dialog, when open.
     pin_restore: Option<PinRestore>,
+    /// The nicknames dialog for a chat, when open.
+    nickname_edit: Option<NicknameEdit>,
     /// The PIN restore succeeded once (kept): encrypted chats then fetch
     /// their restored history from the hidden web engine.
     history_restored: bool,
@@ -254,6 +256,7 @@ impl MessengerApp {
             sticker_pack: None,
             sticker_store: false,
             pin_restore: None,
+            nickname_edit: None,
             history_restored: stored("history_restored").is_some_and(|v| v == "true"),
             login_stale_xs: None,
             login_poll: 0.0,
@@ -523,6 +526,123 @@ impl MessengerApp {
         self.pin_restore = Some(st);
     }
 
+    /// Open the nicknames dialog for a chat: everyone in it, you included.
+    fn open_nicknames(&mut self, store: &Store, thread: i64) {
+        let Some(t) = store.threads.get(&thread) else { return };
+        let mut members = t.participants.clone();
+        if !members.contains(&store.me) {
+            members.push(store.me);
+        }
+        // Older one-to-one chats may list nobody else: their key is the other
+        // person's id (encrypted chats have keys of their own, so only a known contact).
+        if !t.is_group() && members.len() < 2 && store.contacts.contains_key(&thread) {
+            members.push(thread);
+        }
+        // You first, then everyone else by name.
+        members.sort_by_key(|id| (*id != store.me, store.contact_name(*id).to_lowercase()));
+        let rows = members
+            .into_iter()
+            .map(|id| {
+                let nick = store.nicknames.get(&thread).and_then(|n| n.get(&id)).cloned().unwrap_or_default();
+                let name = store.contacts.get(&id).map(|c| c.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| store.contact_name(id));
+                (id, name, nick.clone(), nick)
+            })
+            .collect();
+        self.nickname_edit = Some(NicknameEdit { thread, rows, focused: false });
+    }
+
+    /// The nicknames dialog: a Liquid Glass window with one capsule field per
+    /// member (their name as the hint). Save sends only what changed.
+    fn nickname_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut st) = self.nickname_edit.take() else { return };
+        let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
+        let mut save = false;
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::new("nickname_scrim")).order(egui::Order::Foreground).fixed_pos(screen.min).show(ctx, |ui| {
+            let scrim = ui.allocate_rect(screen, Sense::click());
+            ui.painter().rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(110));
+            if scrim.clicked() {
+                close = true;
+            }
+        });
+        let list_h = (st.rows.len() as f32 * 52.0).min(360.0);
+        let size = Vec2::new(400.0, 150.0 + list_h);
+        let origin = ctx.input(|i| i.viewport().inner_rect.map(|r| r.min)).unwrap_or_default();
+        let builder = egui::ViewportBuilder::default()
+            .with_title(crate::macos::NICKNAME_WINDOW)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_taskbar(false)
+            .with_position(origin + (screen.center() - size / 2.0).to_vec2())
+            .with_inner_size(size);
+        let avatars: Vec<(String, String)> = {
+            let store = self.shared.store.lock().unwrap();
+            st.rows.iter().map(|(id, name, ..)| (store.contacts.get(id).map(|c| c.picture.clone()).unwrap_or_default(), name.clone())).collect()
+        };
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("nicknames"), builder, |nctx, _| {
+            crate::macos::glass_window(crate::macos::NICKNAME_WINDOW, 24.0);
+            if nctx.input(|i| i.key_pressed(Key::Escape)) {
+                close = true;
+            }
+            let frame = Frame::NONE.stroke(Stroke::new(1.0, pal().border)).corner_radius(CornerRadius::same(24)).inner_margin(Margin::same(22));
+            egui::CentralPanel::default().frame(frame).show(nctx, |ui| {
+                ui.vertical_centered(|ui| ui.label(sf("Nicknames", 17.0, 700)));
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| ui.label(sf("Everyone in the chat sees the nicknames you set.", 12.0, 400).color(pal().muted)));
+                ui.add_space(12.0);
+                ScrollArea::vertical().max_height(list_h).auto_shrink([false, true]).show(ui, |ui| {
+                    for (i, (_, name, _, draft)) in st.rows.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            avatar(ui, &avatars[i].0, &avatars[i].1, 36.0);
+                            ui.add_space(4.0);
+                            let field_rect = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover()).0;
+                            let field_id = egui::Id::new(("nickname_field", i));
+                            let focused = ui.memory(|m| m.has_focus(field_id));
+                            ui.painter().rect_filled(field_rect, CornerRadius::same(18), pal().input);
+                            let ring = if focused { Stroke::new(2.0, pal().blue) } else { Stroke::new(1.0, pal().border) };
+                            ui.painter().rect_stroke(field_rect, CornerRadius::same(18), ring, egui::StrokeKind::Inside);
+                            let field = TextEdit::singleline(draft).id(field_id).frame(Frame::NONE).char_limit(100).font(egui::FontId::proportional(14.0)).hint_text(name.as_str());
+                            let resp = ui.put(field_rect.shrink2(Vec2::new(14.0, 8.0)), field);
+                            if i == 0 && !st.focused {
+                                // Make the dialog's window key so names can be typed.
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                                resp.request_focus();
+                                st.focused = true;
+                            }
+                            if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                save = true;
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 8.0) / 2.0;
+                    if ui.add(egui::Button::new(sf("Cancel", 14.0, 600)).fill(pal().input).corner_radius(CornerRadius::same(16)).min_size(Vec2::new(w, 34.0))).clicked() {
+                        close = true;
+                    }
+                    let changed = st.rows.iter().any(|(_, _, old, new)| old.trim() != new.trim());
+                    if ui.add_enabled(changed, egui::Button::new(sf("Save", 14.0, 600).color(Color32::WHITE)).fill(pal().blue).corner_radius(CornerRadius::same(16)).min_size(Vec2::new(w, 34.0))).clicked() {
+                        save = true;
+                    }
+                });
+            });
+        });
+        if save {
+            for (contact, _, old, new) in &st.rows {
+                if old.trim() != new.trim() {
+                    self.send(Command::SetNickname { thread: st.thread, contact: *contact, nickname: new.trim().to_string() });
+                }
+            }
+            return;
+        }
+        if !close {
+            self.nickname_edit = Some(st);
+        }
+    }
+
     /// Follow the chosen appearance (or the system's): palette, egui style,
     /// and the native window appearance the glass is drawn with.
     fn apply_theme(&mut self, ctx: &egui::Context) {
@@ -581,6 +701,7 @@ impl eframe::App for MessengerApp {
         self.apply_theme(&ctx);
         crate::macos::reap_video();
         self.pin_restore_ui(&ctx);
+        self.nickname_ui(&ctx);
         self.history_tick(&ctx);
         web_probe(&ctx);
         image_viewer(&ctx);
@@ -1000,7 +1121,8 @@ enum Piece {
 /// Split message text into plain text and emoji, turning emoticons into emoji
 /// where the web client does: after the start, a space, a quote, "." or "(",
 /// and before the end, a space, a quote or `.,!?)`. A few (`;)`, `O:)`, `3:)`,
-/// `(y)`) don't match when another ")" follows.
+/// `(y)`) don't match when another ")" follows, and none match when their
+/// last character repeats (`:))` stays text).
 fn emoji_pieces(text: &str) -> Vec<Piece> {
     let mut out: Vec<Piece> = Vec::new();
     let mut plain = String::new();
@@ -1022,8 +1144,11 @@ fn emoji_pieces(text: &str) -> Vec<Piece> {
                 .filter(|(e, _)| {
                     let next = rest[e.len()..].chars().next();
                     let no_paren = matches!(*e, "O:)" | "0:)" | "O:-)" | "0:-)" | "3:)" | "3:-)" | "(y)" | "(Y)" | ";)" | ";-)");
+                    // ":))", "=))", ":((" (the last character repeated) stay as typed.
+                    let repeated = next.is_some() && next == e.chars().last();
                     match next {
                         None => true,
+                        _ if repeated => false,
                         Some(')') => !no_paren,
                         Some(n) => n.is_whitespace() || matches!(n, '\'' | '"' | '.' | ',' | '!' | '?'),
                     }
@@ -1531,6 +1656,14 @@ fn save_restored_picture(data_url: &str) -> Option<String> {
     Some(format!("file://{}", path.display()))
 }
 
+/// The nicknames dialog: each member's nickname as it was and as edited.
+struct NicknameEdit {
+    thread: i64,
+    /// (member, name shown when there's no nickname, nickname, edited)
+    rows: Vec<(i64, String, String, String)>,
+    focused: bool,
+}
+
 #[derive(Default)]
 struct PinRestore {
     pin: String,
@@ -1660,6 +1793,9 @@ mod emoji_tests {
         assert_eq!(super::emoji_pieces("a:Db"), vec![Text("a:Db".into())]);
         assert_eq!(super::emoji_pieces("ok 👍🏻!"), vec![Text("ok ".into()), Emoji("👍🏻".into()), Text("!".into())]);
         assert_eq!(super::emoji_pieces("<3"), vec![Emoji("❤".into())]);
+        assert_eq!(super::emoji_pieces("vui quá :))"), vec![Text("vui quá :))".into())]);
+        assert_eq!(super::emoji_pieces("=)))"), vec![Text("=)))".into())]);
+        assert_eq!(super::emoji_pieces(":(("), vec![Text(":((".into())]);
     }
 
     #[test]
@@ -1876,7 +2012,8 @@ impl MessengerApp {
         let selected = self.selected == Some(t.key);
         let unread = t.unread();
         let title = store.thread_title(t);
-        let typing = !store.typing_in(t.key).is_empty();
+        let typers = store.typing_in(t.key);
+        let typing = !typers.is_empty();
         let row_id = ui.scope_id().with(("thread", t.key));
         let hovered = ui.ctx().read_response(row_id).is_some_and(|r| r.hovered());
         let fill = if selected {
@@ -1899,7 +2036,11 @@ impl MessengerApp {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let name = sf(&title, 15.0, if unread { 600 } else { 500 }).color(pal().text);
                         ui.add(egui::Label::new(name).truncate());
-                        let snippet = if typing {
+                        let snippet = if typing && t.is_group() {
+                            // Groups: who's typing ("Anh is typing…", "Anh, Bình are typing…").
+                            let names: Vec<String> = typers.iter().map(|id| store.member_name(t.key, *id)).collect();
+                            format!("{} {} typing…", names.join(", "), if names.len() == 1 { "is" } else { "are" })
+                        } else if typing {
                             "typing…".to_string()
                         } else if t.e2ee || t.snippet.trim().is_empty() || newest_is_latest(store, t) {
                             // The server can't know encrypted content, and a live
@@ -2104,7 +2245,8 @@ impl MessengerApp {
                         typing_bubble(ui);
                         let names: Vec<_> = typing.iter().map(|id| store.member_name(key, *id)).collect();
                         if thread.is_group() {
-                            ui.label(sf(&format!("{} is typing", names.join(", ")), 12.0, 400).color(pal().muted));
+                            let verb = if names.len() == 1 { "is" } else { "are" };
+                            ui.label(sf(&format!("{} {verb} typing", names.join(", ")), 12.0, 400).color(pal().muted));
                         }
                     });
                 }
@@ -3133,14 +3275,16 @@ impl MessengerApp {
             // Round action buttons, centered as a group.
             // SF Symbols, not emoji (AGENTS.md).
             let mute = if t.muted { ("bell", "Unmute") } else { ("bell.slash", "Mute") };
-            let actions: Vec<(&str, &str)> = if t.thread_type == 1 { vec![("person", "Profile"), mute] } else { vec![mute] };
-            let group_w = actions.len() as f32 * 72.0;
+            let nicknames = ("pencil", "Nicknames");
+            let actions: Vec<(&str, &str)> = if t.thread_type == 1 { vec![("person", "Profile"), mute, nicknames] } else { vec![mute, nicknames] };
+            let group_w = actions.len() as f32 * 88.0;
             ui.horizontal(|ui| {
                 ui.add_space(((ui.available_width() - group_w) / 2.0).max(0.0));
                 for (icon, label) in actions {
                     if round_action(ui, icon, label) {
                         match label {
                             "Profile" => ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://www.facebook.com/{key}"))),
+                            "Nicknames" => self.open_nicknames(store, key),
                             _ => cmds.push(Command::Mute { thread: key, minutes: if t.muted { None } else { Some(-1) } }),
                         }
                     }
@@ -3538,7 +3682,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, color: Color32) -> egui::Response 
 
 fn round_action(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
     let mut clicked = false;
-    ui.allocate_ui_with_layout(Vec2::new(64.0, 64.0), Layout::top_down(Align::Center), |ui| {
+    ui.allocate_ui_with_layout(Vec2::new(80.0, 64.0), Layout::top_down(Align::Center), |ui| {
         let (rect, r) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::click());
         ui.painter().circle_filled(rect.center(), 18.0, if r.hovered() { pal().border } else { pal().input });
         let ink = pal().text;
@@ -3554,7 +3698,8 @@ fn round_action(ui: &mut egui::Ui, icon: &str, label: &str) -> bool {
                 ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, &icon[..1], egui::FontId::proportional(16.0), ink);
             }
         }
-        ui.label(sf(label, 12.0, 400));
+        // One line: labels never break mid-word.
+        ui.add(egui::Label::new(sf(label, 12.0, 400)).extend());
         clicked = r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
     });
     clicked

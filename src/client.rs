@@ -52,6 +52,8 @@ pub enum Command {
     Mute { thread: i64, minutes: Option<i64> },
     /// Archive (hide) a chat, like the web's "Archive chat".
     Archive { thread: i64 },
+    /// Set (or, when empty, remove) someone's nickname in a chat.
+    SetNickname { thread: i64, contact: i64, nickname: String },
 }
 
 #[derive(Default)]
@@ -107,6 +109,20 @@ pub struct Shared {
     pub pin: Mutex<PinInfo>,
     /// A mailbox poll is in flight.
     polling: std::sync::atomic::AtomicBool,
+    /// Gap fills stopped by a rate limit, to run again once it's over:
+    /// thread -> where to start (None = from the newest message).
+    pending_gaps: Mutex<HashMap<i64, Option<(i64, String)>>>,
+    /// HTTP was rate limited and hasn't answered since: tasks go on DGW and
+    /// typing isn't sent (the polls, after their wait, find out when it's over).
+    rate_limited: std::sync::atomic::AtomicBool,
+    /// Another poll was asked for while one was in flight.
+    poll_again: std::sync::atomic::AtomicBool,
+    /// No mailbox poll before this, and the current wait after a "rate limit
+    /// exceeded" answer (doubles each time, back to none on success).
+    poll_wait: Mutex<(Option<std::time::Instant>, u64)>,
+    /// The server answered "log in to continue" (error 1357001): the page
+    /// tokens are stale, so reconnect with a fresh bootstrap.
+    session_expired: std::sync::atomic::AtomicBool,
 }
 
 /// Gap fills run one at a time (see `Conn::fill_gap`).
@@ -121,6 +137,11 @@ pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (A
         stickers: Mutex::new(StickerState::default()),
         e2ee_tx: Mutex::new(None),
         polling: Default::default(),
+        poll_again: Default::default(),
+        rate_limited: Default::default(),
+        pending_gaps: Default::default(),
+        poll_wait: Mutex::new((None, 0)),
+        session_expired: Default::default(),
         pin: Mutex::new(PinInfo::default()),
         http_cursor: Mutex::new(None),
     });
@@ -193,7 +214,17 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
 
         set_status(Status::Syncing);
         let cursor = shared.store.lock().unwrap().cursors.get(&1).cloned();
-        match session.ls_sync(1, cursor.as_deref()).await.and_then(|p| decode_payload(&p)) {
+        let synced = match session.ls_sync(1, cursor.as_deref()).await.and_then(|p| decode_payload(&p)) {
+            // Rate limited over HTTP (error 1675004): DGW still works and its
+            // sync streams bring the mailbox, so go on without this sync.
+            Err(e) if format!("{e:#}").contains("1675004") => {
+                eprintln!("[sync] HTTP rate limited; syncing over DGW only");
+                shared.note_rate_limit();
+                Ok(Vec::new())
+            }
+            other => other,
+        };
+        match synced {
             Ok(calls) => {
                 shared.note_http_cursor(&calls);
                 shared.store.lock().unwrap().apply(&calls);
@@ -294,6 +325,9 @@ struct Conn {
     snapshot_streams: std::collections::HashSet<u16>,
     /// Streams carrying a task sent on DGW (reactions), for the debug log.
     task_streams: std::collections::HashSet<u16>,
+    /// Task streams carrying tasks the server asked for (their answers'
+    /// own follow-ups aren't sent).
+    followup_streams: std::collections::HashSet<u16>,
     /// The snapshots are in: connections now open with delta syncs.
     subscribed: bool,
     request_id: i64,
@@ -305,7 +339,7 @@ struct Conn {
 
 impl Conn {
     fn new(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) -> Self {
-        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
+        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), followup_streams: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
     }
 
     /// A Lightspeed request body (the JSON the web client sends on a DGW stream).
@@ -410,10 +444,13 @@ impl Conn {
         let mut last_frame = tokio::time::Instant::now();
         let mut ping = tokio::time::interval(Duration::from_secs(15));
         ping.tick().await;
-        // DGW doesn't push live changes to us yet (the web client gets them on
-        // its database 1 stream; something it does to subscribe is still
-        // missing), so poll a delta sync of the mailbox over HTTP meanwhile.
-        let mut poll = tokio::time::interval(Duration::from_secs(5));
+        // DGW pushes only part of the mailbox's changes on its database 1
+        // stream (the web client gets them all; something it does to subscribe
+        // is still missing). Most arrive as a bare sequence bump with no
+        // content: that triggers a delta sync over HTTP (see the Data frames
+        // below). This is only a fallback for anything missed. Fixed polling
+        // every 5 s got the account rate limited (1675004) and warned.
+        let mut poll = tokio::time::interval(Duration::from_secs(300));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         poll.tick().await;
 
@@ -447,6 +484,9 @@ impl Conn {
                                     reply.extend(dgw::ack(stream, id));
                                 }
                                 let sync_failed = self.handle_ls_resp(&body);
+                                if self.subscribed && self.sync_streams.get(&stream) == Some(&1) && is_bare_bump(&body) {
+                                    self.poll_mailbox();
+                                }
                                 if let Some(database) = self.sync_streams.get(&stream).copied() {
                                     let has_cursor = self.shared.store.lock().unwrap().cursors.contains_key(&database);
                                     if !sync_failed && has_cursor && self.snapshot_streams.remove(&stream) && self.snapshot_streams.is_empty() {
@@ -477,6 +517,22 @@ impl Conn {
                                     }
                                     // No End here: after we closed a task stream the server
                                     // dropped the whole connection on the next task.
+                                    // Tasks the server asks for in its answer (encrypted
+                                    // chats' nicknames answer with task 722) are queued and
+                                    // sent like the web's task queue does; one level only.
+                                    if !self.followup_streams.remove(&stream) {
+                                        let follow = followup_tasks(&body);
+                                        if !follow.is_empty() {
+                                            let tasks = follow.iter().map(|(label, payload, queue)| (label.as_str(), payload.clone(), queue.clone())).collect();
+                                            let body = self.tasks(tasks);
+                                            let fresh = self.next_stream;
+                                            self.next_stream += 1;
+                                            self.task_streams.insert(fresh);
+                                            self.followup_streams.insert(fresh);
+                                            reply.extend(dgw::establish(fresh));
+                                            reply.extend(dgw::data(fresh, 0, &body));
+                                        }
+                                    }
                                 } else {
                                     // A request stream carries one answer; close our side.
                                     reply.extend(dgw::end(stream));
@@ -502,7 +558,9 @@ impl Conn {
                     // Reactions go on DGW like the web: over HTTP the server
                     // fails task 29 with error 1357038. Archiving too: over
                     // HTTP task 146 is acknowledged but the chat stays put.
-                    let on_dgw = matches!(cmd, Command::React { .. } | Command::Archive { .. });
+                    // Nicknames too: over HTTP task 44 fails with 1357038 as well.
+                    let on_dgw = matches!(cmd, Command::React { .. } | Command::Archive { .. } | Command::SetNickname { .. });
+                    let is_typing = matches!(cmd, Command::Typing { .. });
                     // Commands go over HTTP or the E2EE connection, so they don't
                     // wait for the DGW socket (they used to be dropped while it
                     // reconnected).
@@ -511,7 +569,9 @@ impl Conn {
                         // socket, the server answers and then drops the whole
                         // connection, losing live updates until we reconnect. DGW
                         // carries only the database sync streams.
-                        Ok(Some(body)) if on_dgw => {
+                        // While HTTP is rate limited, tasks go on DGW too.
+                        Ok(Some(_)) if self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) && is_typing => {}
+                        Ok(Some(body)) if on_dgw || (self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) && lightspeed_request(&body).is_some_and(|(kind, _)| kind == 3)) => {
                             let stream = self.next_stream;
                             self.next_stream += 1;
                             self.task_streams.insert(stream);
@@ -528,14 +588,29 @@ impl Conn {
                         },
                         Ok(None) => {}
                         Err(e) => {
+                            // Logged only (no generic error notice).
                             eprintln!("[command] failed: {e:#}");
-                            *self.shared.error.lock().unwrap() = Some("Couldn't complete that.".into());
-                            (self.repaint)();
                         }
                     }
                 }
                 _ = poll.tick(), if self.subscribed => self.poll_mailbox(),
                 _ = ping.tick() => {
+                    if self.shared.session_expired.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                        anyhow::bail!("session expired");
+                    }
+                    // (History can't come over DGW instead: task 228 there makes
+                    // the server drop the connection.)
+                    if !self.shared.http_limited() {
+                        let gaps: Vec<_> = self.shared.pending_gaps.lock().unwrap().drain().collect();
+                        let missed = self.shared.poll_again.load(std::sync::atomic::Ordering::Acquire)
+                            && !self.shared.polling.load(std::sync::atomic::Ordering::Acquire);
+                        if missed {
+                            self.poll_mailbox();
+                        }
+                        for (thread, start) in gaps {
+                            self.fill_gap(thread, start);
+                        }
+                    }
                     if last_frame.elapsed() > Duration::from_secs(45) {
                         anyhow::bail!("no data from the server for 45s");
                     }
@@ -572,6 +647,14 @@ impl Conn {
                 }
                 for c in calls.iter().filter(|c| c.name == "executeFirstBlockForSyncTransactionV4") {
                     eprintln!("  sync transaction: database {:?} epoch {:?} prev cursor {} new cursor {}", c.arg(0), c.arg(1), c.arg(2).str().map_or(0, str::len), c.arg(3).str().map_or(0, str::len));
+                }
+                // Shapes only: numbers as is, strings by length.
+                for c in calls.iter().filter(|c| c.name == "insertAdminMessageInClientMessages" || c.name == "updateThreadParticipantNicknameV2") {
+                    let shape: Vec<String> = c.args.iter().enumerate().map(|(i, a)| match a.str() {
+                        Some(s) => format!("{i}:str({})", s.chars().count()),
+                        None => format!("{i}:{a:?}"),
+                    }).collect();
+                    eprintln!("  {} {}", c.name, shape.join(" "));
                 }
                 for c in calls.iter().filter(|c| c.name == "taskExists" || c.name == "removeTask" || c.name == "updateSyncGroupForThreadType") {
                     eprintln!("  {} {:?}", c.name, c.args);
@@ -668,6 +751,7 @@ impl Conn {
             }
             match result {
                 Ok(calls) => {
+                    shared.rate_limited.store(false, std::sync::atomic::Ordering::Release);
                     shared.store.lock().unwrap().apply(&calls);
                     repaint();
                     if kind == 3 {
@@ -681,9 +765,12 @@ impl Conn {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[command] task failed: {e:#}");
-                    *shared.error.lock().unwrap() = Some("Couldn't complete that.".into());
-                    repaint();
+                    if format!("{e:#}").contains("1675004") {
+                        shared.note_rate_limit();
+                    }
+                    // Logged only: a generic "couldn't complete that" told the
+                    // user nothing they could act on.
+                    eprintln!("[command] request type {kind} failed: {e:#}");
                 }
             }
         });
@@ -691,25 +778,48 @@ impl Conn {
 
     /// Delta sync of database 1 from our cursor over HTTP; one at a time.
     fn poll_mailbox(&self) {
+        if self.shared.http_limited() {
+            // Remember it: the ping tick polls once the limit is over.
+            self.shared.poll_again.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
         if self.shared.polling.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            // One in flight: run once more after it (bumps come in bursts).
+            self.shared.poll_again.store(true, std::sync::atomic::Ordering::Release);
             return;
         }
         let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
         tokio::spawn(async move {
-            match http_delta(&session, &shared).await {
-                Ok(calls) => {
-                    let changed = calls.iter().any(|c| !c.name.starts_with("execute") && c.name != "setRegionHint" && !c.name.starts_with("updateLastSync"));
-                    shared.store.lock().unwrap().apply(&calls);
-                    if changed {
-                        if std::env::var_os("MESSENGER_DEBUG").is_some() {
-                            let mut names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-                            names.dedup();
-                            eprintln!("[poll] {names:?}");
+            loop {
+                match http_delta(&session, &shared).await {
+                    Ok(calls) => {
+                        *shared.poll_wait.lock().unwrap() = (None, 0);
+                        shared.rate_limited.store(false, std::sync::atomic::Ordering::Release);
+                        let changed = calls.iter().any(|c| !c.name.starts_with("execute") && c.name != "setRegionHint" && !c.name.starts_with("updateLastSync"));
+                        shared.store.lock().unwrap().apply(&calls);
+                        if changed {
+                            if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                                let mut names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                                names.dedup();
+                                eprintln!("[poll] {names:?}");
+                            }
+                            repaint();
                         }
-                        repaint();
+                    }
+                    Err(e) => {
+                        let e = format!("{e:#}");
+                        if e.contains("\"error\":1357001") {
+                            shared.session_expired.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        if e.contains("1675004") {
+                            shared.note_rate_limit();
+                        }
+                        eprintln!("[poll] {e}");
                     }
                 }
-                Err(e) => eprintln!("[poll] {e:#}"),
+                if shared.http_limited() || !shared.poll_again.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    break;
+                }
             }
             shared.polling.store(false, std::sync::atomic::Ordering::Release);
         });
@@ -869,6 +979,7 @@ impl Conn {
             // One at a time: each page is a task plus a delta sync of the
             // shared HTTP cursor, and two at once take each other's answers.
             let _turn = GAP_TURN.lock().await;
+            let first = start.clone();
             let mut reference = start.or_else(|| newest(&shared.store.lock().unwrap()));
             for page in 0..MAX_PAGES {
                 let Some((ts, mid)) = reference.take() else { break };
@@ -878,6 +989,13 @@ impl Conn {
                     Ok(calls) => calls,
                     Err(e) => {
                         eprintln!("[gap] {thread}: {e:#}");
+                        // Rate limited: try this chat again once HTTP is back
+                        // (from where this page started).
+                        if format!("{e:#}").contains("1675004") {
+                            shared.note_rate_limit();
+                            let from = if page == 0 { first.clone() } else { Some((ts, mid.clone())) };
+                            shared.pending_gaps.lock().unwrap().insert(thread, from);
+                        }
                         break;
                     }
                 };
@@ -926,6 +1044,7 @@ impl Conn {
             let mut st = self.shared.store.lock().unwrap();
             match &payload {
                 crate::e2ee_listen::OutgoingPayload::Sticker { url, .. } if !url.is_empty() => st.add_pending_sticker(thread, otid, url),
+                crate::e2ee_listen::OutgoingPayload::Image(path) => st.add_pending_files(thread, otid, std::slice::from_ref(path), None),
                 _ => st.add_pending(thread, otid, shown, None),
             }
         }
@@ -1003,15 +1122,16 @@ impl Conn {
             }
             Command::SendFiles { thread, paths, reply_to } => {
                 let otid = new_otid();
-                let shown = if paths.len() == 1 { "Sending a file…".to_string() } else { format!("Sending {} files…", paths.len()) };
-                self.shared.store.lock().unwrap().add_pending(thread, otid, shown, None);
+                self.shared.store.lock().unwrap().add_pending_files(thread, otid, &paths, reply_to.clone());
                 (self.repaint)();
                 let mut ids = Vec::new();
                 for path in &paths {
                     match self.session.upload(path).await {
                         Ok(id) => ids.push(id),
                         Err(e) => {
+                            // The picture would vanish without a word: say so.
                             self.shared.store.lock().unwrap().remove_pending(thread, otid);
+                            *self.shared.error.lock().unwrap() = Some("Couldn't send the file.".into());
                             (self.repaint)();
                             return Err(e);
                         }
@@ -1238,11 +1358,71 @@ impl Conn {
                 let p = json!({"thread_key": thread, "remove_type": 1, "sync_group": if e2ee { 95 } else { 1 }, "offline_threading_id": ""});
                 self.tasks(vec![("146", p, thread.to_string())])
             }
+            Command::SetNickname { thread, contact, nickname } => {
+                // The web's LSOptimisticUpdateThreadParticipantNickname: task 44
+                // on the "thread_participant_nickname" queue; no nickname
+                // field removes it.
+                let nickname = nickname.trim().to_string();
+                let e2ee = {
+                    let mut st = self.shared.store.lock().unwrap();
+                    st.set_nickname(thread, contact, &nickname);
+                    st.threads.get(&thread).is_some_and(|t| t.e2ee)
+                };
+                (self.repaint)();
+                let mut p = json!({"thread_key": thread, "contact_id": contact, "sync_group": if e2ee { 95 } else { 1 }});
+                if !nickname.is_empty() {
+                    p["nickname"] = json!(nickname);
+                }
+                self.tasks(vec![("44", p, "thread_participant_nickname".into())])
+            }
         }))
     }
 }
 
+/// A database 1 push that only moves the sequence id: something changed but
+/// the content didn't come with it.
+fn is_bare_bump(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else { return false };
+    let Some(Ok(calls)) = v.get("payload").and_then(Value::as_str).map(decode_payload) else { return false };
+    calls.iter().any(|c| c.name == "upsertSequenceId")
+        && calls.iter().all(|c| c.name.starts_with("execute") || matches!(c.name.as_str(), "upsertSequenceId" | "disableSyncForSyncGroup"))
+}
+
+/// The tasks a task answer asks the client to send next (`issueNewTask`:
+/// queue, label, payload JSON).
+fn followup_tasks(body: &[u8]) -> Vec<(String, Value, String)> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else { return Vec::new() };
+    let Some(Ok(calls)) = v.get("payload").and_then(Value::as_str).map(decode_payload) else { return Vec::new() };
+    calls
+        .iter()
+        .filter(|c| c.name == "issueNewTask")
+        .filter_map(|c| {
+            let payload = serde_json::from_str::<Value>(c.arg(2).str()?).ok()?;
+            let label = c.arg(1).int();
+            if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                let keys: Vec<String> = payload.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+                eprintln!("[task] server asks for label {label} with {keys:?}");
+            }
+            Some((label.to_string(), payload, c.arg(0).string()))
+        })
+        .collect()
+}
+
 impl Shared {
+    /// HTTP answered "rate limit exceeded": no polls for a while (1, 2, 4 …
+    /// 15 min), and tasks go on DGW until HTTP answers again.
+    fn note_rate_limit(&self) {
+        let mut wait = self.poll_wait.lock().unwrap();
+        let secs = (wait.1 * 2).clamp(60, 900);
+        *wait = (Some(std::time::Instant::now() + Duration::from_secs(secs)), secs);
+        self.rate_limited.store(true, std::sync::atomic::Ordering::Release);
+        eprintln!("[http] rate limited; next poll in {secs}s");
+    }
+
+    fn http_limited(&self) -> bool {
+        self.poll_wait.lock().unwrap().0.is_some_and(|t| std::time::Instant::now() < t)
+    }
+
     /// Remember the database 1 cursor an HTTP sync answered with.
     fn note_http_cursor(&self, calls: &[crate::lightspeed::Call]) {
         let cursor = calls
