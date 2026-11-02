@@ -27,7 +27,8 @@ pub struct Mention {
 
 #[derive(Debug)]
 pub enum Command {
-    SendText { thread: i64, text: String, reply_to: Option<String>, mentions: Vec<Mention> },
+    /// `otid` 0 until `show_now` gives it one (and shows the message).
+    SendText { thread: i64, text: String, reply_to: Option<String>, mentions: Vec<Mention>, otid: i64 },
     SendFiles { thread: i64, paths: Vec<PathBuf>, reply_to: Option<String> },
     React { thread: i64, message_id: String, emoji: String },
     Unsend { thread: i64, message_id: String },
@@ -214,7 +215,9 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
 
         set_status(Status::Syncing);
         let cursor = shared.store.lock().unwrap().cursors.get(&1).cloned();
-        let synced = match session.ls_sync(1, cursor.as_deref()).await.and_then(|p| decode_payload(&p)) {
+        // Still rate limited: don't even try (a refused request still counts).
+        let limited = shared.rate_limited.load(std::sync::atomic::Ordering::Acquire);
+        let synced = if limited { Ok(Vec::new()) } else { match session.ls_sync(1, cursor.as_deref()).await.and_then(|p| decode_payload(&p)) {
             // Rate limited over HTTP (error 1675004): DGW still works and its
             // sync streams bring the mailbox, so go on without this sync.
             Err(e) if format!("{e:#}").contains("1675004") => {
@@ -223,16 +226,18 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
                 Ok(Vec::new())
             }
             other => other,
-        };
+        } };
         match synced {
             Ok(calls) => {
                 shared.note_http_cursor(&calls);
                 shared.store.lock().unwrap().apply(&calls);
                 // Database 95 holds end-to-end encrypted chats: we can list them
                 // (participants, activity) even though we can't decrypt messages.
-                match session.ls_sync(95, None).await.and_then(|p| decode_payload(&p)) {
-                    Ok(calls) => shared.store.lock().unwrap().apply(&calls),
-                    Err(e) => eprintln!("[sync] e2ee thread list: {e}"),
+                if !shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) {
+                    match session.ls_sync(95, None).await.and_then(|p| decode_payload(&p)) {
+                        Ok(calls) => shared.store.lock().unwrap().apply(&calls),
+                        Err(e) => eprintln!("[sync] e2ee thread list: {e}"),
+                    }
                 }
                 // Replay E2EE messages decrypted in earlier runs (before notifications start).
                 {
@@ -761,17 +766,10 @@ impl Conn {
             match result {
                 Ok(calls) => {
                     shared.rate_limited.store(false, std::sync::atomic::Ordering::Release);
+                    // What the task changed comes back on DGW (or as a bump
+                    // that polls): no extra sync here, it doubled the requests.
                     shared.store.lock().unwrap().apply(&calls);
                     repaint();
-                    if kind == 3 {
-                        match http_delta(&session, &shared).await {
-                            Ok(calls) => {
-                                shared.store.lock().unwrap().apply(&calls);
-                                repaint();
-                            }
-                            Err(e) => eprintln!("[command] sync after task failed: {e:#}"),
-                        }
-                    }
                 }
                 Err(e) => {
                     if format!("{e:#}").contains("1675004") {
@@ -1041,14 +1039,26 @@ impl Conn {
     /// Encrypted 1:1 chats go through the E2EE connection, not Lightspeed.
     /// `shown` is what the pending bubble says until the send completes.
     fn send_e2ee(&self, thread: i64, payload: crate::e2ee_listen::OutgoingPayload, shown: String) -> Result<()> {
+        self.send_e2ee_as(thread, payload, shown, 0)
+    }
+
+    /// `send_e2ee` for a message already shown under `otid` (0: not yet).
+    fn send_e2ee_as(&self, thread: i64, payload: crate::e2ee_listen::OutgoingPayload, shown: String, otid: i64) -> Result<()> {
         let peer = {
             let st = self.shared.store.lock().unwrap();
             st.threads.get(&thread).and_then(|t| t.participants.iter().copied().find(|p| *p != st.me))
         };
-        let peer = peer.ok_or_else(|| anyhow::anyhow!("can't tell who this encrypted chat is with"))?;
         let tx = self.shared.e2ee_tx.lock().unwrap().clone();
-        let tx = tx.ok_or_else(|| anyhow::anyhow!("encrypted chats aren't connected yet"))?;
-        let otid = new_otid();
+        let (Some(peer), Some(tx)) = (peer, tx) else {
+            // Shown already but can't go: take it back and say so.
+            if otid != 0 {
+                self.shared.store.lock().unwrap().remove_pending(thread, otid);
+                *self.shared.error.lock().unwrap() = Some("Couldn't send the encrypted message.".into());
+                (self.repaint)();
+            }
+            anyhow::bail!("encrypted chat not ready (peer known: {})", peer.is_some());
+        };
+        let otid = if otid == 0 { new_otid() } else { otid };
         {
             let mut st = self.shared.store.lock().unwrap();
             match &payload {
@@ -1080,8 +1090,8 @@ impl Conn {
         use crate::e2ee_listen::OutgoingPayload;
         let e2ee = |t: &i64| self.shared.store.lock().unwrap().threads.get(t).is_some_and(|t| t.e2ee);
         match &cmd {
-            Command::SendText { thread, text, .. } if e2ee(thread) => {
-                self.send_e2ee(*thread, OutgoingPayload::Text(text.clone()), text.clone())?;
+            Command::SendText { thread, text, otid, .. } if e2ee(thread) => {
+                self.send_e2ee_as(*thread, OutgoingPayload::Text(text.clone()), text.clone(), *otid)?;
                 return Ok(None);
             }
             Command::SendSticker { thread, image, label, .. } if e2ee(thread) => {
@@ -1104,8 +1114,8 @@ impl Conn {
             _ => {}
         }
         Ok(Some(match cmd {
-            Command::SendText { thread, text, reply_to, mentions } => {
-                let otid = new_otid();
+            Command::SendText { thread, text, reply_to, mentions, otid } => {
+                let otid = if otid == 0 { new_otid() } else { otid };
                 self.shared.store.lock().unwrap().add_pending(thread, otid, text.clone(), reply_to.clone());
                 (self.repaint)();
                 let mut p = json!({
@@ -1415,6 +1425,23 @@ fn followup_tasks(body: &[u8]) -> Vec<(String, Value, String)> {
             Some((label.to_string(), payload, c.arg(0).string()))
         })
         .collect()
+}
+
+/// Show a message or reaction the moment it's sent, before the command
+/// reaches the connection (which may be reconnecting for a few seconds).
+pub fn show_now(shared: &Shared, cmd: &mut Command) {
+    let mut st = shared.store.lock().unwrap();
+    match cmd {
+        Command::SendText { thread, text, reply_to, otid, .. } if *otid == 0 => {
+            *otid = new_otid();
+            st.add_pending(*thread, *otid, text.clone(), reply_to.clone());
+        }
+        Command::React { thread, message_id, emoji } => {
+            let me = st.me;
+            st.set_reaction(*thread, message_id, me, emoji.clone());
+        }
+        _ => {}
+    }
 }
 
 impl Shared {

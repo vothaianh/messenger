@@ -787,7 +787,8 @@ impl eframe::App for MessengerApp {
             }
         }
         drop(store);
-        for c in cmds {
+        for mut c in cmds {
+            crate::client::show_now(&self.shared, &mut c);
             self.send(c);
         }
         crate::macos::hover_popover(self.reaction_hover.take().or_else(|| GLASS_TIP.take()));
@@ -3241,7 +3242,7 @@ impl MessengerApp {
                     cmds.push(Command::Edit { message_id: id, text });
                 } else {
                     let mentions = locate_mentions(&text, &self.mention_picks);
-                    cmds.push(Command::SendText { thread: key, text, reply_to: self.reply_to.take().map(|r| r.0), mentions });
+                    cmds.push(Command::SendText { thread: key, text, reply_to: self.reply_to.take().map(|r| r.0), mentions, otid: 0 });
                 }
                 if self.typing_sent.take().is_some() {
                     cmds.push(Command::Typing { thread: key, is_group: thread.is_group(), typing: false });
