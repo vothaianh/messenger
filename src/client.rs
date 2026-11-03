@@ -1238,12 +1238,13 @@ impl Conn {
             Command::MarkRead { thread } => {
                 // Clear the unread dot right away: the server's read watermark
                 // update isn't always pushed back to us.
-                let (e2ee, unread_ids, peer) = {
+                let (e2ee, unread_ids, peer, watermark) = {
                     let mut st = self.shared.store.lock().unwrap();
                     let me = st.me;
                     let Some(t) = st.threads.get_mut(&thread) else { return Ok(None) };
                     let since = t.last_read_ms;
                     t.last_read_ms = t.last_read_ms.max(t.last_activity_ms);
+                    t.read_here_ms = t.last_read_ms;
                     let (e2ee, peer) = (t.e2ee, t.participants.iter().copied().find(|p| *p != me));
                     // Messages received live over E2EE (numeric ids; restored
                     // copies have web ids) from the peer, not read yet.
@@ -1255,7 +1256,7 @@ impl Conn {
                             .take(20)
                             .collect()
                     });
-                    (e2ee, ids, peer)
+                    (e2ee, ids, peer, st.threads.get(&thread).map_or(0, |t| t.last_read_ms))
                 };
                 (self.repaint)();
                 if e2ee {
@@ -1267,7 +1268,10 @@ impl Conn {
                     }
                     return Ok(None);
                 }
-                let p = json!({"thread_id": thread, "last_read_watermark_ts": now_ms(), "sync_group": 1});
+                // Never below the newest message's server time: with this Mac's
+                // clock behind the server's, now() would leave it unread there.
+                let ts = now_ms().max(watermark);
+                let p = json!({"thread_id": thread, "last_read_watermark_ts": ts, "sync_group": 1});
                 self.tasks(vec![("21", p, thread.to_string())])
             }
             Command::Typing { thread, is_group, typing } => {

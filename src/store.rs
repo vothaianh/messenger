@@ -31,6 +31,10 @@ pub struct Thread {
     pub picture: String,
     pub last_activity_ms: i64,
     pub last_read_ms: i64,
+    /// Read watermark we sent from this app. A thread snapshot that the
+    /// server built before it applied our read (or a lost read task) carries
+    /// an older watermark; it mustn't bring the unread dot back.
+    pub read_here_ms: i64,
     pub thread_type: i64,
     pub participants: Vec<i64>,
     /// Oldest message we hold has more history behind it on the server.
@@ -857,7 +861,7 @@ impl Store {
                 let t = self.threads.entry(key).or_default();
                 t.key = key;
                 t.last_activity_ms = c.arg(0).int();
-                t.last_read_ms = c.arg(1).int();
+                t.last_read_ms = c.arg(1).int().max(t.read_here_ms);
                 t.snippet = c.arg(2).string();
                 t.name = c.arg(3).string();
                 t.picture = c.arg(4).string();
