@@ -678,7 +678,21 @@ pub fn glass_window(title: &str, radius: f64) {
 // login window's session (the default, persistent WebKit data store), so the
 // app can use the web client's own code where reimplementing it isn't
 // practical (restoring encrypted-chat history with the PIN). Its window sits
-// off-screen but "visible", so WebKit doesn't throttle the page.
+// off-screen but "visible", so WebKit doesn't throttle the page. macOS can
+// still pull an off-screen window back onto a display (screen changes, wake),
+// which showed the web page behind the app, so the window is also nearly
+// transparent (alpha 0 would count as occluded and get throttled), has no
+// shadow, and is put back off-screen whenever it's moved.
+
+const WEB_ORIGIN: NSPoint = NSPoint::new(-30000.0, -30000.0);
+
+/// Put the hidden page's window back off-screen if macOS moved it.
+fn web_keep_hidden(window: &NSWindow) {
+    let origin = window.frame().origin;
+    if origin.x != WEB_ORIGIN.x || origin.y != WEB_ORIGIN.y {
+        window.setFrameOrigin(WEB_ORIGIN);
+    }
+}
 
 use objc2_web_kit::{WKContentWorld, WKWebView, WKWebViewConfiguration};
 
@@ -701,21 +715,28 @@ pub fn web_open(url: &str, user_agent: &str) {
     let Some(mtm) = MainThreadMarker::new() else { return };
     WEB.with_borrow_mut(|w| {
         if w.view.is_some() {
+            if let Some(window) = &w.window {
+                web_keep_hidden(window);
+            }
             return;
         }
-        let rect = NSRect::new(NSPoint::new(-30000.0, -30000.0), NSSize::new(1280.0, 800.0));
+        let rect = NSRect::new(WEB_ORIGIN, NSSize::new(1280.0, 800.0));
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(mtm.alloc(), rect, NSWindowStyleMask::Borderless, NSBackingStoreType::Buffered, false)
         };
         unsafe { window.setReleasedWhenClosed(false) };
         window.setExcludedFromWindowsMenu(true);
         window.setIgnoresMouseEvents(true);
+        window.setAlphaValue(0.01);
+        window.setOpaque(false);
+        window.setHasShadow(false);
         window.setCollectionBehavior(NSWindowCollectionBehavior::Transient | NSWindowCollectionBehavior::IgnoresCycle);
         let config = unsafe { WKWebViewConfiguration::new(mtm) };
         let view = unsafe { WKWebView::initWithFrame_configuration(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), rect.size), &config) };
         unsafe { view.setCustomUserAgent(Some(&NSString::from_str(user_agent))) };
         window.setContentView(Some(&view));
         window.orderFrontRegardless();
+        web_keep_hidden(&window);
         if let Some(u) = NSURL::URLWithString(&NSString::from_str(url)) {
             let request = NSURLRequest::requestWithURL(&u);
             unsafe { view.loadRequest(&request) };
@@ -727,6 +748,11 @@ pub fn web_open(url: &str, user_agent: &str) {
 
 /// Whether the hidden page finished loading.
 pub fn web_loaded() -> bool {
+    WEB.with_borrow(|w| {
+        if let Some(window) = &w.window {
+            web_keep_hidden(window);
+        }
+    });
     WEB.with_borrow(|w| w.view.as_ref().is_some_and(|v| unsafe { !v.isLoading() }))
 }
 

@@ -317,6 +317,8 @@ fn spawn_e2ee(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) {
 /// encrypted thread list.
 const SYNC_STREAMS: [(u16, i64); 4] = [(0, 1), (1, 2), (2, 16), (3, 95)];
 const FIRST_REQUEST_STREAM: u16 = 4;
+/// Minimum time between DGW reconnects that stand in for an HTTP poll.
+const RESYNC_GAP: Duration = Duration::from_secs(20);
 
 struct Conn {
     session: Arc<Session>,
@@ -337,6 +339,12 @@ struct Conn {
     answered_tasks: std::collections::HashSet<u16>,
     /// The snapshots are in: connections now open with delta syncs.
     subscribed: bool,
+    /// While HTTP is rate limited, a mailbox change can't be fetched with an
+    /// HTTP delta sync: reconnect DGW at this time instead (its database 1
+    /// stream opens with a delta sync from our cursor, which brings the
+    /// content). Coalesced, and at most once per `RESYNC_GAP`.
+    resync_at: Option<tokio::time::Instant>,
+    last_resync: Option<tokio::time::Instant>,
     request_id: i64,
     epoch: i64,
     /// Lightspeed task ids must be unique: the server answers a reused id with
@@ -346,7 +354,7 @@ struct Conn {
 
 impl Conn {
     fn new(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) -> Self {
-        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), followup_streams: Default::default(), answered_tasks: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
+        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), followup_streams: Default::default(), answered_tasks: Default::default(), subscribed: false, resync_at: None, last_resync: None, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
     }
 
     /// A Lightspeed request body (the JSON the web client sends on a DGW stream).
@@ -462,6 +470,7 @@ impl Conn {
         poll.tick().await;
 
         loop {
+            let resync_deadline = self.resync_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 msg = ws.recv() => {
                     let Some(bytes) = msg? else { anyhow::bail!("connection closed") };
@@ -493,6 +502,9 @@ impl Conn {
                                 let sync_failed = self.handle_ls_resp(&body);
                                 if self.subscribed && self.sync_streams.get(&stream) == Some(&1) && is_bare_bump(&body) {
                                     self.poll_mailbox();
+                                    if self.shared.http_limited() {
+                                        self.schedule_resync();
+                                    }
                                 }
                                 if let Some(database) = self.sync_streams.get(&stream).copied() {
                                     let has_cursor = self.shared.store.lock().unwrap().cursors.contains_key(&database);
@@ -607,7 +619,23 @@ impl Conn {
                         }
                     }
                 }
-                _ = poll.tick(), if self.subscribed => self.poll_mailbox(),
+                _ = poll.tick(), if self.subscribed => {
+                    self.poll_mailbox();
+                    if self.shared.http_limited() {
+                        self.schedule_resync();
+                    }
+                }
+                _ = tokio::time::sleep_until(resync_deadline), if self.resync_at.is_some() => {
+                    if !self.task_streams.is_empty() {
+                        // A task's answer is still due on this socket: wait for it.
+                        self.resync_at = Some(tokio::time::Instant::now() + Duration::from_secs(2));
+                        continue;
+                    }
+                    self.resync_at = None;
+                    self.last_resync = Some(tokio::time::Instant::now());
+                    eprintln!("[sync] HTTP rate limited; reconnecting DGW for the mailbox changes");
+                    return Ok(true);
+                }
                 _ = ping.tick() => {
                     if self.shared.session_expired.swap(false, std::sync::atomic::Ordering::AcqRel) {
                         anyhow::bail!("session expired");
@@ -633,6 +661,20 @@ impl Conn {
                 }
             }
         }
+    }
+
+    /// Reconnect soon to fetch mailbox changes over DGW (HTTP rate limited).
+    fn schedule_resync(&mut self) {
+        if self.resync_at.is_some() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        // A short wait gathers a burst of bumps into one reconnect.
+        let mut at = now + Duration::from_secs(2);
+        if let Some(last) = self.last_resync {
+            at = at.max(last + RESYNC_GAP);
+        }
+        self.resync_at = Some(at);
     }
 
     /// Apply a Lightspeed response; returns true if it was a sync failure

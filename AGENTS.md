@@ -190,7 +190,9 @@ aren't sent yet; old history needs the PIN restore (in progress, see
   often pushes only a bare sequence bump (`upsertSequenceId`, no content):
   the client polls once on such a bump (coalesced), plus a 5-minute fallback.
   While rate limited, tasks go on DGW and gap fills wait for HTTP
-  (`pending_gaps`). History (task 228) can't go on DGW: the server drops the
+  (`pending_gaps`), and a bump reconnects DGW instead of polling (its
+  database 1 stream reopens with a delta sync from the cursor, which brings
+  the content; coalesced, at most once per 20 s: `Conn::schedule_resync`). History (task 228) can't go on DGW: the server drops the
   connection, and so does a second sync stream for database 1.
 - Don't open facebook.com in Chrome for research: Facebook locks multiple web
   sessions. Read the web's public JS bundles instead (their links are in the
