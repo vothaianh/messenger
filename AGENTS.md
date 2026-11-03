@@ -194,7 +194,11 @@ aren't sent yet; old history needs the PIN restore (in progress, see
   delta sync from the cursor answers only `updateLastSyncCompletedTimestampMsToNow`
   (tried in 1.0.13, removed). Opening a chat with few messages used to ask
   for older history every 10 s forever (rate limited the account); a fetch
-  that adds nothing now sets `has_more_before = false`. History (task 228) can't go on DGW: the server drops the
+  that adds nothing now sets `has_more_before = false`.
+  HTTP Lightspeed requests use their own device id
+  (`Session::http_device_id`): after an HTTP sync under the DGW socket's
+  device id, DGW stopped pushing live changes (1.0.15; confirm on a
+  non-rate-limited account). History (task 228) can't go on DGW: the server drops the
   connection, and so does a second sync stream for database 1.
 - Don't open facebook.com in Chrome for research: Facebook locks multiple web
   sessions. Read the web's public JS bundles instead (their links are in the

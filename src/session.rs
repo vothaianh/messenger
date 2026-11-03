@@ -105,6 +105,13 @@ pub struct Session {
     /// new id per request the server answers every sync with a fresh snapshot
     /// and delivers fetched history to a "device" that never asks for it.
     pub device_id: String,
+    /// Device id for Lightspeed requests over HTTP (GraphQL). Not the DGW
+    /// one: once an HTTP sync ran under the DGW socket's device id, DGW
+    /// stopped pushing live changes (seen every time; runs without an HTTP
+    /// sync kept getting pushes), so new messages waited for the 5-minute
+    /// fallback poll. Fixed for the session, so HTTP cursors and task
+    /// results still belong to one device.
+    pub http_device_id: String,
 }
 
 fn capture(html: &str, re: &str) -> Option<String> {
@@ -205,6 +212,7 @@ impl Session {
             boot: Bootstrap { fbid, dtsg, lsd, ls_app_id, mqtt_app_id, mqtt_endpoint, ls_doc_id, ls_version, page_params, e2ee_cat, e2ee_app_id, region, vesta_wasm_url, presence },
             req_counter: Default::default(),
             device_id: uuid::Uuid::new_v4().to_string(),
+            http_device_id: uuid::Uuid::new_v4().to_string(),
         })
     }
 
@@ -276,7 +284,7 @@ impl Session {
     /// `LSPlatformGraphQLLightspeedRequestQuery`: type 1 = database sync, 3 = tasks.
     pub async fn ls_request(&self, request_type: i64, request_payload: String) -> Result<String> {
         let variables = json!({
-            "deviceId": self.device_id,
+            "deviceId": self.http_device_id,
             "requestId": 0,
             "requestPayload": request_payload,
             "requestType": request_type,
