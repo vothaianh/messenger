@@ -162,6 +162,11 @@ notifications, snippets, live updates), implement it for both paths in the
 same change, or say clearly in your report which side is missing and why.
 Don't hide a control in one kind of chat without telling the user (the
 sticker button was hidden in E2EE chats and the user had to ask).
+An E2EE message arrives under two ids, `<peer>@msgr.<id>` (inbox sync)
+and `<id>` (E2EE socket); `store::same_id` treats them as one.
+Reads made here are kept in `Thread::read_here_ms`; when the server's
+watermark (`server_read_ms`) stays behind, the read is sent again once HTTP
+answers (reads queued while rate limited used to be lost on quit).
 Current gaps in E2EE chats: replies, reactions, edits, unsend and typing
 aren't sent yet; old history needs the PIN restore (in progress, see
 `docs/E2EE.md`).

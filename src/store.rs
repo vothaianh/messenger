@@ -35,6 +35,10 @@ pub struct Thread {
     /// server built before it applied our read (or a lost read task) carries
     /// an older watermark; it mustn't bring the unread dot back.
     pub read_here_ms: i64,
+    /// The read watermark the server reported (0 = not heard this run's
+    /// sync yet). Below `read_here_ms`, our read didn't reach the server
+    /// (lost while rate limited, or the app quit first): it's sent again.
+    pub server_read_ms: i64,
     pub thread_type: i64,
     pub participants: Vec<i64>,
     /// Oldest message we hold has more history behind it on the server.
@@ -195,7 +199,18 @@ impl Store {
         let snap: Snapshot = serde_json::from_slice(&bytes).ok()?;
         let mut store = Store { me: snap.me, ..Default::default() };
         store.contacts = snap.contacts.into_iter().map(|c| (c.id, c)).collect();
-        store.threads = snap.threads.into_iter().map(|t| (t.key, t)).collect();
+        store.threads = snap
+            .threads
+            .into_iter()
+            .map(|mut t| {
+                // What the server reported last run may be out of date, so
+                // wait for this run's sync. Reads from before 1.0.17 only
+                // live in last_read_ms.
+                t.server_read_ms = 0;
+                t.read_here_ms = t.read_here_ms.max(t.last_read_ms);
+                (t.key, t)
+            })
+            .collect();
         for mut m in snap.messages {
             // Caches from before 1.0.8 can hold the same share many times.
             let mut kept: Vec<Attachment> = Vec::new();
@@ -213,7 +228,19 @@ impl Store {
             }
             m.attachments = kept;
             store.seen_ids.insert(m.id.clone());
-            store.messages.entry(m.thread_key).or_default().push(m);
+            let list = store.messages.entry(m.thread_key).or_default();
+            // Caches from before 1.0.17 can hold an E2EE message twice (under
+            // both id forms): keep the first.
+            if !list.iter().any(|k| same_id(&k.id, &m.id)) {
+                list.push(m);
+            }
+        }
+        // ...and live 1:1 E2EE messages filed under an encrypted group with
+        // the same person (bare numeric ids; groups get none of their own).
+        for (key, list) in store.messages.iter_mut() {
+            if store.threads.get(key).is_some_and(|t| t.e2ee && t.participants.len() > 2) {
+                list.retain(|m| m.id.is_empty() || !m.id.bytes().all(|b| b.is_ascii_digit()));
+            }
         }
         store.read_receipts = snap.read_receipts;
         store.delivered_receipts = snap.delivered_receipts;
@@ -444,14 +471,20 @@ impl Store {
         let (thread_key, id) = (msg.thread_key, msg.id.clone());
         let early = self.early_stickers.remove(&id);
         let list = self.messages.entry(msg.thread_key).or_default();
-        // Replace an optimistic copy (same otid) or an earlier version (same id).
+        // Replace an optimistic copy (same otid) or an earlier version (same
+        // id, also under its other E2EE id form).
         if let Some(existing) = list
             .iter_mut()
-            .find(|m| m.id == msg.id || (msg.otid != 0 && m.otid == msg.otid))
+            .find(|m| same_id(&m.id, &msg.id) || (msg.otid != 0 && m.otid == msg.otid))
         {
             let attachments = std::mem::take(&mut existing.attachments);
             let reactions = std::mem::take(&mut existing.reactions);
+            // Keep the bare E2EE id: read receipts go out under it.
+            let keep_id = (existing.id != msg.id && same_id(&existing.id, &msg.id) && !existing.id.contains('@')).then(|| existing.id.clone());
             *existing = msg;
+            if let Some(id) = keep_id {
+                existing.id = id;
+            }
             if existing.attachments.is_empty() {
                 existing.attachments = attachments;
             }
@@ -575,7 +608,9 @@ impl Store {
         let Some(thread_key) = self
             .threads
             .values()
-            .find(|t| t.e2ee && (t.participants.contains(&ev.peer) || t.key == ev.peer))
+            // Not an encrypted group that has them too (group messages aren't
+            // mapped yet, see `to_incoming`).
+            .find(|t| t.e2ee && ((t.participants.contains(&ev.peer) && t.participants.len() <= 2) || t.key == ev.peer))
             .map(|t| t.key)
         else {
             return false;
@@ -674,6 +709,13 @@ impl Store {
         });
     }
 
+}
+
+/// An E2EE message comes as `<peer>@msgr.<id>` from the inbox sync and as
+/// `<id>` over the E2EE socket: the same message.
+pub fn same_id(a: &str, b: &str) -> bool {
+    let bare = |id: &str| id.rsplit_once("@msgr.").map_or(id, |(_, n)| n).to_string();
+    a == b || (!a.is_empty() && bare(a) == bare(b))
 }
 
 /// The same message under two ids (received live over E2EE, and restored
@@ -841,6 +883,7 @@ impl Store {
                 t.key = key;
                 t.last_activity_ms = t.last_activity_ms.max(c.arg(0).int());
                 t.last_read_ms = t.last_read_ms.max(c.arg(1).int());
+                t.server_read_ms = t.server_read_ms.max(c.arg(1).int());
                 if let Some(s) = c.arg(2).str() {
                     t.snippet = s.to_string();
                 }
@@ -862,6 +905,7 @@ impl Store {
                 t.key = key;
                 t.last_activity_ms = c.arg(0).int();
                 t.last_read_ms = c.arg(1).int().max(t.read_here_ms);
+                t.server_read_ms = t.server_read_ms.max(c.arg(1).int());
                 t.snippet = c.arg(2).string();
                 t.name = c.arg(3).string();
                 t.picture = c.arg(4).string();
@@ -987,6 +1031,7 @@ impl Store {
                     }
                     if msg.sender_id == self.me {
                         t.last_read_ms = t.last_read_ms.max(msg.timestamp_ms);
+                        t.server_read_ms = t.server_read_ms.max(msg.timestamp_ms);
                     }
                 }
                 self.typing.entry(msg.thread_key).or_default().remove(&msg.sender_id);
@@ -1143,12 +1188,14 @@ impl Store {
                 if contact == self.me {
                     if let Some(t) = self.threads.get_mut(&thread) {
                         t.last_read_ms = t.last_read_ms.max(ts);
+                        t.server_read_ms = t.server_read_ms.max(ts);
                     }
                 }
             }
             "markThreadRead" | "markThreadReadV2" => {
                 if let Some(t) = self.threads.get_mut(&c.arg(1).int()) {
                     t.last_read_ms = t.last_read_ms.max(c.arg(0).int());
+                    t.server_read_ms = t.server_read_ms.max(c.arg(0).int());
                 }
             }
             "updateTypingIndicator" => {
@@ -1319,11 +1366,27 @@ mod tests {
         assert_eq!(m.sender_id, 42);
         assert_eq!(m.reactions[&1], "❤");
     }
+
+    #[test]
+    fn e2ee_message_under_both_ids_shows_once() {
+        let mut st = Store::default();
+        let msg = |id: &str| Message { id: id.into(), thread_key: 7, sender_id: 1, text: "hi".into(), timestamp_ms: 5, ..Default::default() };
+        st.insert_message(msg("75233"));
+        st.insert_message(msg("42@msgr.75233"));
+        st.insert_message(msg("42@msgr.99"));
+        let ids: Vec<&str> = st.messages[&7].iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["75233", "42@msgr.99"]);
+        assert!(!same_id("42@msgr.1", "43@msgr.12"));
+    }
 }
 
 
 /// Write cache bytes atomically, readable only by us (it holds messages).
 pub fn write_cache(bytes: &[u8]) {
+    // One writer at a time: saves now also start on each new message, and
+    // two writers share the same temporary file.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(path) = cache_path() {
         let _ = crate::e2ee_media::write_private(&path, bytes);
     }
@@ -1434,5 +1497,17 @@ mod redirect_tests {
     fn unwraps_facebook_redirect() {
         assert_eq!(super::unwrap_redirect("https://l.facebook.com/l.php?u=https%3A%2F%2Fgithub.com%2Fa%2Fb&h=AT0"), "https://github.com/a/b");
         assert_eq!(super::unwrap_redirect("https://www.facebook.com/reel/1"), "https://www.facebook.com/reel/1");
+    }
+}
+
+impl Store {
+    /// Regular chats this app marked read that the server still has unread
+    /// (once this run's sync told us its watermark): (thread, watermark).
+    pub fn reads_to_resend(&self) -> Vec<(i64, i64)> {
+        self.threads
+            .values()
+            .filter(|t| !t.e2ee && t.server_read_ms > 0 && t.read_here_ms > t.server_read_ms)
+            .map(|t| (t.key, t.read_here_ms))
+            .collect()
     }
 }

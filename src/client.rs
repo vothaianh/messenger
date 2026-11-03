@@ -117,6 +117,10 @@ pub struct Shared {
     /// (On DGW the task makes the server drop the connection, and each
     /// reconnect costs HTTP requests that extend the limit.)
     pending_reads: Mutex<HashSet<i64>>,
+    /// Reads sent again because the server's watermark stayed behind ours
+    /// (thread, watermark): once each, so a server that keeps an older
+    /// watermark doesn't get the task over and over.
+    resent_reads: Mutex<HashSet<(i64, i64)>>,
     /// HTTP was rate limited and hasn't answered since: tasks go on DGW and
     /// typing isn't sent (the polls, after their wait, find out when it's over).
     rate_limited: std::sync::atomic::AtomicBool,
@@ -146,6 +150,7 @@ pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (A
         rate_limited: Default::default(),
         pending_gaps: Default::default(),
         pending_reads: Default::default(),
+        resent_reads: Default::default(),
         poll_wait: Mutex::new((None, 0)),
         session_expired: Default::default(),
         pin: Mutex::new(PinInfo::default()),
@@ -639,6 +644,31 @@ impl Conn {
                                 if let Some((kind, payload)) = lightspeed_request(&body) {
                                     self.send_request_http(kind, payload);
                                 }
+                            }
+                        }
+                        // Reads that never reached the server (lost while rate
+                        // limited, or the app quit before sending them): one
+                        // request for all of them.
+                        // Only once HTTP answered again (the wait after a rate
+                        // limit ending doesn't mean the limit is over), as each
+                        // read is retried just once per run.
+                        let limited = self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire);
+                        let resend: Vec<(i64, i64)> = if limited { Vec::new() } else {
+                            let mut sent = self.shared.resent_reads.lock().unwrap();
+                            let st = self.shared.store.lock().unwrap();
+                            st.reads_to_resend().into_iter().filter(|r| sent.insert(*r)).take(20).collect()
+                        };
+                        if !resend.is_empty() {
+                            if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                                eprintln!("[read] sending {} read(s) the server missed", resend.len());
+                            }
+                            let tasks = resend
+                                .iter()
+                                .map(|(thread, ts)| ("21", json!({"thread_id": thread, "last_read_watermark_ts": ts, "sync_group": 1}), thread.to_string()))
+                                .collect();
+                            let body = self.tasks(tasks);
+                            if let Some((kind, payload)) = lightspeed_request(&body) {
+                                self.send_request_http(kind, payload);
                             }
                         }
                     }

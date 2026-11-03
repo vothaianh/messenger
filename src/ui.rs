@@ -686,7 +686,8 @@ impl eframe::App for MessengerApp {
         storage.set_string("theme", self.theme.key().into());
         storage.set_string("history_restored", self.history_restored.to_string());
         // Also keep the inbox for the next launch (eframe calls this every
-        // ~30 s and on exit); the file is written off the UI thread.
+        // ~30 s and on exit; new messages save it at once too, see
+        // `notify`); the file is written off the UI thread.
         if let Some(bytes) = self.shared.store.lock().unwrap().cache_bytes() {
             std::thread::spawn(move || crate::store::write_cache(&bytes));
         }
@@ -2036,7 +2037,7 @@ impl MessengerApp {
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
                         let name = sf(&title, 15.0, if unread { 600 } else { 500 }).color(pal().text);
-                        ui.add(egui::Label::new(name).truncate());
+                        trunc_label(ui, name);
                         let snippet = if typing && t.is_group() {
                             // Groups: who's typing ("Anh is typing…", "Anh, Bình are typing…").
                             let names: Vec<String> = typers.iter().map(|id| store.member_name(t.key, *id)).collect();
@@ -2052,7 +2053,7 @@ impl MessengerApp {
                             t.snippet.replace('\n', " ")
                         };
                         let s = if unread { sf(&snippet, 13.0, 600).color(pal().text) } else { sf(&snippet, 13.0, 400).color(pal().muted) };
-                        ui.add(egui::Label::new(s).truncate());
+                        trunc_label(ui, s);
                     },
                 );
                 ui.with_layout(Layout::top_down(Align::Max).with_main_align(Align::Center), |ui| {
@@ -2147,7 +2148,7 @@ impl MessengerApp {
                     let width = (ui.available_width() - 140.0).max(80.0);
                     ui.allocate_ui_with_layout(Vec2::new(width, height), Layout::top_down(Align::Min), |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.add(egui::Label::new(sf(&title, 17.0, 600)).truncate());
+                        trunc_label(ui, sf(&title, 17.0, 600));
                         if let Some(subtitle) = subtitle {
                             ui.label(sf(&subtitle, 13.0, 400).color(pal().muted));
                         }
@@ -2635,7 +2636,7 @@ impl MessengerApp {
                 }
             }
             let title = self.store_preview.as_ref().map_or("Sticker Store".to_string(), |(_, name)| name.clone());
-            ui.add(egui::Label::new(sf(&title, 16.0, 700)).truncate());
+            trunc_label(ui, sf(&title, 16.0, 700));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.add(egui::Button::new(sf("Done", 13.0, 600).color(pal().blue)).frame(false)).clicked() {
                     self.sticker_store = false;
@@ -2699,8 +2700,8 @@ impl MessengerApp {
                         ui.vertical(|ui| {
                             ui.set_width(w - 16.0 - 84.0);
                             ui.spacing_mut().item_spacing.y = 1.0;
-                            ui.add(egui::Label::new(sf(&p.name, 13.0, 600)).truncate());
-                            ui.add(egui::Label::new(sf(&p.artist, 11.0, 400).color(pal().muted)).truncate());
+                            trunc_label(ui, sf(&p.name, 13.0, 600));
+                            trunc_label(ui, sf(&p.artist, 11.0, 400).color(pal().muted));
                         });
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let added = in_tray(&p.id, p.in_tray);
@@ -2928,7 +2929,7 @@ impl MessengerApp {
                     ui.spacing_mut().item_spacing.y = 0.0;
                     ui.label(sf(&title, 13.0, 600));
                     if !body.is_empty() {
-                        ui.add(egui::Label::new(sf(&truncate(body, 90), 12.0, 400).color(pal().muted)).truncate());
+                        trunc_label(ui, sf(&truncate(body, 90), 12.0, 400).color(pal().muted));
                     }
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -3340,6 +3341,13 @@ impl MessengerApp {
 
     fn notify(&mut self, store: &mut Store) {
         let incoming = std::mem::take(&mut store.new_incoming);
+        // Save the inbox as soon as a message arrives, not at the next
+        // periodic save (~30 s), so a quit or crash doesn't lose it.
+        if !incoming.is_empty() {
+            if let Some(bytes) = store.cache_bytes() {
+                std::thread::spawn(move || crate::store::write_cache(&bytes));
+            }
+        }
         for (thread, mid) in incoming {
             let Some(t) = store.threads.get(&thread) else { continue };
             if t.muted || !t.in_inbox() || (self.focused && self.selected == Some(thread)) {
@@ -3497,7 +3505,7 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
                             ui.add(egui::Label::new(sf(&truncate(&a.title, 110), 14.0, 600).color(pal().text)).wrap());
                         }
                         if !a.subtitle.is_empty() {
-                            ui.add(egui::Label::new(sf(&a.subtitle, 12.0, 400).color(pal().muted)).truncate());
+                            trunc_label(ui, sf(&a.subtitle, 12.0, 400).color(pal().muted));
                         }
                     });
                 })
@@ -4010,6 +4018,20 @@ fn long_time(ms: i64) -> String {
         dt.format("%a %H:%M").to_string()
     } else {
         dt.format("%d %b %Y, %H:%M").to_string()
+    }
+}
+
+/// A one-line label cut with "…" to fit; the full text shows in a Liquid
+/// Glass tooltip when cut (egui's own elided-text tooltip is opaque).
+fn trunc_label(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+    let text: egui::WidgetText = text.into();
+    let full = text.text().to_string();
+    let width = text.clone().into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body).size().x;
+    let resp = ui.add(egui::Label::new(text).truncate().show_tooltip_when_elided(false));
+    if width > resp.rect.width() + 0.5 {
+        resp.glass_tip(full)
+    } else {
+        resp
     }
 }
 
