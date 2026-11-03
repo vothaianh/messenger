@@ -113,6 +113,10 @@ pub struct Shared {
     /// Gap fills stopped by a rate limit, to run again once it's over:
     /// thread -> where to start (None = from the newest message).
     pending_gaps: Mutex<HashMap<i64, Option<(i64, String)>>>,
+    /// Chats marked read while HTTP was rate limited: sent once it's back.
+    /// (On DGW the task makes the server drop the connection, and each
+    /// reconnect costs HTTP requests that extend the limit.)
+    pending_reads: Mutex<HashSet<i64>>,
     /// HTTP was rate limited and hasn't answered since: tasks go on DGW and
     /// typing isn't sent (the polls, after their wait, find out when it's over).
     rate_limited: std::sync::atomic::AtomicBool,
@@ -141,6 +145,7 @@ pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (A
         poll_again: Default::default(),
         rate_limited: Default::default(),
         pending_gaps: Default::default(),
+        pending_reads: Default::default(),
         poll_wait: Mutex::new((None, 0)),
         session_expired: Default::default(),
         pin: Mutex::new(PinInfo::default()),
@@ -317,8 +322,6 @@ fn spawn_e2ee(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) {
 /// encrypted thread list.
 const SYNC_STREAMS: [(u16, i64); 4] = [(0, 1), (1, 2), (2, 16), (3, 95)];
 const FIRST_REQUEST_STREAM: u16 = 4;
-/// Minimum time between DGW reconnects that stand in for an HTTP poll.
-const RESYNC_GAP: Duration = Duration::from_secs(20);
 
 struct Conn {
     session: Arc<Session>,
@@ -339,12 +342,6 @@ struct Conn {
     answered_tasks: std::collections::HashSet<u16>,
     /// The snapshots are in: connections now open with delta syncs.
     subscribed: bool,
-    /// While HTTP is rate limited, a mailbox change can't be fetched with an
-    /// HTTP delta sync: reconnect DGW at this time instead (its database 1
-    /// stream opens with a delta sync from our cursor, which brings the
-    /// content). Coalesced, and at most once per `RESYNC_GAP`.
-    resync_at: Option<tokio::time::Instant>,
-    last_resync: Option<tokio::time::Instant>,
     request_id: i64,
     epoch: i64,
     /// Lightspeed task ids must be unique: the server answers a reused id with
@@ -354,7 +351,7 @@ struct Conn {
 
 impl Conn {
     fn new(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) -> Self {
-        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), followup_streams: Default::default(), answered_tasks: Default::default(), subscribed: false, resync_at: None, last_resync: None, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
+        Conn { session, shared, repaint, next_stream: FIRST_REQUEST_STREAM, sync_streams: HashMap::new(), snapshot_streams: Default::default(), task_streams: Default::default(), followup_streams: Default::default(), answered_tasks: Default::default(), subscribed: false, request_id: 0, epoch: now_ms() << 22, task_id: now_ms() % 1_000_000 }
     }
 
     /// A Lightspeed request body (the JSON the web client sends on a DGW stream).
@@ -470,7 +467,6 @@ impl Conn {
         poll.tick().await;
 
         loop {
-            let resync_deadline = self.resync_at.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 msg = ws.recv() => {
                     let Some(bytes) = msg? else { anyhow::bail!("connection closed") };
@@ -502,9 +498,6 @@ impl Conn {
                                 let sync_failed = self.handle_ls_resp(&body);
                                 if self.subscribed && self.sync_streams.get(&stream) == Some(&1) && is_bare_bump(&body) {
                                     self.poll_mailbox();
-                                    if self.shared.http_limited() {
-                                        self.schedule_resync();
-                                    }
                                 }
                                 if let Some(database) = self.sync_streams.get(&stream).copied() {
                                     let has_cursor = self.shared.store.lock().unwrap().cursors.contains_key(&database);
@@ -587,6 +580,7 @@ impl Conn {
                     // Nicknames too: over HTTP task 44 fails with 1357038 as well.
                     let on_dgw = matches!(cmd, Command::React { .. } | Command::Archive { .. } | Command::SetNickname { .. });
                     let is_typing = matches!(cmd, Command::Typing { .. });
+                    let read_thread = match &cmd { Command::MarkRead { thread } => Some(*thread), _ => None };
                     // Commands go over HTTP or the E2EE connection, so they don't
                     // wait for the DGW socket (they used to be dropped while it
                     // reconnected).
@@ -597,6 +591,9 @@ impl Conn {
                         // carries only the database sync streams.
                         // While HTTP is rate limited, tasks go on DGW too.
                         Ok(Some(_)) if self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) && is_typing => {}
+                        Ok(Some(_)) if self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) && read_thread.is_some() => {
+                            self.shared.pending_reads.lock().unwrap().extend(read_thread);
+                        }
                         Ok(Some(body)) if on_dgw || (self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) && lightspeed_request(&body).is_some_and(|(kind, _)| kind == 3)) => {
                             let stream = self.next_stream;
                             self.next_stream += 1;
@@ -619,23 +616,7 @@ impl Conn {
                         }
                     }
                 }
-                _ = poll.tick(), if self.subscribed => {
-                    self.poll_mailbox();
-                    if self.shared.http_limited() {
-                        self.schedule_resync();
-                    }
-                }
-                _ = tokio::time::sleep_until(resync_deadline), if self.resync_at.is_some() => {
-                    if !self.task_streams.is_empty() {
-                        // A task's answer is still due on this socket: wait for it.
-                        self.resync_at = Some(tokio::time::Instant::now() + Duration::from_secs(2));
-                        continue;
-                    }
-                    self.resync_at = None;
-                    self.last_resync = Some(tokio::time::Instant::now());
-                    eprintln!("[sync] HTTP rate limited; reconnecting DGW for the mailbox changes");
-                    return Ok(true);
-                }
+                _ = poll.tick(), if self.subscribed => self.poll_mailbox(),
                 _ = ping.tick() => {
                     if self.shared.session_expired.swap(false, std::sync::atomic::Ordering::AcqRel) {
                         anyhow::bail!("session expired");
@@ -652,6 +633,14 @@ impl Conn {
                         for (thread, start) in gaps {
                             self.fill_gap(thread, start);
                         }
+                        let reads: Vec<i64> = self.shared.pending_reads.lock().unwrap().drain().collect();
+                        for thread in reads {
+                            if let Ok(Some(body)) = self.command(Command::MarkRead { thread }).await {
+                                if let Some((kind, payload)) = lightspeed_request(&body) {
+                                    self.send_request_http(kind, payload);
+                                }
+                            }
+                        }
                     }
                     if last_frame.elapsed() > Duration::from_secs(45) {
                         anyhow::bail!("no data from the server for 45s");
@@ -661,20 +650,6 @@ impl Conn {
                 }
             }
         }
-    }
-
-    /// Reconnect soon to fetch mailbox changes over DGW (HTTP rate limited).
-    fn schedule_resync(&mut self) {
-        if self.resync_at.is_some() {
-            return;
-        }
-        let now = tokio::time::Instant::now();
-        // A short wait gathers a burst of bumps into one reconnect.
-        let mut at = now + Duration::from_secs(2);
-        if let Some(last) = self.last_resync {
-            at = at.max(last + RESYNC_GAP);
-        }
-        self.resync_at = Some(at);
     }
 
     /// Apply a Lightspeed response; returns true if it was a sync failure
@@ -986,6 +961,10 @@ impl Conn {
     /// our cursor: the delta carries the fetched range. (Over DGW the server
     /// drops the connection instead of pushing the result.)
     fn load_older(&self, thread: i64) {
+        // Rate limited: a refused request still counts, so don't ask.
+        if self.shared.http_limited() {
+            return;
+        }
         let oldest = {
             let st = self.shared.store.lock().unwrap();
             st.messages.get(&thread).and_then(|v| v.iter().find(|m| !m.pending)).map(|m| (m.timestamp_ms, m.id.clone()))
@@ -1005,11 +984,25 @@ impl Conn {
                     let mut st = shared.store.lock().unwrap();
                     let before = st.messages.get(&thread).map_or(0, Vec::len);
                     st.apply(&calls);
+                    let after = st.messages.get(&thread).map_or(0, Vec::len);
+                    // Nothing older came back: that's the start of the chat.
+                    // Without this, a short chat asked again every 10 s and got
+                    // the account rate limited.
+                    if after == before {
+                        if let Some(t) = st.threads.get_mut(&thread) {
+                            t.has_more_before = false;
+                        }
+                    }
                     if std::env::var_os("MESSENGER_DEBUG").is_some() {
-                        eprintln!("[load_older] {thread}: {before} -> {} messages", st.messages.get(&thread).map_or(0, Vec::len));
+                        eprintln!("[load_older] {thread}: {before} -> {after} messages");
                     }
                 }
-                Err(e) => eprintln!("[load_older] {thread}: {e:#}"),
+                Err(e) => {
+                    if format!("{e:#}").contains("1675004") {
+                        shared.note_rate_limit();
+                    }
+                    eprintln!("[load_older] {thread}: {e:#}");
+                }
             }
             repaint();
         });
@@ -1022,6 +1015,11 @@ impl Conn {
     /// `start`: the message to page back from (None: the newest we have).
     fn fill_gap(&self, thread: i64, start: Option<(i64, String)>) {
         const MAX_PAGES: usize = 15;
+        // Rate limited: a refused request still counts; wait for HTTP.
+        if self.shared.http_limited() {
+            self.shared.pending_gaps.lock().unwrap().insert(thread, start);
+            return;
+        }
         let (session, shared, repaint) = (self.session.clone(), self.shared.clone(), self.repaint.clone());
         tokio::spawn(async move {
             let newest = |st: &Store| st.messages.get(&thread).and_then(|v| v.iter().rev().find(|m| !m.pending && m.id.starts_with("mid."))).map(|m| (m.timestamp_ms, m.id.clone()));

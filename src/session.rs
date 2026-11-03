@@ -145,6 +145,10 @@ impl Session {
             .await?
             .text()
             .await?;
+        // Research aid: the page lists the web client's public JS bundles.
+        if let Some(path) = std::env::var_os("MESSENGER_DUMP_PAGE") {
+            let _ = std::fs::write(path, &html);
+        }
 
         let dtsg = capture(&html, r#""DTSGInitialData",\[\],\{"token":"([^"]+)""#)
             .ok_or_else(|| anyhow!("session expired — please log in again"))?;
