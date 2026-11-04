@@ -237,6 +237,7 @@ fn main() -> anyhow::Result<()> {
                             ),
                             None => format!("Media {kind:?} (no file reference decoded)"),
                         },
+                        armadillo::Content2::StickerRef { .. } => "Sticker (by reference)".into(),
                         armadillo::Content2::Reaction { .. } => "Reaction".into(),
                         armadillo::Content2::Edit { .. } => "Edit".into(),
                         armadillo::Content2::Revoke { .. } => "Revoke".into(),

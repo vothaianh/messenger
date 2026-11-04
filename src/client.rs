@@ -1178,7 +1178,10 @@ impl Conn {
                 return Ok(None);
             }
             Command::SendSticker { thread, image, label, .. } if e2ee(thread) => {
-                let payload = crate::e2ee_listen::OutgoingPayload::Sticker { url: image.clone(), label: label.clone() };
+                let id = match &cmd { Command::SendSticker { sticker_id, .. } => *sticker_id, _ => 0 };
+                // Shown from our own picture once the reference comes back.
+                self.shared.store.lock().unwrap().sticker_images.insert(id.to_string(), image.clone());
+                let payload = crate::e2ee_listen::OutgoingPayload::Sticker { id, url: image.clone(), label: label.clone() };
                 self.send_e2ee(*thread, payload, "Sticker".into())?;
                 return Ok(None);
             }

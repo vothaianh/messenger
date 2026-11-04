@@ -338,6 +338,9 @@ pub enum Content2 {
     Reaction { target_id: String, emoji: String },
     Edit { target_id: String, text: String },
     Revoke { target_id: String },
+    /// A Messenger sticker sent by reference (`receiverFetchId` = the
+    /// sticker's id): no file, the receiver fetches the picture itself.
+    StickerRef { fetch_id: String, width: u32, height: u32, label: String },
     /// Only protocol data (e.g. a sender key distribution), nothing to show.
     None,
     Unsupported,
@@ -414,7 +417,16 @@ fn consumer_content(bytes: &[u8]) -> Result<Content2> {
     } else if let Some(m) = c.audio {
         media(MediaKind::Audio, m)
     } else if let Some(m) = c.sticker {
-        media(MediaKind::Sticker, m)
+        // By reference (how Messenger sends its own stickers), or a file.
+        let reference = m.media.as_ref().and_then(|sub| sub.payload.as_deref()).and_then(|b| StickerTransport::decode(b).ok()).and_then(|t| {
+            let anc = t.ancillary.unwrap_or_default();
+            let id = t.integral.and_then(|i| i.receiver_fetch_id).or(anc.receiver_fetch_id.clone()).filter(|id| !id.is_empty())?;
+            Some(Content2::StickerRef { fetch_id: id, width: anc.width.unwrap_or(0), height: anc.height.unwrap_or(0), label: anc.accessibility_label.unwrap_or_default() })
+        });
+        match reference {
+            Some(r) => r,
+            None => media(MediaKind::Sticker, m),
+        }
     } else if let Some(d) = c.document {
         Content2::Media { kind: MediaKind::File, caption: String::new(), file_name: d.file_name.unwrap_or_default(), file: media_file(d.document) }
     } else if let Some(r) = c.reaction {
@@ -486,6 +498,8 @@ struct StickerIntegral {
     transport: Option<WaMediaTransport>,
     #[prost(bool, optional, tag = "2")]
     is_animated: Option<bool>,
+    #[prost(string, optional, tag = "3")]
+    receiver_fetch_id: Option<String>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -494,16 +508,57 @@ struct StickerAncillary {
     height: Option<u32>,
     #[prost(uint32, optional, tag = "3")]
     width: Option<u32>,
+    #[prost(bool, optional, tag = "7")]
+    is_third_party: Option<bool>,
+    #[prost(string, optional, tag = "8")]
+    receiver_fetch_id: Option<String>,
     #[prost(string, optional, tag = "9")]
     accessibility_label: Option<String>,
 }
 
+/// A Messenger sticker by reference, as the web sends one (its receiver
+/// fetch message): the sticker id in both halves, the size, and a transport
+/// with only the mimetype and thumbnail size, no file.
+pub fn encode_sticker_ref(sticker_id: &str, width: u32, height: u32, label: &str) -> Outgoing {
+    let transport = StickerTransport {
+        integral: Some(StickerIntegral {
+            transport: Some(WaMediaTransport {
+                integral: Some(MediaIntegral::default()),
+                ancillary: Some(MediaAncillary {
+                    mimetype: Some("image/webp".into()),
+                    thumbnail: Some(MediaThumbnail { jpeg_thumbnail: None, width: Some(width), height: Some(height) }),
+                    ..Default::default()
+                }),
+            }),
+            is_animated: None,
+            receiver_fetch_id: Some(sticker_id.to_string()),
+        }),
+        ancillary: Some(StickerAncillary {
+            height: Some(height),
+            width: Some(width),
+            is_third_party: Some(false),
+            receiver_fetch_id: Some(sticker_id.to_string()),
+            accessibility_label: (!label.is_empty()).then(|| label.to_string()),
+        }),
+    };
+    encode_content(Content {
+        sticker: Some(CaptionedMedia {
+            media: Some(SubProtocol { payload: Some(transport.encode_to_vec()), version: Some(1) }),
+            caption: None,
+        }),
+        ..Default::default()
+    })
+}
+
 pub fn encode_sticker(file: &MediaFile, object_id: Option<&str>, media_key_timestamp: i64, animated: bool, label: &str) -> Outgoing {
     let transport = StickerTransport {
-        integral: Some(StickerIntegral { transport: Some(wa_transport(file, object_id, media_key_timestamp)), is_animated: Some(animated) }),
+        // Like the web: no isAnimated on a still sticker.
+        integral: Some(StickerIntegral { transport: Some(wa_transport(file, object_id, media_key_timestamp)), is_animated: animated.then_some(true), receiver_fetch_id: None }),
         ancillary: Some(StickerAncillary {
             height: Some(file.height),
             width: Some(file.width),
+            is_third_party: None,
+            receiver_fetch_id: None,
             accessibility_label: (!label.is_empty()).then(|| label.to_string()),
         }),
     };
@@ -621,6 +676,13 @@ fn media_file(sub: Option<SubProtocol>) -> Option<MediaFile> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sticker_by_reference_round_trips() {
+        let out = encode_sticker_ref("369239263222822", 240, 240, "A bunny");
+        let d = decode(&encode_transport(&out.application, "1", None)).unwrap();
+        assert_eq!(d.content, Content2::StickerRef { fetch_id: "369239263222822".into(), width: 240, height: 240, label: "A bunny".into() });
+    }
     use super::*;
 
     fn wrap_consumer(content: Content, quoted: Option<&str>) -> Vec<u8> {

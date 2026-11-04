@@ -95,7 +95,8 @@ pub enum OutgoingPayload {
     Image(std::path::PathBuf),
     /// A sticker picture (link) to download, encrypt, upload and send as a
     /// sticker, with its accessibility label.
-    Sticker { url: String, label: String },
+    /// `id`: the Messenger sticker's id (sent by reference); 0 = send the picture.
+    Sticker { id: i64, url: String, label: String },
     /// Read receipts for the peer's messages `ids` (newest first).
     Read(Vec<String>),
 }
@@ -322,7 +323,7 @@ impl Listener {
     }
 
     pub async fn send_text(&mut self, peer: i64, text: &str, backlog: &mut Vec<Vec<u8>>) -> Result<Received> {
-        self.send_application(peer, crate::armadillo::encode_text(text), backlog).await
+        self.send_application(peer, crate::armadillo::encode_text(text), None, backlog).await
     }
 
     /// Encrypt a picture, upload it (`e2ee_media::upload`) and send it. A plain
@@ -358,7 +359,7 @@ impl Listener {
             e2ee_media::write_private(&cached, &img.bytes)?;
         }
         let out = crate::armadillo::encode_image(&file, uploaded.object_id.as_deref(), crate::store::now_ms() / 1000, "");
-        self.send_application(peer, out, backlog).await
+        self.send_application(peer, out, Some("image"), backlog).await
     }
 
     /// Send a sticker: its picture (WebP, often animated) encrypted and
@@ -366,6 +367,7 @@ impl Listener {
     pub async fn send_sticker(
         &mut self,
         peer: i64,
+        sticker_id: i64,
         url: &str,
         label: &str,
         http: &reqwest::Client,
@@ -375,7 +377,25 @@ impl Listener {
         use crate::e2ee_media::{self, MediaType};
         let bytes = http.get(url).send().await?.error_for_status()?.bytes().await?.to_vec();
         let format = image::guess_format(&bytes).map_err(|_| anyhow!("the sticker isn't a picture"))?;
-        let (width, height) = image::load_from_memory_with_format(&bytes, format).map(|i| (i.width(), i.height())).unwrap_or((512, 512));
+        let picture = image::load_from_memory_with_format(&bytes, format)?;
+        let (width, height) = (picture.width(), picture.height());
+        // A Messenger sticker goes by reference, like the web and the phone
+        // apps send theirs (an uploaded picture showed as "Message
+        // unavailable" on phones).
+        if sticker_id != 0 {
+            let out = crate::armadillo::encode_sticker_ref(&sticker_id.to_string(), width, height, label);
+            return self.send_application(peer, out, Some("sticker"), backlog).await;
+        }
+        // Stickers travel as WebP: the web converts any other picture first
+        // (`MAWImagePreProcess`), and phones showed a PNG sticker as
+        // "Message unavailable".
+        let (bytes, format) = if format == image::ImageFormat::WebP {
+            (bytes, format)
+        } else {
+            let mut out = Vec::new();
+            picture.to_rgba8().write_with_encoder(image::codecs::webp::WebPEncoder::new_lossless(&mut out))?;
+            (out, image::ImageFormat::WebP)
+        };
         // Animated WebP has an ANIM chunk.
         let animated = bytes.windows(4).take(256).any(|w| w == b"ANIM");
         let enc = e2ee_media::encrypt(&bytes, MediaType::Image)?;
@@ -399,14 +419,16 @@ impl Listener {
             e2ee_media::write_private(&cached, &bytes)?;
         }
         let out = crate::armadillo::encode_sticker(&file, uploaded.object_id.as_deref(), crate::store::now_ms() / 1000, animated, label);
-        self.send_application(peer, out, backlog).await
+        self.send_application(peer, out, Some("sticker"), backlog).await
     }
 
     /// Encrypt a message (`armadillo::Outgoing`) for every device of `peer`
     /// and of our other devices, send it, wait for the server's ack, and log
     /// it to the inbox as our own message (so it shows up again after a
-    /// restart). Returns that inbox record.
-    async fn send_application(&mut self, peer: i64, out: crate::armadillo::Outgoing, backlog: &mut Vec<Vec<u8>>) -> Result<Received> {
+    /// restart). Returns that inbox record. `media`: the media type of a
+    /// media message ("image", "sticker"), sent like the web's stanza: the
+    /// message has type "media" and each `<enc>` a `mediatype`.
+    async fn send_application(&mut self, peer: i64, out: crate::armadillo::Outgoing, media: Option<&str>, backlog: &mut Vec<Vec<u8>>) -> Result<Received> {
         let own_device = crate::e2ee::Device::load().and_then(|d| d.wa_device_id).ok_or_else(|| anyhow!("device missing"))?;
         let own_jid = format!("{}:{own_device}@msgr", self.own_user);
         let peer_jid = format!("{peer}@msgr");
@@ -432,13 +454,17 @@ impl Listener {
             let (mut sessions, mut identities) = (self.store.clone(), self.store.clone());
             let ciphertext = message_encrypt(&plaintext, &address, &mut sessions, &mut identities).await?;
             let kind = if ciphertext.message_type() == CiphertextMessageType::PreKey { "pkmsg" } else { "msg" };
-            let enc = NodeBuilder::new("enc").attr("v", "3").attr("type", kind).bytes(ciphertext.serialize().to_vec()).build();
+            let mut enc = NodeBuilder::new("enc").attr("v", "3").attr("type", kind);
+            if let Some(m) = media {
+                enc = enc.attr("mediatype", m);
+            }
+            let enc = enc.bytes(ciphertext.serialize().to_vec()).build();
             participants.push(NodeBuilder::new("to").attr("jid", jid_value(d)).children([enc]).build());
         }
         let node = NodeBuilder::new("message")
             .attr("id", id.clone())
             .attr("to", jid_value(&peer_jid))
-            .attr("type", "text")
+            .attr("type", if media.is_some() { "media" } else { "text" })
             .children([
                 NodeBuilder::new("participants").children(participants).build(),
                 NodeBuilder::new("franking")
@@ -792,6 +818,15 @@ fn append_inbox(rec: &Received) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn png_sticker_becomes_webp() {
+        let picture = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 128])));
+        let mut out = Vec::new();
+        picture.to_rgba8().write_with_encoder(image::codecs::webp::WebPEncoder::new_lossless(&mut out)).unwrap();
+        assert_eq!(image::guess_format(&out).unwrap(), image::ImageFormat::WebP);
+        assert_eq!(image::load_from_memory(&out).unwrap().width(), 8);
+    }
+
     use super::*;
 
     #[test]
@@ -880,7 +915,7 @@ pub async fn run(
                         let sent = match &out.payload {
                             OutgoingPayload::Text(text) => listener.send_text(out.peer, text, &mut backlog).await,
                             OutgoingPayload::Image(path) => listener.send_image(out.peer, path, &session.http, &mut media_conn, &mut backlog).await,
-                            OutgoingPayload::Sticker { url, label } => listener.send_sticker(out.peer, url, label, &session.http, &mut media_conn, &mut backlog).await,
+                            OutgoingPayload::Sticker { id, url, label } => listener.send_sticker(out.peer, *id, url, label, &session.http, &mut media_conn, &mut backlog).await,
                             OutgoingPayload::Read(_) => unreachable!("handled above"),
                         };
                         match sent {

@@ -779,7 +779,12 @@ pub fn web_call_with(body: &str, args: &[(&str, &str)]) -> Option<u64> {
         let handler = RcBlock::new(move |result: *mut objc2::runtime::AnyObject, error: *mut NSError| {
             let outcome = if !error.is_null() {
                 let e = unsafe { &*error };
-                Err(e.localizedDescription().to_string())
+                // WebKit puts the script's own message in the user info.
+                let detail = e.userInfo().objectForKey(&*NSString::from_str("WKJavaScriptExceptionMessage")).and_then(|v| v.downcast::<NSString>().ok()).map(|s| s.to_string());
+                Err(match detail {
+                    Some(d) => format!("{}: {d}", e.localizedDescription()),
+                    None => e.localizedDescription().to_string(),
+                })
             } else if result.is_null() {
                 Ok(String::new())
             } else {

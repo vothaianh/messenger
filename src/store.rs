@@ -163,6 +163,13 @@ pub struct Store {
     pub presence_checked_ms: i64,
     /// Contact -> when they were last active (unix seconds).
     pub last_active: HashMap<i64, i64>,
+    /// Sticker id -> picture, for stickers sent by reference over E2EE.
+    pub sticker_images: HashMap<String, String>,
+    /// Stickers by reference whose picture the hidden web page should look
+    /// up (`getReceiverFetchInfo`, which gives the animated one), and the
+    /// messages (thread, id) showing each.
+    pub sticker_refs_wanted: Vec<String>,
+    pub sticker_ref_messages: HashMap<String, Vec<(i64, String)>>,
 }
 
 /// What's kept on disk between launches so the app shows the inbox at once
@@ -671,6 +678,31 @@ impl Store {
                 }
                 self.touch_thread(thread_key, ev.timestamp_ms, format!("{snippet_prefix}{label}"));
             }
+            Content2::StickerRef { fetch_id, width, height, label } => {
+                // A sticker by reference: its picture when we know it (one we
+                // sent, or looked up), otherwise a label until the lookup.
+                let refs = self.sticker_ref_messages.entry(fetch_id.clone()).or_default();
+                if refs.is_empty() && !self.sticker_refs_wanted.contains(fetch_id) {
+                    self.sticker_refs_wanted.push(fetch_id.clone());
+                }
+                refs.push((thread_key, ev.id.clone()));
+                match self.sticker_images.get(fetch_id).cloned() {
+                    Some(url) => {
+                        self.add_e2ee_message(thread_key, ev, String::new());
+                        self.attach(thread_key, &ev.id, Attachment {
+                            kind: AttachmentKind::Sticker,
+                            preview_url: url.clone(),
+                            url,
+                            title: String::new(),
+                            subtitle: String::new(),
+                            width: *width as f32,
+                            height: *height as f32,
+                        });
+                    }
+                    None => self.add_e2ee_message(thread_key, ev, if label.is_empty() { "Sticker".into() } else { format!("Sticker: {label}") }),
+                }
+                self.touch_thread(thread_key, ev.timestamp_ms, format!("{snippet_prefix}Sticker"));
+            }
             Content2::Reaction { target_id, emoji } => {
                 self.set_reaction(thread_key, target_id, ev.sender, emoji.clone());
             }
@@ -691,7 +723,7 @@ impl Store {
         // Every E2EE message counts as seen, also the ones replayed from disk
         // at startup, so a redelivered copy doesn't notify again.
         let fresh = self.seen_ids.insert(ev.id.clone());
-        if !ev.from_me && self.initial_sync_done && fresh && matches!(ev.decoded.content, Content2::Text { .. } | Content2::Link { .. } | Content2::Media { .. }) {
+        if !ev.from_me && self.initial_sync_done && fresh && matches!(ev.decoded.content, Content2::Text { .. } | Content2::Link { .. } | Content2::Media { .. } | Content2::StickerRef { .. }) {
             self.new_incoming.push((thread_key, ev.id.clone()));
         }
         true
@@ -1389,6 +1421,21 @@ pub fn write_cache(bytes: &[u8]) {
     let _turn = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(path) = cache_path() {
         let _ = crate::e2ee_media::write_private(&path, bytes);
+    }
+}
+
+impl Store {
+    /// The picture of a sticker sent by reference (from the web page's
+    /// lookup): shown on every message that has it.
+    pub fn resolve_sticker_ref(&mut self, fetch_id: &str, url: &str, width: f32, height: f32) {
+        self.sticker_images.insert(fetch_id.to_string(), url.to_string());
+        let targets = self.sticker_ref_messages.get(fetch_id).cloned().unwrap_or_default();
+        for (thread, id) in targets {
+            let Some(m) = self.find_message_mut(Some(thread), &id) else { continue };
+            let att = Attachment { kind: AttachmentKind::Sticker, url: url.to_string(), preview_url: url.to_string(), title: String::new(), subtitle: String::new(), width, height };
+            m.text.clear();
+            m.attachments = vec![att];
+        }
     }
 }
 

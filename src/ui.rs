@@ -183,6 +183,9 @@ pub struct MessengerApp {
     /// one being fetched.
     history_fetched: HashSet<i64>,
     history_job: Option<HistoryJob>,
+    /// A sticker-by-reference lookup running in the hidden web page:
+    /// (sticker id, call id).
+    sticker_lookup: Option<(String, u64)>,
     /// Whether the hidden page already holds a restored backup (checked
     /// once, when an encrypted chat is first opened and the flag isn't set):
     /// None = not checked, Some(None) = waiting, Some(Some(id)) = running.
@@ -262,6 +265,7 @@ impl MessengerApp {
             login_poll: 0.0,
             history_fetched: HashSet::new(),
             history_job: None,
+            sticker_lookup: None,
             restore_check: None,
             store_preview: None,
             last_layout_log: String::new(),
@@ -364,6 +368,45 @@ impl MessengerApp {
         if !done {
             self.history_job = Some(job);
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+    }
+
+    /// Look up stickers sent by reference over E2EE, one at a time, in the
+    /// hidden web page (`STICKER_REF_JS`), like the web shows them.
+    fn sticker_ref_tick(&mut self, ctx: &egui::Context) {
+        if let Some((fetch_id, call)) = self.sticker_lookup.take() {
+            match crate::macos::web_result(call) {
+                Some(Ok(text)) => {
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                    let num = |k: &str| v[k].as_f64().or_else(|| v[k].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0) as f32;
+                    match v["url"].as_str().filter(|u| u.starts_with("http")) {
+                        Some(url) => self.shared.store.lock().unwrap().resolve_sticker_ref(&fetch_id, url, num("w"), num("h")),
+                        None if std::env::var_os("MESSENGER_DEBUG").is_some() => eprintln!("[sticker] {fetch_id}: no picture ({})", v["error"].as_str().unwrap_or("empty")),
+                        None => {}
+                    }
+                }
+                Some(Err(e)) => eprintln!("[sticker] {fetch_id}: {e}"),
+                None => {
+                    self.sticker_lookup = Some((fetch_id, call));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(300));
+                }
+            }
+            return;
+        }
+        let next = {
+            let mut st = self.shared.store.lock().unwrap();
+            (!st.sticker_refs_wanted.is_empty()).then(|| st.sticker_refs_wanted.remove(0))
+        };
+        let Some(fetch_id) = next else { return };
+        crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
+        if !crate::macos::web_loaded() {
+            self.shared.store.lock().unwrap().sticker_refs_wanted.insert(0, fetch_id);
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            return;
+        }
+        if let Some(call) = crate::macos::web_call_with(STICKER_REF_JS, &[("fetchId", &fetch_id)]) {
+            self.sticker_lookup = Some((fetch_id, call));
+            ctx.request_repaint_after(std::time::Duration::from_millis(300));
         }
     }
 
@@ -714,6 +757,7 @@ impl eframe::App for MessengerApp {
         self.pin_restore_ui(&ctx);
         self.nickname_ui(&ctx);
         self.history_tick(&ctx);
+        self.sticker_ref_tick(&ctx);
         web_probe(&ctx);
         image_viewer(&ctx);
         let status = self.shared.status.lock().unwrap().clone();
@@ -1420,6 +1464,21 @@ const BACKUP_PRESENT_JS: &str = r#"
     if (!t) return 'no';
     const rows = await ReQL.toArrayAsync(ReQL.fromTableAscending(t));
     return rows.length > 0 ? 'yes' : 'no';
+"#;
+
+/// The picture of a sticker sent by reference (`fetchId`), asked the way the
+/// web's sticker view asks (`getReceiverFetchInfo`): JSON {url, w, h, mime}.
+const STICKER_REF_JS: &str = r#"
+    try {
+        const r = await Promise.race([
+            require('MAWBridgeSendAndReceive').sendAndReceive('backend', 'getReceiverFetchInfo', { receiverFetchId: fetchId, receiverFetchType: 'sticker' }),
+            new Promise((ok) => setTimeout(() => ok(null), 15000)),
+        ]);
+        if (!r) return JSON.stringify({ error: 'no answer' });
+        return JSON.stringify({ url: r.previewUrl || '', w: r.previewWidth || 0, h: r.previewHeight || 0, mime: r.mimetype || '' });
+    } catch (e) {
+        return JSON.stringify({ error: String(e && e.message || e) });
+    }
 "#;
 
 /// Navigate the hidden page to a chat (`path`): an encrypted one makes the

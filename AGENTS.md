@@ -167,6 +167,13 @@ and `<id>` (E2EE socket); `store::same_id` treats them as one.
 Reads made here are kept in `Thread::read_here_ms`; when the server's
 watermark (`server_read_ms`) stays behind, the read is sent again once HTTP
 answers (reads queued while rate limited used to be lost on quit).
+Stickers in E2EE chats go by reference, like the web and phones send
+Messenger stickers: `armadillo::encode_sticker_ref` (sticker id as
+`receiverFetchId`, no file; an uploaded picture showed as "Message
+unavailable" on phones). Received ones (`Content2::StickerRef`) get their
+picture from the hidden web page (`STICKER_REF_JS`, `getReceiverFetchInfo`),
+a still JPG, as the web shows them. Media messages are sent with message
+type "media" and `<enc mediatype=…>` like the web's stanza.
 Current gaps in E2EE chats: replies, reactions, edits, unsend and typing
 aren't sent yet; old history needs the PIN restore (in progress, see
 `docs/E2EE.md`).
