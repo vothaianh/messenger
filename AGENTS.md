@@ -216,7 +216,10 @@ aren't sent yet; old history needs the PIN restore (in progress, see
   web client with its own working connection; opening the chat there
   (`/messages/t/<key>`) loads its recent messages, which `READ_THREAD_JS`
   reads from the web's database (`HistoryJob { e2ee: false }`, started for
-  a chat with a gap waiting while rate limited). The HTTP gap fill still
+  a chat with a gap waiting while rate limited, and for any regular chat
+  opened with new activity while limited: messages DGW only announced with
+  a sequence bump never come and leave no gap; at most once a minute per
+  chat, stops after ~15 s when nothing is missing). The HTTP gap fill still
   runs once the limit is over. Reconnecting DGW doesn't stand in for a poll: its
   delta sync from the cursor answers only `updateLastSyncCompletedTimestampMsToNow`
   (tried in 1.0.13, removed). Opening a chat with few messages used to ask

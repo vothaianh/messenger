@@ -3317,7 +3317,7 @@ dependencies = [
 
 [[package]]
 name = "messenger-rs"
-version = "1.0.19"
+version = "1.0.20"
 dependencies = [
  "aes",
  "anyhow",

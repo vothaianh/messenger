@@ -1560,6 +1560,11 @@ impl Shared {
         self.rate_limited.load(std::sync::atomic::Ordering::Acquire) && self.pending_gaps.lock().unwrap().contains_key(&thread)
     }
 
+    /// HTTP is rate limited (the last request was refused).
+    pub fn is_rate_limited(&self) -> bool {
+        self.rate_limited.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn http_limited(&self) -> bool {
         self.poll_wait.lock().unwrap().0.is_some_and(|t| std::time::Instant::now() < t)
     }

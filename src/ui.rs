@@ -183,6 +183,9 @@ pub struct MessengerApp {
     /// one being fetched.
     history_fetched: HashSet<i64>,
     history_job: Option<HistoryJob>,
+    /// Regular chats read from the hidden web page while rate limited: the
+    /// chat's last activity then, and when.
+    web_read: HashMap<i64, (i64, Instant)>,
     /// A sticker-by-reference lookup running in the hidden web page:
     /// (sticker id, call id).
     sticker_lookup: Option<(String, u64)>,
@@ -265,6 +268,7 @@ impl MessengerApp {
             login_poll: 0.0,
             history_fetched: HashSet::new(),
             history_job: None,
+            web_read: HashMap::new(),
             sticker_lookup: None,
             restore_check: None,
             store_preview: None,
@@ -346,6 +350,7 @@ impl MessengerApp {
                         let added = self.shared.store.lock().unwrap().add_restored(job.thread, restored);
                         job.found += added;
                         job.last_added = added;
+                        job.reads += 1;
                         if std::env::var_os("MESSENGER_DEBUG").is_some() && added > 0 {
                             eprintln!("[history] {} new restored messages", added);
                         }
@@ -359,7 +364,8 @@ impl MessengerApp {
         }
         // A regular chat: stop once a read adds nothing new (the HTTP gap fill
         // later still completes details like reactions).
-        if !job.e2ee && job.found > 0 && job.last_added == 0 && matches!(job.stage, HistoryStage::Idle(_)) {
+        // Nothing missing after three reads (~15 s): done too.
+        if !job.e2ee && job.last_added == 0 && (job.found > 0 || job.reads >= 3) && matches!(job.stage, HistoryStage::Idle(_)) {
             done = true;
         }
         if done && !job.e2ee && std::env::var_os("MESSENGER_DEBUG").is_some() {
@@ -1444,6 +1450,8 @@ struct HistoryJob {
     found: usize,
     /// What the last read added.
     last_added: usize,
+    /// Reads of the web's database done so far.
+    reads: u32,
 }
 
 enum HistoryStage {
@@ -2255,15 +2263,21 @@ impl MessengerApp {
             self.restore_check = Some(None);
         }
         if thread.e2ee && self.history_restored && self.history_job.is_none() && self.history_fetched.insert(key) {
-            self.history_job = Some(HistoryJob { thread: key, e2ee: true, stage: HistoryStage::Start, started: Instant::now(), found: 0, last_added: 0 });
+            self.history_job = Some(HistoryJob { thread: key, e2ee: true, stage: HistoryStage::Start, started: Instant::now(), found: 0, last_added: 0, reads: 0 });
         }
         // A regular chat missing messages while HTTP is rate limited: the
         // hidden web page loads them over its own connection; read them there.
-        if !thread.e2ee && self.history_job.is_none() && self.shared.gap_waiting(key) && self.history_fetched.insert(key) {
+        // While rate limited the mailbox poll is refused, so messages DGW only
+        // announced (a bare sequence bump) never come and leave no visible
+        // gap: read any chat that had activity since its last read there
+        // (at most once a minute per chat).
+        let web_due = self.web_read.get(&key).is_none_or(|(activity, at)| *activity != thread.last_activity_ms && at.elapsed() > std::time::Duration::from_secs(60));
+        if !thread.e2ee && self.history_job.is_none() && (self.shared.gap_waiting(key) || self.shared.is_rate_limited()) && web_due {
+            self.web_read.insert(key, (thread.last_activity_ms, Instant::now()));
             if std::env::var_os("MESSENGER_DEBUG").is_some() {
                 eprintln!("[history] {key}: rate limited; reading the chat from the web page");
             }
-            self.history_job = Some(HistoryJob { thread: key, e2ee: false, stage: HistoryStage::Start, started: Instant::now(), found: 0, last_added: 0 });
+            self.history_job = Some(HistoryJob { thread: key, e2ee: false, stage: HistoryStage::Start, started: Instant::now(), found: 0, last_added: 0, reads: 0 });
         }
         if thread.e2ee && messages.is_empty() {
             if e2ee_notice(ui, key) {
