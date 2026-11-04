@@ -242,6 +242,13 @@ impl Session {
     /// From a cursor this is a delta sync (type 2, no sync params, like the web
     /// client); without one, a snapshot (type 1).
     pub async fn ls_sync(&self, database: i64, cursor: Option<&str>) -> Result<String> {
+        let (kind, payload) = self.sync_request(database, cursor);
+        self.ls_request(kind, payload).await
+    }
+
+    /// Request type and payload of a database sync (1 = snapshot, 2 = delta
+    /// from `cursor`), for any transport.
+    pub fn sync_request(&self, database: i64, cursor: Option<&str>) -> (i64, String) {
         let (kind, sync_params) = match cursor {
             Some(_) => (2, Value::Null),
             None => (1, Value::String(ls_sync_params())),
@@ -255,12 +262,17 @@ impl Session {
             "version": self.boot.ls_version,
         })
         .to_string();
-        self.ls_request(kind, request_payload).await
+        (kind, request_payload)
     }
 
     /// Run Lightspeed tasks (`(label, payload, queue)`) over GraphQL and return
     /// the raw LS payload of the response (e.g. fetched message history).
     pub async fn ls_tasks(&self, tasks: &[(&str, Value, String)]) -> Result<String> {
+        self.ls_request(3, self.tasks_request(tasks)).await
+    }
+
+    /// Payload of a tasks request (type 3), for any transport.
+    pub fn tasks_request(&self, tasks: &[(&str, Value, String)]) -> String {
         let base_id = crate::store::now_ms() % 1_000_000;
         let tasks: Vec<Value> = tasks
             .iter()
@@ -278,7 +290,7 @@ impl Session {
             "version_id": self.boot.ls_version.to_string(),
         })
         .to_string();
-        self.ls_request(3, request_payload).await
+        request_payload
     }
 
     /// `LSPlatformGraphQLLightspeedRequestQuery`: type 1 = database sync, 3 = tasks.

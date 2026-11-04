@@ -195,7 +195,22 @@ aren't sent yet; old history needs the PIN restore (in progress, see
   often pushes only a bare sequence bump (`upsertSequenceId`, no content):
   the client polls once on such a bump (coalesced), plus a 5-minute fallback.
   While rate limited, tasks go on DGW and gap fills wait for HTTP
-  (`pending_gaps`). Reconnecting DGW doesn't stand in for a poll: its
+  (`pending_gaps`). The limit is saved in `rate_limit.json` (data dir) so a
+  relaunch doesn't open with an HTTP request; waits double up to 1 hour,
+  and only the mailbox poll probes HTTP (gaps and reads wait for its answer).
+  Relaunching the app during development still costs requests: don't restart
+  it more than needed while limited.
+  History while rate limited (tried 2026-11-04, neither works): over MQTT
+  (`mqtt::LsSocket`, `debug-mqtt-ls`, `debug-mqtt-history`) sync requests are
+  answered and task 228 is accepted, but no messages ever come back (not in
+  the deltas, not pushed); on DGW, task 228 on its own stream (no End) is
+  answered, nothing is pushed, and the server drops the connection ~10 s
+  later. What works: the hidden web page (`macos::web_open`) is the real
+  web client with its own working connection; opening the chat there
+  (`/messages/t/<key>`) loads its recent messages, which `READ_THREAD_JS`
+  reads from the web's database (`HistoryJob { e2ee: false }`, started for
+  a chat with a gap waiting while rate limited). The HTTP gap fill still
+  runs once the limit is over. Reconnecting DGW doesn't stand in for a poll: its
   delta sync from the cursor answers only `updateLastSyncCompletedTimestampMsToNow`
   (tried in 1.0.13, removed). Opening a chat with few messages used to ask
   for older history every 10 s forever (rate limited the account); a fetch

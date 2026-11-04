@@ -473,6 +473,66 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Diagnostics: history (task 228) for a thread over MQTT, step by step:
+    // `debug-mqtt-history <thread> <ts> <mid>`.
+    if std::env::args().nth(1).as_deref() == Some("debug-mqtt-history") {
+        let cookies = Cookies::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        let (thread, ts, mid): (i64, i64, String) = (args[0].parse()?, args[1].parse()?, args[2].clone());
+        return tokio::runtime::Runtime::new()?.block_on(async {
+            let s = session::Session::connect(cookies).await?;
+            let mut ls = mqtt::LsSocket::open(&s).await?;
+            let names = |calls: &[lightspeed::Call]| {
+                let mut n: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+                n.dedup();
+                n
+            };
+            let msgs = |calls: &[lightspeed::Call]| calls.iter().filter(|c| matches!(c.name.as_str(), "upsertMessage" | "insertMessage") && c.arg(3).int() == thread).count();
+            let (k, p) = s.sync_request(1, None);
+            let snap = lightspeed::decode_payload(&ls.request(k, p).await?)?;
+            let cursor = snap.iter().find(|c| c.name == "executeFirstBlockForSyncTransactionV4" && c.arg(0).int() == 1).and_then(|c| c.arg(3).str().map(str::to_string));
+            println!("snapshot: {} calls, cursor {}", snap.len(), cursor.is_some());
+            let task = serde_json::json!({"thread_key": thread, "direction": 0, "reference_timestamp_ms": ts, "reference_message_id": mid, "sync_group": 1, "cursor": cursor});
+            let ans = ls.request(3, s.tasks_request(&[("228", task, format!("mrq.{thread}"))])).await?;
+            let ans = lightspeed::decode_payload(&ans).unwrap_or_default();
+            println!("task: {:?} msgs {}", names(&ans), msgs(&ans));
+            for (topic, payload) in ls.drain(6).await {
+                let v: serde_json::Value = serde_json::from_slice(&payload).unwrap_or_default();
+                let calls = v["payload"].as_str().and_then(|p| lightspeed::decode_payload(p).ok()).unwrap_or_default();
+                println!("pushed {topic} request_id={} {:?} msgs {}", v["request_id"], names(&calls), msgs(&calls));
+            }
+            for i in 0..4 {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                let (k, p) = s.sync_request(1, cursor.as_deref());
+                let d = lightspeed::decode_payload(&ls.request(k, p).await?)?;
+                println!("delta {i}: {:?} msgs {}", names(&d), msgs(&d));
+            }
+            Ok(())
+        });
+    }
+
+    // Diagnostics: one read-only snapshot sync over the MQTT socket.
+    if std::env::args().nth(1).as_deref() == Some("debug-mqtt-ls") {
+        let cookies = Cookies::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        return tokio::runtime::Runtime::new()?.block_on(async {
+            let s = session::Session::connect(cookies).await?;
+            let mut ls = mqtt::LsSocket::open(&s).await?;
+            println!("mqtt connected");
+            let (kind, payload) = s.sync_request(1, None);
+            let ans = ls.request(kind, payload).await?;
+            match lightspeed::decode_payload(&ans) {
+                Ok(calls) => {
+                    let mut names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                    names.sort();
+                    names.dedup();
+                    println!("snapshot: {} calls, messages {}, procs {names:?}", calls.len(), calls.iter().filter(|c| c.name == "upsertMessage").count());
+                }
+                Err(e) => println!("undecodable answer ({} bytes): {e}; starts {:?}", ans.len(), ans.chars().take(200).collect::<String>()),
+            }
+            Ok(())
+        });
+    }
+
     if std::env::args().nth(1).as_deref() == Some("debug-mqtt") {
         let cookies = Cookies::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
         let (shared, tx) = client::spawn(cookies, || {});

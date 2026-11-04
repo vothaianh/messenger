@@ -203,3 +203,121 @@ mod tests {
         assert_eq!(parse(&mut first).unwrap().len(), 1);
     }
 }
+
+/// Lightspeed requests over the web's older MQTT socket (edge-chat), which
+/// still answers `/ls_req` (it no longer pushes). Used to fetch history
+/// while GraphQL over HTTP is rate limited (error 1675004).
+pub struct LsSocket {
+    ws: WsStream,
+    buf: Vec<u8>,
+    request_id: i64,
+    packet_id: u16,
+    app_id: String,
+    pending: Vec<Packet>,
+}
+
+impl LsSocket {
+    /// Connect the way the web client did: CONNECT with its JSON username,
+    /// then app settings and the `/ls_resp` subscription.
+    pub async fn open(session: &crate::session::Session) -> Result<Self> {
+        let b = &session.boot;
+        if b.mqtt_endpoint.is_empty() {
+            bail!("no MQTT endpoint on the page");
+        }
+        let sid: u64 = rand::random::<u64>() >> 11;
+        let cid = uuid::Uuid::new_v4().to_string();
+        let sep = if b.mqtt_endpoint.contains('?') { '&' } else { '?' };
+        let url = format!("{}{sep}sid={sid}&cid={cid}", b.mqtt_endpoint);
+        let ws = open(&url, &session.cookies.0, crate::session::USER_AGENT).await?;
+        let username = serde_json::json!({
+            "u": b.fbid.to_string(), "s": sid, "chat_on": true, "fg": false, "d": cid,
+            "ct": "websocket", "aid": b.mqtt_app_id, "mqtt_sid": "", "cp": 3, "ecp": 10,
+            "st": [], "pm": [], "dc": "", "no_auto_fg": true, "gas": null, "pack": [],
+            "php_override": "", "p": null, "a": crate::session::USER_AGENT, "aids": null,
+        });
+        let mut s = LsSocket { ws, buf: Vec::new(), request_id: 0, packet_id: 0, app_id: b.ls_app_id.clone(), pending: Vec::new() };
+        send(&mut s.ws, connect("mqttwsclient", &username.to_string(), 10)).await?;
+        loop {
+            match s.take_packet().await? {
+                Packet::ConnAck { code: 0 } => break,
+                Packet::ConnAck { code } => bail!("MQTT refused the connection (code {code})"),
+                _ => {}
+            }
+        }
+        let settings = serde_json::json!({"ls_fdid": "", "ls_sv": b.ls_version.to_string()});
+        let id = s.next_id();
+        send(&mut s.ws, publish("/ls_app_settings", settings.to_string().as_bytes(), Some(id))).await?;
+        let id = s.next_id();
+        send(&mut s.ws, subscribe(id, &["/ls_foreground_state", "/ls_resp"])).await?;
+        Ok(s)
+    }
+
+    fn next_id(&mut self) -> u16 {
+        self.packet_id = self.packet_id.wrapping_add(1).max(1);
+        self.packet_id
+    }
+
+    async fn next_packet(&mut self) -> Result<Packet> {
+        loop {
+            let mut ready = parse(&mut self.buf)?;
+            if !ready.is_empty() {
+                let p = ready.remove(0);
+                // Put back what we didn't take (rare: several in one frame).
+                for later in ready.into_iter().rev() {
+                    self.pending.insert(0, later);
+                }
+                return Ok(p);
+            }
+            let Some(bytes) = recv(&mut self.ws).await? else { bail!("MQTT socket closed") };
+            self.buf.extend(bytes);
+        }
+    }
+
+    /// One Lightspeed request (1 = snapshot sync, 2 = delta sync, 3 = tasks);
+    /// returns the answer's LS payload.
+    pub async fn request(&mut self, kind: i64, payload: String) -> Result<String> {
+        self.request_id += 1;
+        let rid = self.request_id;
+        let body = serde_json::json!({"app_id": self.app_id, "payload": payload, "request_id": rid, "type": kind});
+        let id = self.next_id();
+        send(&mut self.ws, publish("/ls_req", body.to_string().as_bytes(), Some(id))).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let packet = tokio::time::timeout_at(deadline, self.take_packet()).await.map_err(|_| anyhow::anyhow!("no MQTT answer in 20s"))??;
+            if let Packet::Publish { topic, payload, packet_id } = packet {
+                if let Some(pid) = packet_id {
+                    send(&mut self.ws, puback(pid)).await?;
+                }
+                if topic != "/ls_resp" {
+                    continue;
+                }
+                let v: serde_json::Value = serde_json::from_slice(&payload)?;
+                if v["request_id"].as_i64() == Some(rid) {
+                    return v["payload"].as_str().map(str::to_string).ok_or_else(|| anyhow::anyhow!("MQTT answer without a payload"));
+                }
+            }
+        }
+    }
+
+    /// Everything published to us for `secs` seconds: (topic, payload).
+    pub async fn drain(&mut self, secs: u64) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while let Ok(Ok(p)) = tokio::time::timeout_at(deadline, self.take_packet()).await {
+            if let Packet::Publish { topic, payload, packet_id } = p {
+                if let Some(pid) = packet_id {
+                    let _ = send(&mut self.ws, puback(pid)).await;
+                }
+                out.push((topic, payload));
+            }
+        }
+        out
+    }
+
+    async fn take_packet(&mut self) -> Result<Packet> {
+        if !self.pending.is_empty() {
+            return Ok(self.pending.remove(0));
+        }
+        self.next_packet().await
+    }
+}

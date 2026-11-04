@@ -308,7 +308,8 @@ impl MessengerApp {
             HistoryStage::Start => {
                 crate::macos::web_open("https://www.facebook.com/messages/", crate::session::USER_AGENT);
                 if crate::macos::web_loaded() {
-                    let _ = crate::macos::web_call_with(OPEN_THREAD_JS, &[("threadKey", &key)]);
+                    let path = format!("/messages/{}t/{key}", if job.e2ee { "e2ee/" } else { "" });
+                    let _ = crate::macos::web_call_with(OPEN_THREAD_JS, &[("path", &path)]);
                     job.stage = HistoryStage::Opening(Instant::now());
                 }
             }
@@ -340,6 +341,7 @@ impl MessengerApp {
                         let restored = parse_restored(&text);
                         let added = self.shared.store.lock().unwrap().add_restored(job.thread, restored);
                         job.found += added;
+                        job.last_added = added;
                         if std::env::var_os("MESSENGER_DEBUG").is_some() && added > 0 {
                             eprintln!("[history] {} new restored messages", added);
                         }
@@ -350,6 +352,14 @@ impl MessengerApp {
         }
         if job.started.elapsed() > std::time::Duration::from_secs(120) {
             done = true;
+        }
+        // A regular chat: stop once a read adds nothing new (the HTTP gap fill
+        // later still completes details like reactions).
+        if !job.e2ee && job.found > 0 && job.last_added == 0 && matches!(job.stage, HistoryStage::Idle(_)) {
+            done = true;
+        }
+        if done && !job.e2ee && std::env::var_os("MESSENGER_DEBUG").is_some() {
+            eprintln!("[history] {}: {} messages from the web page", job.thread, job.found);
         }
         if !done {
             self.history_job = Some(job);
@@ -1382,9 +1392,14 @@ fn web_probe(ctx: &egui::Context) {
 
 struct HistoryJob {
     thread: i64,
+    /// An encrypted chat (restored from the backup), or a regular one whose
+    /// missed messages HTTP can't fetch while rate limited.
+    e2ee: bool,
     stage: HistoryStage,
     started: Instant,
     found: usize,
+    /// What the last read added.
+    last_added: usize,
 }
 
 enum HistoryStage {
@@ -1407,10 +1422,11 @@ const BACKUP_PRESENT_JS: &str = r#"
     return rows.length > 0 ? 'yes' : 'no';
 "#;
 
-/// Navigate the hidden page to an encrypted chat (`threadKey`), which makes
-/// the web client restore that chat's history from the backup.
+/// Navigate the hidden page to a chat (`path`): an encrypted one makes the
+/// web client restore its history from the backup; any chat makes it load
+/// the chat's recent messages.
 const OPEN_THREAD_JS: &str = r#"
-    location.assign('/messages/e2ee/t/' + encodeURIComponent(threadKey));
+    location.assign(path);
     return 'ok';
 "#;
 
@@ -2180,7 +2196,15 @@ impl MessengerApp {
             self.restore_check = Some(None);
         }
         if thread.e2ee && self.history_restored && self.history_job.is_none() && self.history_fetched.insert(key) {
-            self.history_job = Some(HistoryJob { thread: key, stage: HistoryStage::Start, started: Instant::now(), found: 0 });
+            self.history_job = Some(HistoryJob { thread: key, e2ee: true, stage: HistoryStage::Start, started: Instant::now(), found: 0, last_added: 0 });
+        }
+        // A regular chat missing messages while HTTP is rate limited: the
+        // hidden web page loads them over its own connection; read them there.
+        if !thread.e2ee && self.history_job.is_none() && self.shared.gap_waiting(key) && self.history_fetched.insert(key) {
+            if std::env::var_os("MESSENGER_DEBUG").is_some() {
+                eprintln!("[history] {key}: rate limited; reading the chat from the web page");
+            }
+            self.history_job = Some(HistoryJob { thread: key, e2ee: false, stage: HistoryStage::Start, started: Instant::now(), found: 0, last_added: 0 });
         }
         if thread.e2ee && messages.is_empty() {
             if e2ee_notice(ui, key) {

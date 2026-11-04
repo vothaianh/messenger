@@ -138,6 +138,7 @@ pub struct Shared {
 static GAP_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (Arc<Shared>, mpsc::UnboundedSender<Command>) {
+    let saved_limit = load_rate_limit();
     let shared = Arc::new(Shared {
         // Last session's inbox, shown right away while we connect and sync.
         store: Mutex::new(Store::load_cache().unwrap_or_default()),
@@ -147,11 +148,13 @@ pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (A
         e2ee_tx: Mutex::new(None),
         polling: Default::default(),
         poll_again: Default::default(),
-        rate_limited: Default::default(),
+        // A rate limit from the last run still holds: don't open with an
+        // HTTP request (a refused one counts against the limit too).
+        rate_limited: std::sync::atomic::AtomicBool::new(saved_limit.is_some()),
         pending_gaps: Default::default(),
         pending_reads: Default::default(),
         resent_reads: Default::default(),
-        poll_wait: Mutex::new((None, 0)),
+        poll_wait: Mutex::new(saved_limit.unwrap_or((None, 0))),
         session_expired: Default::default(),
         pin: Mutex::new(PinInfo::default()),
         http_cursor: Mutex::new(None),
@@ -500,8 +503,9 @@ impl Conn {
                                 if let Some(id) = ack_id {
                                     reply.extend(dgw::ack(stream, id));
                                 }
+                                let on_db1 = self.subscribed && self.sync_streams.get(&stream) == Some(&1);
                                 let sync_failed = self.handle_ls_resp(&body);
-                                if self.subscribed && self.sync_streams.get(&stream) == Some(&1) && is_bare_bump(&body) {
+                                if on_db1 && is_bare_bump(&body) {
                                     self.poll_mailbox();
                                 }
                                 if let Some(database) = self.sync_streams.get(&stream).copied() {
@@ -536,6 +540,7 @@ impl Conn {
                                     // dropped the whole connection on the next task. We
                                     // close it once the server has (below).
                                     self.answered_tasks.insert(stream);
+
                                     // Tasks the server asks for in its answer (encrypted
                                     // chats' nicknames answer with task 722) are queued and
                                     // sent like the web's task queue does; one level only.
@@ -629,7 +634,10 @@ impl Conn {
                     // (History can't come over DGW instead: task 228 there makes
                     // the server drop the connection.)
                     if !self.shared.http_limited() {
-                        let gaps: Vec<_> = self.shared.pending_gaps.lock().unwrap().drain().collect();
+                        // Only the poll tries HTTP after a rate limit's wait;
+                        // gap fills and reads go once it got an answer.
+                        let still_limited = self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire);
+                        let gaps: Vec<_> = if still_limited { Vec::new() } else { self.shared.pending_gaps.lock().unwrap().drain().collect() };
                         let missed = self.shared.poll_again.load(std::sync::atomic::Ordering::Acquire)
                             && !self.shared.polling.load(std::sync::atomic::Ordering::Acquire);
                         if missed {
@@ -638,7 +646,7 @@ impl Conn {
                         for (thread, start) in gaps {
                             self.fill_gap(thread, start);
                         }
-                        let reads: Vec<i64> = self.shared.pending_reads.lock().unwrap().drain().collect();
+                        let reads: Vec<i64> = if still_limited { Vec::new() } else { self.shared.pending_reads.lock().unwrap().drain().collect() };
                         for thread in reads {
                             if let Ok(Some(body)) = self.command(Command::MarkRead { thread }).await {
                                 if let Some((kind, payload)) = lightspeed_request(&body) {
@@ -812,7 +820,7 @@ impl Conn {
             }
             match result {
                 Ok(calls) => {
-                    shared.rate_limited.store(false, std::sync::atomic::Ordering::Release);
+                    shared.limit_over();
                     // What the task changed comes back on DGW (or as a bump
                     // that polls): no extra sync here, it doubled the requests.
                     shared.store.lock().unwrap().apply(&calls);
@@ -848,7 +856,7 @@ impl Conn {
                 match http_delta(&session, &shared).await {
                     Ok(calls) => {
                         *shared.poll_wait.lock().unwrap() = (None, 0);
-                        shared.rate_limited.store(false, std::sync::atomic::Ordering::Release);
+                        shared.limit_over();
                         let changed = calls.iter().any(|c| !c.name.starts_with("execute") && c.name != "setRegionHint" && !c.name.starts_with("updateLastSync"));
                         shared.store.lock().unwrap().apply(&calls);
                         if changed {
@@ -992,7 +1000,7 @@ impl Conn {
     /// drops the connection instead of pushing the result.)
     fn load_older(&self, thread: i64) {
         // Rate limited: a refused request still counts, so don't ask.
-        if self.shared.http_limited() {
+        if self.shared.http_limited() || self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         let oldest = {
@@ -1045,8 +1053,10 @@ impl Conn {
     /// `start`: the message to page back from (None: the newest we have).
     fn fill_gap(&self, thread: i64, start: Option<(i64, String)>) {
         const MAX_PAGES: usize = 15;
-        // Rate limited: a refused request still counts; wait for HTTP.
-        if self.shared.http_limited() {
+        // Rate limited: a refused request still counts; wait for HTTP. (History
+        // only comes over HTTP: on DGW task 228 drops the connection, and over
+        // MQTT it's accepted but nothing comes back; both tried 2026-11-04.)
+        if self.shared.http_limited() || self.shared.rate_limited.load(std::sync::atomic::Ordering::Acquire) {
             self.shared.pending_gaps.lock().unwrap().insert(thread, start);
             return;
         }
@@ -1066,10 +1076,13 @@ impl Conn {
                     Ok(calls) => calls,
                     Err(e) => {
                         eprintln!("[gap] {thread}: {e:#}");
-                        // Rate limited: try this chat again once HTTP is back
-                        // (from where this page started).
-                        if format!("{e:#}").contains("1675004") {
+                        // Rate limited, or MQTT failed: try this chat again once
+                        // HTTP is back (from where this page started).
+                        let rate_limited = format!("{e:#}").contains("1675004");
+                        if rate_limited {
                             shared.note_rate_limit();
+                        }
+                        if rate_limited {
                             let from = if page == 0 { first.clone() } else { Some((ts, mid.clone())) };
                             shared.pending_gaps.lock().unwrap().insert(thread, from);
                         }
@@ -1523,10 +1536,25 @@ impl Shared {
     /// 15 min), and tasks go on DGW until HTTP answers again.
     fn note_rate_limit(&self) {
         let mut wait = self.poll_wait.lock().unwrap();
-        let secs = (wait.1 * 2).clamp(60, 900);
+        // Up to an hour between tries: the limit lasted all night with a
+        // try every 15 minutes, and refused requests count against it.
+        let secs = (wait.1 * 2).clamp(60, 3600);
         *wait = (Some(std::time::Instant::now() + Duration::from_secs(secs)), secs);
         self.rate_limited.store(true, std::sync::atomic::Ordering::Release);
+        save_rate_limit(Some(secs));
         eprintln!("[http] rate limited; next poll in {secs}s");
+    }
+
+    /// HTTP answered: the rate limit is over.
+    fn limit_over(&self) {
+        if self.rate_limited.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            save_rate_limit(None);
+        }
+    }
+
+    /// A chat whose missed messages wait for the rate limit to end.
+    pub fn gap_waiting(&self, thread: i64) -> bool {
+        self.rate_limited.load(std::sync::atomic::Ordering::Acquire) && self.pending_gaps.lock().unwrap().contains_key(&thread)
     }
 
     fn http_limited(&self) -> bool {
@@ -1632,4 +1660,33 @@ fn regex_lite_mask(ls: &str) -> String {
         }
     }
     out
+}
+
+/// Where a rate limit is remembered between runs (see `save_rate_limit`).
+fn rate_limit_path() -> Option<std::path::PathBuf> {
+    crate::e2ee_store::data_dir().ok().map(|d| d.join("rate_limit.json"))
+}
+
+/// Remember (or forget, with None) a rate limit and its current wait, so the
+/// next launch doesn't open with an HTTP request that extends it.
+fn save_rate_limit(wait_secs: Option<u64>) {
+    let Some(path) = rate_limit_path() else { return };
+    match wait_secs {
+        Some(secs) => {
+            let until = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()) + secs;
+            let _ = std::fs::write(path, json!({"until": until, "wait": secs}).to_string());
+        }
+        None => {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The saved rate limit: when to try HTTP again and the wait so far.
+fn load_rate_limit() -> Option<(Option<std::time::Instant>, u64)> {
+    let v: Value = serde_json::from_slice(&std::fs::read(rate_limit_path()?).ok()?).ok()?;
+    let (until, wait) = (v["until"].as_u64()?, v["wait"].as_u64()?);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    let left = until.saturating_sub(now);
+    Some((Some(std::time::Instant::now() + Duration::from_secs(left)), wait))
 }
