@@ -172,7 +172,9 @@ Messenger stickers: `armadillo::encode_sticker_ref` (sticker id as
 `receiverFetchId`, no file; an uploaded picture showed as "Message
 unavailable" on phones). Received ones (`Content2::StickerRef`) get their
 picture from the hidden web page (`STICKER_REF_JS`, `getReceiverFetchInfo`),
-a still JPG, as the web shows them. Media messages are sent with message
+a still JPG. Ones we send show the pack's moving `animated_image`
+(`Session::sticker_pack` reads it; `image` is a still PNG), and loading a
+pack upgrades stickers shown from its still PNG (`upgrade_sticker_images`). Media messages are sent with message
 type "media" and `<enc mediatype=…>` like the web's stanza.
 Current gaps in E2EE chats: replies, reactions, edits, unsend and typing
 aren't sent yet; old history needs the PIN restore (in progress, see

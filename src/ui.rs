@@ -1316,7 +1316,18 @@ fn rich_text(ui: &mut egui::Ui, text: &str, size: f32, ink: Color32) -> egui::Re
                         for word in line.split_inclusive(' ') {
                             let bare = word.trim_end_matches(' ');
                             if !bare.is_empty() {
-                                ui.add(egui::Label::new(sf(bare, size, 400).color(ink)).extend());
+                                // A word wider than the bubble (a URL, JSON)
+                                // breaks across lines instead of widening the
+                                // whole message list.
+                                let font = egui::FontId::new(size * text_scale(), egui::FontFamily::Name("sf-400".into()));
+                                let w = ui.painter().layout_no_wrap(bare.into(), font, ink).size().x;
+                                if w > width {
+                                    ui.end_row();
+                                    ui.add(egui::Label::new(sf(bare, size, 400).color(ink)).wrap_mode(egui::TextWrapMode::Wrap));
+                                    ui.end_row();
+                                } else {
+                                    ui.add(egui::Label::new(sf(bare, size, 400).color(ink)).extend());
+                                }
                             }
                             let spaces = word.len() - bare.len();
                             if spaces > 0 {
@@ -2376,6 +2387,11 @@ impl MessengerApp {
         // Fetch older history while the list doesn't fill the view, holds only a
         // few messages, or is scrolled to the top. One request at a time: wait
         // for the oldest message to change (or 10 s) before asking again.
+        // Debug: something wider than the view widens the whole list and
+        // pushes right-aligned (own) messages out of sight.
+        if std::env::var_os("MESSENGER_DEBUG").is_some() && out.content_size.x > out.inner_rect.width() + 1.0 {
+            eprintln!("[layout] messages wider than the view: {} > {}", out.content_size.x, out.inner_rect.width());
+        }
         let online = *self.shared.status.lock().unwrap() == crate::client::Status::Online;
         let wanted = (settled && offset < 60.0) || out.content_size.y <= out.inner_rect.height() || messages.len() < 20;
         let oldest = messages.iter().find(|m| !m.pending).map(|m| m.id.clone());

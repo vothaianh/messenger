@@ -445,7 +445,17 @@ impl Session {
                 let n = &e["node"];
                 Some(Sticker {
                     id: n["id"].as_str()?.parse().ok()?,
-                    image: n.pointer("/image/uri").and_then(Value::as_str)?.to_string(),
+                    still: n.pointer("/image/uri").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    // The moving version when there is one (the web picker
+                    // asks for both); `image` is a still PNG. Encrypted chats
+                    // show the sent sticker from this link (the phone gets
+                    // only the sticker id).
+                    image: n
+                        .pointer("/animated_image/uri")
+                        .and_then(Value::as_str)
+                        .filter(|u| !u.is_empty())
+                        .or(n.pointer("/image/uri").and_then(Value::as_str))?
+                        .to_string(),
                     label: n["label"].as_str().or(n["accessibility_label"].as_str()).unwrap_or_default().to_string(),
                 })
             })
@@ -555,6 +565,8 @@ pub struct StickerPack {
 pub struct Sticker {
     pub id: i64,
     pub image: String,
+    /// The still PNG (when `image` is the moving version).
+    pub still: String,
     pub label: String,
 }
 

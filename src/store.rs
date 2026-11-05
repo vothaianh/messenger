@@ -234,6 +234,11 @@ impl Store {
                 }
             }
             m.attachments = kept;
+            // An encrypted sticker first shown as its label, then given its
+            // picture, kept both (before 1.0.21): the picture is enough.
+            if m.text.starts_with("Sticker") && m.attachments.iter().any(|a| matches!(a.kind, AttachmentKind::Sticker)) {
+                m.text.clear();
+            }
             store.seen_ids.insert(m.id.clone());
             let list = store.messages.entry(m.thread_key).or_default();
             // Caches from before 1.0.17 can hold an E2EE message twice (under
@@ -689,6 +694,10 @@ impl Store {
                 match self.sticker_images.get(fetch_id).cloned() {
                     Some(url) => {
                         self.add_e2ee_message(thread_key, ev, String::new());
+                        // It may be there already, shown as its label.
+                        if let Some(m) = self.find_message_mut(Some(thread_key), &ev.id) {
+                            m.text.clear();
+                        }
                         self.attach(thread_key, &ev.id, Attachment {
                             kind: AttachmentKind::Sticker,
                             preview_url: url.clone(),
@@ -1435,6 +1444,34 @@ impl Store {
             let att = Attachment { kind: AttachmentKind::Sticker, url: url.to_string(), preview_url: url.to_string(), title: String::new(), subtitle: String::new(), width, height };
             m.text.clear();
             m.attachments = vec![att];
+        }
+    }
+}
+
+impl Store {
+    /// Stickers shown from their still PNG (encrypted chats sent before the
+    /// moving link was used): switch them to the moving one. Matched by the
+    /// file name, since the link's signed query changes.
+    pub fn upgrade_sticker_images(&mut self, stickers: &[crate::session::Sticker]) {
+        let file = |u: &str| u.split('?').next().and_then(|p| p.rsplit('/').next()).unwrap_or_default().to_string();
+        let moving: HashMap<String, &str> = stickers.iter().filter(|s| !s.still.is_empty() && s.still != s.image).map(|s| (file(&s.still), s.image.as_str())).collect();
+        if moving.is_empty() {
+            return;
+        }
+        for list in self.messages.values_mut() {
+            for m in list.iter_mut() {
+                for a in m.attachments.iter_mut().filter(|a| matches!(a.kind, AttachmentKind::Sticker)) {
+                    if let Some(url) = moving.get(&file(&a.url)) {
+                        a.url = url.to_string();
+                        a.preview_url = url.to_string();
+                    }
+                }
+            }
+        }
+        for url in self.sticker_images.values_mut() {
+            if let Some(m) = moving.get(&file(url)) {
+                *url = m.to_string();
+            }
         }
     }
 }

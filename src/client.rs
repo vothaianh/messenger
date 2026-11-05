@@ -981,6 +981,7 @@ impl Conn {
                 },
                 Some(id) => match session.sticker_pack(id).await {
                     Ok(list) => {
+                        shared.store.lock().unwrap().upgrade_sticker_images(&list);
                         shared.stickers.lock().unwrap().pack_stickers.insert(id.clone(), list);
                     }
                     Err(e) => {
