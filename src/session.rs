@@ -140,6 +140,11 @@ impl Session {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::limited(5))
+            // A request in flight when the Mac sleeps can otherwise wait
+            // forever on a dead connection (the read timeout is per read, so
+            // long uploads still work).
+            .connect_timeout(std::time::Duration::from_secs(20))
+            .read_timeout(std::time::Duration::from_secs(90))
             .build()?;
         let html = http
             .get(format!("{BASE}/messages/"))

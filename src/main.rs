@@ -294,11 +294,11 @@ fn main() -> anyhow::Result<()> {
         let secs: u64 = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(120);
         let cookies = Cookies::load().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
         return tokio::runtime::Runtime::new()?.block_on(async {
-            let s = session::Session::connect(cookies).await?;
+            let s = std::sync::Arc::new(session::Session::connect(cookies).await?);
             let stamp = || chrono::Local::now().format("%H:%M:%S").to_string();
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
             let decrypted = e2ee_listen::run(
-                &s,
+                || s.clone(),
                 Some(deadline),
                 None,
                 |m| {

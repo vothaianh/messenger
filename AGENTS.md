@@ -232,6 +232,14 @@ aren't sent yet; old history needs the PIN restore (in progress, see
   device id, DGW stopped pushing live changes (1.0.15; confirm on a
   non-rate-limited account). History (task 228) can't go on DGW: the server drops the
   connection, and so does a second sync stream for database 1.
+- **Waking from sleep:** sockets can die without closing. DGW reconnects
+  after 45 s of silence; the E2EE socket after 70 s without a ping answer,
+  and it reconnects with the newest session (`Shared::session`; the first
+  session's tokens are stale after a night). HTTP has connect (20 s) and
+  per-read (90 s) timeouts; socket connects are bounded at 30 s.
+- Facebook re-signs picture links (new query string, same file) on syncs:
+  `paint_avatar` and `attachment` keep showing the loaded picture until the
+  new link loads, or avatars flash.
 - Don't open facebook.com in Chrome for research: Facebook locks multiple web
   sessions. Read the web's public JS bundles instead (their links are in the
   `/messages/` page the app already loads).

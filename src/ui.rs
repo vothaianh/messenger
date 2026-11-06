@@ -3559,8 +3559,20 @@ fn attachment(ui: &mut egui::Ui, a: &Attachment, fill: Color32, radius: CornerRa
             let max = if matches!(a.kind, AttachmentKind::Sticker) { 120.0 } else { 300.0 };
             let scale = (max / w).min(max / h).min(1.0).max(0.0);
             let size = Vec2::new((w * scale).max(80.0), (h * scale).max(80.0));
-            let image = media_image(ui.ctx(), &a.preview_url).fit_to_exact_size(size).corner_radius(radius).sense(Sense::click());
-            let loading = matches!(image.load_for_size(ui.ctx(), size), Ok(egui::load::TexturePoll::Pending { .. }));
+            // A re-signed link to the same picture: show the one already
+            // loaded until the new link has loaded (no flash).
+            let file = a.preview_url.split('?').next().unwrap_or(&a.preview_url).to_string();
+            let shown = egui::Id::new(("media-shown", &file));
+            let mut image = media_image(ui.ctx(), &a.preview_url).fit_to_exact_size(size).corner_radius(radius).sense(Sense::click());
+            let mut loading = matches!(image.load_for_size(ui.ctx(), size), Ok(egui::load::TexturePoll::Pending { .. }));
+            if loading {
+                if let Some(prev) = ui.ctx().data(|d| d.get_temp::<String>(shown)).filter(|p| *p != a.preview_url) {
+                    image = media_image(ui.ctx(), &prev).fit_to_exact_size(size).corner_radius(radius).sense(Sense::click());
+                    loading = matches!(image.load_for_size(ui.ctx(), size), Ok(egui::load::TexturePoll::Pending { .. }));
+                }
+            } else if ui.ctx().data(|d| d.get_temp::<String>(shown)).as_deref() != Some(a.preview_url.as_str()) {
+                ui.ctx().data_mut(|d| d.insert_temp(shown, a.preview_url.clone()));
+            }
             // egui's own spinner fills the whole picture; while it loads show
             // a quiet placeholder with a small spinner instead.
             let r = ui.add(image.show_loading_spinner(false));
@@ -4093,13 +4105,30 @@ fn paint_avatar(ui: &egui::Ui, rect: Rect, url: &str, name: &str) {
         initial(ui);
         return;
     }
-    let image = egui::Image::new(url).corner_radius(CornerRadius::same((rect.width() / 2.0) as u8));
+    let radius = CornerRadius::same((rect.width() / 2.0) as u8);
+    let image = egui::Image::new(url).corner_radius(radius);
+    // Syncs hand out the same picture under a freshly signed link (new
+    // query string) every so often; until the new link loads, keep showing
+    // the picture we had instead of flashing a grey disc.
+    let file = url.split('?').next().unwrap_or(url).to_string();
+    let shown = egui::Id::new(("avatar-shown", &file));
     match image.load_for_size(ui.ctx(), rect.size()) {
-        Ok(egui::load::TexturePoll::Ready { .. }) => image.paint_at(ui, rect),
-        Ok(egui::load::TexturePoll::Pending { .. }) => {
-            ui.painter().circle_filled(rect.center(), rect.width() / 2.0, pal().quote);
+        Ok(egui::load::TexturePoll::Ready { .. }) => {
+            image.paint_at(ui, rect);
+            if ui.ctx().data(|d| d.get_temp::<String>(shown)).as_deref() != Some(url) {
+                ui.ctx().data_mut(|d| d.insert_temp(shown, url.to_string()));
+            }
         }
-        Err(_) => initial(ui),
+        Ok(egui::load::TexturePoll::Pending { .. }) => match ui.ctx().data(|d| d.get_temp::<String>(shown)) {
+            Some(prev) if prev != url => egui::Image::new(prev).corner_radius(radius).paint_at(ui, rect),
+            _ => {
+                ui.painter().circle_filled(rect.center(), rect.width() / 2.0, pal().quote);
+            }
+        },
+        Err(_) => match ui.ctx().data(|d| d.get_temp::<String>(shown)) {
+            Some(prev) if prev != url => egui::Image::new(prev).corner_radius(radius).paint_at(ui, rect),
+            _ => initial(ui),
+        },
     }
 }
 

@@ -101,6 +101,8 @@ pub struct Shared {
     pub stickers: Mutex<StickerState>,
     /// Queue into the E2EE connection, once it's running.
     e2ee_tx: Mutex<Option<mpsc::UnboundedSender<crate::e2ee_listen::Outgoing>>>,
+    /// The newest connected session (the E2EE socket reconnects with it).
+    session: Mutex<Option<Arc<Session>>>,
     /// Database 1 cursor of the HTTP (GraphQL) sync chain. Kept apart from the
     /// DGW streams' cursor (`Store::cursors`): the server rejects one chain's
     /// cursor on the other with `handleSyncFailure`.
@@ -146,6 +148,7 @@ pub fn spawn(cookies: Cookies, repaint: impl Fn() + Send + Sync + 'static) -> (A
         error: Mutex::new(None),
         stickers: Mutex::new(StickerState::default()),
         e2ee_tx: Mutex::new(None),
+        session: Mutex::new(None),
         polling: Default::default(),
         poll_again: Default::default(),
         // A rate limit from the last run still holds: don't open with an
@@ -199,6 +202,7 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
                 continue;
             }
         };
+        *shared.session.lock().unwrap() = Some(session.clone());
         {
             let mut st = shared.store.lock().unwrap();
             if st.me != 0 && st.me != session.boot.fbid {
@@ -277,6 +281,7 @@ async fn run(cookies: Cookies, shared: Arc<Shared>, mut rx: mpsc::UnboundedRecei
         }
         repaint();
 
+        backoff = 1;
         let mut conn = Conn::new(session.clone(), shared.clone(), repaint.clone());
         let mut result = conn.run(&mut rx, &set_status).await;
         // After the snapshot connection, subscribe like the web client: a new
@@ -302,8 +307,9 @@ fn spawn_e2ee(session: Arc<Session>, shared: Arc<Shared>, repaint: Repaint) {
     *shared.e2ee_tx.lock().unwrap() = Some(tx);
     tokio::spawn(async move {
         let me = session.boot.fbid;
+        let latest = shared.clone();
         let result = crate::e2ee_listen::run(
-            &session,
+            move || latest.session.lock().unwrap().clone().unwrap_or_else(|| session.clone()),
             None,
             Some(&mut rx),
             |rec| {
@@ -427,7 +433,8 @@ impl Conn {
     /// `Ok(false)` means the UI closed.
     async fn run(&mut self, rx: &mut mpsc::UnboundedReceiver<Command>, set_status: &impl Fn(Status)) -> Result<bool> {
         let url = dgw::lightspeed_url(&self.session.boot.ls_app_id, self.session.boot.fbid, &self.session.device_id, self.session.boot.region.as_deref());
-        let mut ws = dgw::Socket::open(&url, &self.session.cookies.0, USER_AGENT).await?;
+        // Bounded: right after waking from sleep a connect can hang.
+        let mut ws = tokio::time::timeout(Duration::from_secs(30), dgw::Socket::open(&url, &self.session.cookies.0, USER_AGENT)).await.map_err(|_| anyhow::anyhow!("DGW connect timed out"))??;
         if std::env::var_os("MESSENGER_DEBUG").is_some() {
             eprintln!("[dgw] region hint {:?}", self.session.boot.region);
         }

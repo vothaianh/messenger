@@ -860,7 +860,7 @@ mod tests {
 /// and hand every decrypted message to `on_message`. Runs until `deadline` (if
 /// any) passes; otherwise forever.
 pub async fn run(
-    session: &crate::session::Session,
+    current_session: impl Fn() -> std::sync::Arc<crate::session::Session>,
     deadline: Option<tokio::time::Instant>,
     mut outgoing: Option<&mut tokio::sync::mpsc::UnboundedReceiver<Outgoing>>,
     mut on_message: impl FnMut(&Received),
@@ -874,7 +874,15 @@ pub async fn run(
     let mut decrypted = 0;
     let mut backoff = 2u64;
     while tokio::time::Instant::now() < deadline {
-        let sock = match crate::e2ee_socket::ChatSocket::connect(session, &mut device).await {
+        // The newest session on each connect: its tokens go stale (after a
+        // night asleep the first session's no longer let us in).
+        let session_arc = current_session();
+        let session = &*session_arc;
+        let connected = match tokio::time::timeout(Duration::from_secs(30), crate::e2ee_socket::ChatSocket::connect(session, &mut device)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!("timed out")),
+        };
+        let sock = match connected {
             Ok(sock) => sock,
             Err(e) => {
                 log(format!("connect failed: {e:#}; retrying in {backoff}s"));
@@ -887,10 +895,33 @@ pub async fn run(
         let store = SignalStore::open(&device)?;
         let mut listener = Listener::new(sock, store, session.boot.fbid);
         let mut backlog = Vec::new();
-        let (on_server, uploaded) = listener.ensure_prekeys(&mut backlog).await?;
-        listener.set_active(&mut backlog).await?;
-        log(format!("logged in, active; prekeys on server {on_server}, uploaded {uploaded}"));
+        // A socket that dies during setup (e.g. right after waking from
+        // sleep): reconnect rather than stop listening for good.
+        let setup = async {
+            let keys = listener.ensure_prekeys(&mut backlog).await?;
+            listener.set_active(&mut backlog).await?;
+            anyhow::Ok(keys)
+        };
+        match tokio::time::timeout(Duration::from_secs(60), setup).await {
+            Ok(Ok((on_server, uploaded))) => log(format!("logged in, active; prekeys on server {on_server}, uploaded {uploaded}")),
+            Ok(Err(e)) => {
+                log(format!("setup failed: {e:#}; reconnecting"));
+                listener.sock.close().await;
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+                continue;
+            }
+            Err(_) => {
+                log("setup timed out; reconnecting".into());
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+                continue;
+            }
+        }
         let mut next_ping = tokio::time::Instant::now() + Duration::from_secs(20);
+        // The server answers every ping: silence this long means the socket
+        // died without closing (a Mac waking from sleep).
+        let mut last_rx = tokio::time::Instant::now();
         let mut media_conn: Option<MediaConn> = None;
         loop {
             let bytes = if !backlog.is_empty() {
@@ -933,11 +964,18 @@ pub async fn run(
                     r = tokio::time::timeout_at(next_ping.min(deadline), listener.sock.recv()) => r,
                 };
                 match received {
-                    Ok(Ok(Some(b))) => b,
+                    Ok(Ok(Some(b))) => {
+                        last_rx = tokio::time::Instant::now();
+                        b
+                    }
                     Ok(Ok(None)) => { log("socket closed".into()); break; }
                     Ok(Err(e)) => { log(format!("disconnected: {e:#}")); break; }
                     Err(_) if tokio::time::Instant::now() >= deadline => break,
                     Err(_) => {
+                        if last_rx.elapsed() > Duration::from_secs(70) {
+                            log("no answer to pings; reconnecting".into());
+                            break;
+                        }
                         if let Err(e) = listener.ping().await {
                             log(format!("ping failed: {e:#}"));
                             break;
